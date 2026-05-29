@@ -1,0 +1,17 @@
+# macOS noise
+.DS_Store
+
+# Materialized secrets — never commit. Templates end in .opvault; the
+# injected real files must stay out of git.
+*.opvault.out
+**/mcp.json
+!**/mcp.json.opvault
+
+# Editor / backup noise
+*.swp
+*~
+*.bak.*
+
+# Python bytecode
+__pycache__/
+*.pyc
