@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<style>
+  :root {
+    --bg: #0a0e14;
+    --panel: #0e131c;
+    --fg: #e6edf3;
+    --dim: #8b949e;
+    --line: #1c2330;
+    --accent: #f5b942; /* restrained amber */
+    --green: #3fb950;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1280px; height: 640px; }
+  body {
+    background:
+      radial-gradient(1200px 500px at 78% -10%, rgba(245,185,66,0.10), transparent 60%),
+      var(--bg);
+    color: var(--fg);
+    font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    padding: 64px 72px;
+    overflow: hidden;
+  }
+  .prompt {
+    font-size: 22px;
+    color: var(--dim);
+    letter-spacing: 0.2px;
+  }
+  .prompt .path { color: var(--green); }
+  .prompt .cmd { color: var(--fg); }
+  .prompt .cur {
+    display: inline-block; width: 11px; height: 22px;
+    background: var(--accent); margin-left: 6px; transform: translateY(3px);
+  }
+  .mid { margin-top: 8px; }
+  h1 {
+    font-size: 76px;
+    line-height: 1.02;
+    font-weight: 700;
+    letter-spacing: -1.5px;
+  }
+  h1 .accent { color: var(--accent); }
+  .tagline {
+    margin-top: 22px;
+    font-size: 26px;
+    color: var(--dim);
+    max-width: 1000px;
+    line-height: 1.45;
+  }
+  .chain {
+    margin-top: 30px;
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+  .pill {
+    font-size: 18px;
+    color: var(--fg);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 9px 18px;
+  }
+  .pill b { color: var(--accent); font-weight: 600; }
+  footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-top: 1px solid var(--line);
+    padding-top: 22px;
+    font-size: 20px;
+    color: var(--dim);
+  }
+  footer .repo { color: var(--fg); }
+  footer .by { color: var(--dim); }
+  footer .lic { color: var(--accent); }
+</style>
+</head>
+<body>
+  <div class="prompt">
+    <span class="path">~/.claude</span> ❯ <span class="cmd">install ways-of-working</span><span class="cur"></span>
+  </div>
+
+  <div class="mid">
+    <h1>Agentic<br><span class="accent">Ways of Working</span></h1>
+    <p class="tagline">One canonical principles doc. Per-tool adapters. Skills + hooks. Harness-agnostic — the transferable layer between your dotfiles and a blog post.</p>
+    <div class="chain">
+      <span class="pill"><b>default to action</b> · no permission-gating</span>
+      <span class="pill"><b>canonical-pattern-first</b></span>
+      <span class="pill"><b>worktree isolation</b></span>
+      <span class="pill"><b>/campsite</b> north-star stance</span>
+    </div>
+  </div>
+
+  <footer>
+    <span class="repo">github.com/nino-chavez/agentic-ways-of-working</span>
+    <span class="by">Nino Chavez &nbsp;·&nbsp; <span class="lic">MIT</span></span>
+  </footer>
+</body>
+</html>
