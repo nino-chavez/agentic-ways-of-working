@@ -62,6 +62,42 @@ The installer is idempotent and reversible: it backs up `settings.json` before t
 
 Then restart your session so the hooks load. Toggle the north-star stance per-project with `/campsite on`.
 
+## Usage in practice
+
+The point isn't the files — it's what changes in a session. Three things you'll notice once it's installed.
+
+**1. The agent stops asking permission to continue.** The decision-bias principle plus the `anti-hesitation` Stop hook mean a turn can't end on a permission-gating question when the direction is already set. If the model tries to close with one, the hook bounces it:
+
+```
+✗  "I've drafted the migration. Want me to apply it next, or stop here?"
+       └─ Stop hook fires → forces a restate
+
+✓  "Migration drafted and applied; tests green. Moving to the rollback script next."
+```
+
+One "go" covers the whole thread, not one step at a time.
+
+**2. Campsite Mode raises the bar, per-project.** Turn it on when you want north-star-only work — no shims, fix-as-discovered, touched files end clean:
+
+```bash
+/campsite on      # → "Campsite Mode ON — north-star only, fix-as-discovered, touched files end clean."
+# ... do the work; pre-existing defects in files you touch get fixed in the same change ...
+/campsite off     # → back to scoped, surgical edits
+```
+
+The flag lives at `<project>/.claude/campsite-mode`, so each repo opts in independently.
+
+**3. Skills fire on intent, not ceremony.** You don't memorize commands — describe the work and the matching skill engages:
+
+```
+"this test is flaky and I can't reproduce it"        → diagnose   (reproduce → minimise → instrument → fix)
+"does this module actually pull its weight?"          → deepen     (depth/seam/locality, the deletion test)
+"ship it"                                             → ship       (reads the project's DEPLOY.md, executes)
+"stress-test this plan against our domain model"      → grill-with-docs
+```
+
+Same principles apply whichever harness reads them — point Codex at `adapters/AGENTS.md` or Gemini at `adapters/GEMINI.md` and the decision-bias, canonical-first, and worktree rules travel unchanged.
+
 ## What's deliberately not here
 
 The personal layer. No voice corpus, no recall database, no secrets, no machine paths, no project-specific context. Those are what made the private version *mine*; none of them would make the public version *yours*. If a skill or hook references a path that doesn't exist in your setup, it degrades quietly rather than failing — that's intentional.
