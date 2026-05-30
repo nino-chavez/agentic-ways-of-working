@@ -28,6 +28,7 @@ adapters/                     Thin pointers: CLAUDE.md, AGENTS.md, GEMINI.md
 skills/                       The methodology suite (see below)
 commands/campsite.md          /campsite — toggle the north-star working stance
 hooks/                        anti-hesitation, campsite, blueprint-session-start
+docs/                         Analysis & essays — e.g. the Aquifer substrate convergence
 install.sh                    Symlinks it all into ~/.claude and wires the hooks
 ```
 
