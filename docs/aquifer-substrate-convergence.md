@@ -81,9 +81,9 @@ Same problem statement, different substrate. Thematic siblings, not structural t
 
 ## Lineage note
 
-This methodology's first principle — *"agent struggle is a missing capability… patching prompts session-by-session produces zero compounding leverage; every encoded capability multiplies across every future initiative"* — is Aquifer's "institutional memory that compounds," stated as a methodology rule instead of a platform feature.
+This methodology's first principle — *"agent struggle is a missing capability: when an agent fails, don't prompt harder; encode the missing capability so every future run inherits it"* — is taken directly from OpenAI's [*Harness engineering: leveraging Codex in an agent-first world*](https://openai.com/index/harness-engineering/) (Ryan Lopopolo, Feb 2026). That work names the move: when something fails, ask "what capability is missing" rather than fixing it by hand.
 
-That compounding principle echoes harness-engineering practice that has been circulating in public for a while. Aquifer is what it looks like as production infrastructure rather than as a working convention.
+So the convergence is three-way, not two. OpenAI's harness engineering **names** the principle. Shopify's Aquifer **builds it into a platform** — durable sessions and shared substrate are institutional memory that compounds at runtime. This methodology **encodes it as a pipeline rule** — every agent failure becomes a reviewer, invariant, or doc the next initiative inherits. Three teams, three layers, one bet: a capability encoded once compounds across every future run.
 
 ---
 
