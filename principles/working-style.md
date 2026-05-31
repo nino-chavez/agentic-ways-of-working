@@ -55,6 +55,8 @@ When work splits across parallel sessions or subagents — any time more than on
 
 **Does NOT apply to:** single linear work in the main session, read-only exploration agents, quick one-shot agents that complete before any other work could start.
 
+**Enforcement (mechanical, not advisory):** [`hooks/worktree-guard.py`](../hooks/worktree-guard.py) makes this a hard gate, not a hope. Each session writes a heartbeat lock under `<repo>/.git/.claude-sessions/`. When another session's lock is live and you attempt a contended git op (`commit`, branch create/switch) from the **shared main checkout**, the PreToolUse hook DENIES it and hands back the exact `git worktree add` remedy. Commits from inside a linked worktree are always allowed (already isolated); a solo session is never blocked. It resolves the *effective* repo of the command (tracking `cd` and `git -C`), so committing to a quiet repo from a session that lives in a busy one is not blocked. Fail-open on any uncertainty. Per-repo escape hatch: `touch <repo>/.git/.claude-sessions/.guard-off`. Wired by `install.sh` (SessionStart / PreToolUse / SessionEnd).
+
 ## Prose-voice tasks load the voice guide FIRST
 
 For any task producing prose for a human reader — blog posts, essays, decks, presentations, public-facing docs, client deliverables, anything with a byline or intended for an audience other than an agent — load your canonical voice guide BEFORE drafting. A terminal-CLI voice (short, imperative) does NOT cover prose voice; drafting prose from CLI cadence alone produces generic-thoughtful-LinkedIn output.

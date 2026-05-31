@@ -60,12 +60,12 @@ with open(settings_path) as f:
 
 hooks = cfg.setdefault("hooks", {})
 
-def ensure(event, command, timeout):
+def ensure(event, command, timeout, matcher=""):
     blocks = hooks.setdefault(event, [])
-    # find/create the matcher-"" block
-    block = next((b for b in blocks if b.get("matcher", "") == ""), None)
+    # find/create the block for this matcher (matcher "" = all tools)
+    block = next((b for b in blocks if b.get("matcher", "") == matcher), None)
     if block is None:
-        block = {"matcher": "", "hooks": []}
+        block = {"matcher": matcher, "hooks": []}
         blocks.append(block)
     inner = block.setdefault("hooks", [])
     if any(h.get("command") == command for h in inner):
@@ -77,6 +77,10 @@ added = []
 if ensure("SessionStart",     f"python3 {claude_dir}/hooks/blueprint-session-start.py", 10): added.append("SessionStart:blueprint-session-start")
 if ensure("Stop",             f"python3 {claude_dir}/hooks/anti-hesitation.py", 5):         added.append("Stop:anti-hesitation")
 if ensure("UserPromptSubmit", f"python3 {claude_dir}/hooks/campsite.py", 3):                added.append("UserPromptSubmit:campsite")
+# Worktree isolation guard: register heartbeat at session boundaries + gate Bash git ops.
+if ensure("SessionStart",     f"python3 {claude_dir}/hooks/worktree-guard.py register", 5):              added.append("SessionStart:worktree-guard")
+if ensure("PreToolUse",       f"python3 {claude_dir}/hooks/worktree-guard.py check", 5, matcher="Bash"): added.append("PreToolUse[Bash]:worktree-guard")
+if ensure("SessionEnd",       f"python3 {claude_dir}/hooks/worktree-guard.py unregister", 5):            added.append("SessionEnd:worktree-guard")
 
 with open(settings_path, "w") as f:
     json.dump(cfg, f, indent=2)

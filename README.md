@@ -16,7 +16,7 @@ What's in them:
 
 - **Decision bias — default to action.** The single highest-leverage rule. Agents pad turns with "want me to keep going?" permission-checks that cost you the one thing you can't get back: the time spent waiting to say yes to something that didn't need asking. The rule names the failure shape precisely, and a [Stop hook](hooks/anti-hesitation.py) enforces it — if the agent ends a turn on a hesitation question, it gets bounced back to restate it as a status sentence.
 - **Canonical-pattern-first for infrastructure.** Before writing auth or payments or webhooks, read the vendor's recommended approach and check your own repos for a working version. Custom shapes have to name what disqualified the canonical one. Silence isn't an answer.
-- **Worktree isolation.** The moment two sessions touch one repo, they get separate git worktrees — otherwise they switch each other's branches mid-flight and commits land in the wrong place.
+- **Worktree isolation.** The moment two sessions touch one repo, they get separate git worktrees — otherwise they switch each other's branches mid-flight and commits land in the wrong place. A [PreToolUse hook](hooks/worktree-guard.py) enforces it: a contended git op in a shared checkout while another session is live gets denied, with the `git worktree add` remedy handed back.
 - **Prose-voice and fabrication guardrails.** Prose for a human reader loads the voice guide first; reflective prose never invents an interior state the author didn't actually have.
 - **Secret handling.** Secrets live in a manager, never in files, and you check for an existing entry before inventing a new name — the convention that prevents silent install-time drift.
 
@@ -27,7 +27,7 @@ principles/working-style.md   The canonical doc. Harness-agnostic. Start here.
 adapters/                     Thin pointers: CLAUDE.md, AGENTS.md, GEMINI.md
 skills/                       The methodology suite (see below)
 commands/campsite.md          /campsite — toggle the north-star working stance
-hooks/                        anti-hesitation, campsite, blueprint-session-start
+hooks/                        anti-hesitation, campsite, blueprint-session-start, worktree-guard
 docs/                         Analysis & essays — e.g. the Aquifer substrate convergence
 install.sh                    Symlinks it all into ~/.claude and wires the hooks
 ```
