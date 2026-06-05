@@ -1,6 +1,7 @@
 ---
 name: ship
 description: Deploy, release, or run migrations against production for a project. Use when user says "deploy", "ship", "push to prod", "release", "run the migration", "apply migrations", or asks how a project gets deployed / where it lives. Reads per-project DEPLOY.md as source of truth; falls back to inference + offer to scaffold one.
+disable-model-invocation: true
 ---
 
 # Ship
