@@ -1,0 +1,26 @@
+# Copy to a repo root as `.claude-review.conf` to tune when commits get
+# auto-reviewed by Claude (post-commit, billed to your Claude subscription).
+#
+# A commit triggers a background review if EITHER:
+#   - it changes a file matching `paths`, OR
+#   - its net changed lines (excluding `skip_paths`) >= `min_changed_lines`.
+#
+# Per-commit overrides (no config edit needed):
+#   REVIEW=1 git commit ...   force a review
+#   REVIEW=0 git commit ...   skip the review
+#
+# Merge commits, and commits replayed during rebase/cherry-pick, are never
+# auto-reviewed.
+
+# Net added+removed lines that make a commit "worth reviewing".
+min_changed_lines = 80
+
+# Always review when these are touched, regardless of size (comma-separated
+# git globs). Leave blank to disable path-based triggering.
+paths = src/auth/**, lib/db/**, **/*.sql, **/migrations/**, **/middleware.*
+
+# Never count these toward the line threshold (comma-separated git globs).
+skip_paths = **/*.md, **/*.lock, **/*.snap, package-lock.json, pnpm-lock.yaml, yarn.lock
+
+# Set to false to disable reviews in this repo entirely.
+enabled = true

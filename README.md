@@ -28,6 +28,7 @@ adapters/                     Thin pointers: CLAUDE.md, AGENTS.md, GEMINI.md
 skills/                       The methodology suite (see below)
 commands/campsite.md          /campsite — toggle the north-star working stance
 hooks/                        anti-hesitation, campsite, blueprint-session-start, worktree-guard
+git-hooks/                    Local post-commit Claude review on commits worth reviewing
 docs/                         Analysis & essays — e.g. the Aquifer substrate convergence
 install.sh                    Symlinks it all into ~/.claude and wires the hooks
 ```
@@ -49,6 +50,10 @@ The craft skills are self-contained — drop them in and they work:
 | `write-a-skill` | Author new skills with progressive disclosure and bundled resources |
 
 The `blueprint-*` suite (`research`, `prototype`, `docs`, `validate`, `deploy`, `dispatch`, `triage`, `handoff`, `amendment`) encodes a brownfield-redesign methodology — diagnose current state, prescribe, prototype the proposed state. These are the most opinionated artifacts here and they pair with a separate Blueprint methodology repo; point `BLUEPRINT_HOME` at your clone of it. Take them as a worked example of how far you can push a methodology into skills, not as a turnkey drop-in.
+
+### Git hooks
+
+The Claude Code hooks above fire inside a session. [`git-hooks/`](git-hooks/) is the other direction: a git `post-commit` hook that runs a focused Claude review *after* a commit — but only on the commits worth it (a configurable line threshold, or a touched sensitive path like `auth/` or `*.sql`). It's the local-first answer to a PR-gated review action: no PR required, async so the commit returns instantly, and billed to your Claude subscription rather than a metered API key (it unsets `ANTHROPIC_API_KEY` before calling `claude`). Merge commits and rebase replays are skipped so a ten-commit rebase doesn't fan out ten reviews. Self-contained with its own `install.sh` — see [`git-hooks/README.md`](git-hooks/README.md).
 
 ## Install
 

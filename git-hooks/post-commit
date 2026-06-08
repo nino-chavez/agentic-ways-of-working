@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# post-commit hook — auto-runs a Claude Code review on meaningful commits.
+#
+# Install globally (via `git config core.hooksPath`) or per-repo (.git/hooks).
+# See README.md and install.sh.
+#
+# Two jobs:
+#   1. Chain to any repo-local .git/hooks/post-commit so a global hooksPath
+#      never silently disables a repo's own hook.
+#   2. Trigger a background Claude review when a commit crosses the thresholds
+#      in .claude-review.conf. The review is billed to the logged-in Claude
+#      subscription (claude-review-run.sh unsets ANTHROPIC_API_KEY first).
+#
+# Per-commit escape hatches:
+#   REVIEW=0 git commit ...   force-skip the review
+#   REVIEW=1 git commit ...   force the review regardless of thresholds
+# Per-repo: set `enabled = false` in .claude-review.conf to disable entirely.
+
+set -uo pipefail
+
+# Never let the review subprocess re-enter this hook.
+[ -n "${CLAUDE_REVIEW_HOOK:-}" ] && exit 0
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+GIT_DIR="$(git rev-parse --git-dir 2>/dev/null)" || exit 0
+REPO="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+
+# (1) Chain to a repo-local post-commit hook if one exists and isn't this file.
+LOCAL_HOOK="$GIT_DIR/hooks/post-commit"
+if [ -x "$LOCAL_HOOK" ]; then
+  LOCAL_DIR="$(cd "$(dirname "$LOCAL_HOOK")" && pwd)"
+  if [ "$LOCAL_DIR" != "$HOOK_DIR" ]; then
+    "$LOCAL_HOOK" "$@" || true
+  fi
+fi
+
+# ---- Review trigger decision ----------------------------------------------
+
+# Don't review replayed/intermediate commits (rebase, merge, cherry-pick).
+for marker in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD; do
+  [ -e "$GIT_DIR/$marker" ] && exit 0
+done
+# Skip merge commits (2+ parents) — the diff is the whole merged branch.
+git rev-parse -q --verify HEAD^2 >/dev/null 2>&1 && exit 0
+
+# Defaults (overridable per-repo via .claude-review.conf).
+MIN_CHANGED_LINES=80
+TRIGGER_PATHS=""
+SKIP_PATHS="**/*.md **/*.lock **/*.snap **/*.svg package-lock.json pnpm-lock.yaml yarn.lock"
+ENABLED=1
+
+CONF="$REPO/.claude-review.conf"
+if [ -f "$CONF" ]; then
+  while IFS='=' read -r key val; do
+    key="${key%%#*}"; key="$(printf '%s' "$key" | tr -d '[:space:]')"
+    [ -z "$key" ] && continue
+    val="$(printf '%s' "$val" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    case "$key" in
+      min_changed_lines) MIN_CHANGED_LINES="$val" ;;
+      paths)             TRIGGER_PATHS="$(printf '%s' "$val" | tr ',' ' ')" ;;
+      skip_paths)        SKIP_PATHS="$(printf '%s' "$val" | tr ',' ' ')" ;;
+      enabled)           case "$val" in 0|no|off|false|FALSE) ENABLED=0 ;; *) ENABLED=1 ;; esac ;;
+    esac
+  done < "$CONF"
+fi
+
+FORCE=""
+case "${REVIEW:-}" in
+  0|no|off|false) exit 0 ;;
+  1|yes|on|true)  FORCE=1 ;;
+esac
+
+[ "$ENABLED" = "1" ] || [ -n "$FORCE" ] || exit 0
+
+# Diff base: previous commit, or the git empty tree for the root commit.
+if git rev-parse -q --verify HEAD~1 >/dev/null 2>&1; then
+  BASE="$(git rev-parse HEAD~1)"
+else
+  BASE="4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # git empty tree
+fi
+
+triggered="$FORCE"
+
+# Path-based trigger: any changed file matching a watched glob.
+if [ -z "$triggered" ] && [ -n "$TRIGGER_PATHS" ]; then
+  specs=()
+  for p in $TRIGGER_PATHS; do specs+=(":(glob)$p"); done
+  if [ -n "$(git diff --name-only "$BASE" HEAD -- "${specs[@]}" 2>/dev/null)" ]; then
+    triggered=1
+  fi
+fi
+
+# Size-based trigger: net added+removed lines, excluding skip globs.
+if [ -z "$triggered" ]; then
+  excl=(".")
+  for p in $SKIP_PATHS; do excl+=(":(exclude,glob)$p"); done
+  total="$(git diff --numstat "$BASE" HEAD -- "${excl[@]}" 2>/dev/null \
+            | awk '{a+=$1; d+=$2} END{print a+d+0}')"
+  if [ "${total:-0}" -ge "$MIN_CHANGED_LINES" ] 2>/dev/null; then
+    triggered=1
+  fi
+fi
+
+[ -n "$triggered" ] || exit 0
+
+# ---- Launch (single-flight, detached) -------------------------------------
+
+LOCK="$GIT_DIR/claude-review.lock"
+# Steal a stale lock (>30 min) left by a crashed run.
+[ -d "$LOCK" ] && find "$LOCK" -maxdepth 0 -mmin +30 -exec rmdir {} \; 2>/dev/null
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "claude-review: a review is already running in this repo — skipping"
+  exit 0
+fi
+
+SHA="$(git rev-parse HEAD)"
+CLAUDE_REVIEW_HOOK=1 nohup "$HOOK_DIR/claude-review-run.sh" "$REPO" "$SHA" "$LOCK" \
+  >/dev/null 2>&1 &
+disown 2>/dev/null || true
+
+echo "claude-review: reviewing ${SHA:0:7} in background -> ${GIT_DIR}/last-review.md"
+exit 0
