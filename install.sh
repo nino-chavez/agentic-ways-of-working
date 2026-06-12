@@ -73,14 +73,26 @@ def ensure(event, command, timeout, matcher=""):
     inner.append({"type": "command", "command": command, "timeout": timeout})
     return True
 
+def drop(event, command, matcher=""):
+    """Remove a previously-wired command from a given matcher block (migration)."""
+    for b in hooks.get(event, []):
+        if b.get("matcher", "") == matcher:
+            b["hooks"] = [h for h in b.get("hooks", []) if h.get("command") != command]
+
+GUARD_MATCHER = "Bash|Write|Edit|MultiEdit"
+# Migrate legacy narrow install: the guard used to gate only matcher="Bash";
+# it now also gates file edits. Drop the old block's command before re-adding.
+drop("PreToolUse", f"python3 {claude_dir}/hooks/worktree-guard.py check", matcher="Bash")
+
 added = []
 if ensure("SessionStart",     f"python3 {claude_dir}/hooks/blueprint-session-start.py", 10): added.append("SessionStart:blueprint-session-start")
 if ensure("Stop",             f"python3 {claude_dir}/hooks/anti-hesitation.py", 5):         added.append("Stop:anti-hesitation")
 if ensure("UserPromptSubmit", f"python3 {claude_dir}/hooks/campsite.py", 3):                added.append("UserPromptSubmit:campsite")
-# Worktree isolation guard: register heartbeat at session boundaries + gate Bash git ops.
-if ensure("SessionStart",     f"python3 {claude_dir}/hooks/worktree-guard.py register", 5):              added.append("SessionStart:worktree-guard")
-if ensure("PreToolUse",       f"python3 {claude_dir}/hooks/worktree-guard.py check", 5, matcher="Bash"): added.append("PreToolUse[Bash]:worktree-guard")
-if ensure("SessionEnd",       f"python3 {claude_dir}/hooks/worktree-guard.py unregister", 5):            added.append("SessionEnd:worktree-guard")
+# Worktree isolation guard: register heartbeat at session boundaries + gate git
+# ops (Bash) and file edits (Write/Edit/MultiEdit) against shared main checkouts.
+if ensure("SessionStart",     f"python3 {claude_dir}/hooks/worktree-guard.py register", 5):                       added.append("SessionStart:worktree-guard")
+if ensure("PreToolUse",       f"python3 {claude_dir}/hooks/worktree-guard.py check", 5, matcher=GUARD_MATCHER):   added.append("PreToolUse[edit+bash]:worktree-guard")
+if ensure("SessionEnd",       f"python3 {claude_dir}/hooks/worktree-guard.py unregister", 5):                     added.append("SessionEnd:worktree-guard")
 
 with open(settings_path, "w") as f:
     json.dump(cfg, f, indent=2)

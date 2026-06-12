@@ -53,6 +53,7 @@ from pathlib import Path
 STALE_SECONDS = 15 * 60  # a lock older than this = dead session, prune it
 LOCK_DIRNAME = ".claude-sessions"
 OVERRIDE_FILENAME = ".guard-off"
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit"}  # file-mutating tools guarded alongside Bash
 
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _SEPARATORS = {"&&", "||", ";", "|", "|&", "&"}
@@ -294,6 +295,14 @@ def is_contended(command: str) -> bool:
     return bool(targets) and any(_is_contended_args(args) for _, args in targets)
 
 
+# --- edit-tool target resolution ---------------------------------------------
+
+def _edit_target_path(payload: dict) -> str | None:
+    """The file an Edit/Write/MultiEdit call targets (its `file_path`), or None."""
+    p = (payload.get("tool_input") or {}).get("file_path")
+    return p if isinstance(p, str) and p else None
+
+
 # --- block message -----------------------------------------------------------
 
 def suggest_worktree(repo_dir: str) -> str:
@@ -324,7 +333,63 @@ def deny_reason(others: list[dict], repo_dir: str, ld: Path) -> str:
     return "\n".join(lines)
 
 
+def deny_reason_edit(others: list[dict], repo_dir: str, ld: Path, path: str) -> str:
+    lines = [
+        "Worktree isolation guard: BLOCKED (file edit).",
+        "",
+        f"You are about to edit a file in the SHARED main checkout ({repo_dir}),",
+        f"but {len(others)} other live Claude session(s) are working in this same main checkout:",
+    ]
+    for o in others:
+        lines.append(f"  - session {str(o.get('session_id', '?'))[:8]} on '{o.get('branch', '?')}' at {o.get('cwd', '?')}")
+    lines += [
+        "",
+        f"  target: {path}",
+        "",
+        "Two sessions editing the same checkout overwrite each other's work and land",
+        "commits on the wrong branch. Move this work into its own worktree first:",
+        "",
+        f"  {suggest_worktree(repo_dir)}",
+        "",
+        "Then re-run from inside the worktree (edits there are allowed).",
+        f"Override for this repo (use sparingly): touch {ld / OVERRIDE_FILENAME}",
+    ]
+    return "\n".join(lines)
+
+
+def register_warning(others: list[dict], repo_dir: str) -> str:
+    lines = [
+        "WORKTREE ISOLATION WARNING.",
+        "",
+        f"You started in the SHARED main checkout ({repo_dir}), but "
+        f"{len(others)} other live Claude session(s) are ALREADY working here:",
+    ]
+    for o in others:
+        lines.append(f"  - session {str(o.get('session_id', '?'))[:8]} on '{o.get('branch', '?')}' at {o.get('cwd', '?')}")
+    lines += [
+        "",
+        "Per working-style.md, parallel sessions MUST isolate in worktrees — sharing this",
+        "checkout will overwrite each other's edits and land commits on the wrong branch.",
+        "Before doing any work, create your own worktree:",
+        "",
+        f"  {suggest_worktree(repo_dir)}",
+        "",
+        "Edits and commits in the main checkout will be BLOCKED while another session is live here.",
+    ]
+    return "\n".join(lines)
+
+
 def allow() -> None:
+    sys.exit(0)
+
+
+def warn_session_start(context: str) -> None:
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": context,
+        }
+    }))
     sys.exit(0)
 
 
@@ -350,6 +415,13 @@ def cmd_register(payload: dict) -> None:
     ld = lock_dir(ctx["common_dir"])
     write_lock(ld, session_id, cwd, ctx)
     prune_stale(ld, session_id)
+    # If this session is starting in the SHARED main checkout while other live
+    # sessions already occupy it, warn loudly at start (inject context) so the
+    # agent creates a worktree BEFORE doing work — not after colliding.
+    if not ctx["is_worktree"] and not (ld / OVERRIDE_FILENAME).exists():
+        main_others = [o for o in live_others(ld, session_id) if not o.get("is_worktree")]
+        if main_others:
+            warn_session_start(register_warning(main_others, cwd))
     allow()
 
 
@@ -363,20 +435,42 @@ def cmd_unregister(payload: dict) -> None:
 
 
 def cmd_check(payload: dict) -> None:
-    if payload.get("tool_name") != "Bash":
+    tool = payload.get("tool_name")
+    if tool not in EDIT_TOOLS and tool != "Bash":
         allow()
     cwd = payload.get("cwd") or os.getcwd()
     session_id = payload.get("session_id") or "unknown"
-    command = (payload.get("tool_input") or {}).get("command", "")
 
-    # Heartbeat: refresh this session's lock in its OWN repo on every Bash call,
-    # so SessionStart is not required for correctness (covers hooks added
+    # Heartbeat: refresh this session's lock in its OWN repo on every guarded
+    # call, so SessionStart is not required for correctness (covers hooks added
     # mid-session). Registration is keyed to the session's home repo.
     sctx = repo_context(cwd)
     if sctx is not None:
         sld = lock_dir(sctx["common_dir"])
         write_lock(sld, session_id, cwd, sctx)
         prune_stale(sld, session_id)
+
+    # Write/Edit/MultiEdit: block a file edit to a SHARED main checkout when
+    # another live session occupies that same main checkout. Resolve the repo
+    # from the target file's path, not the session cwd. Solo sessions and edits
+    # inside an isolated worktree are always allowed.
+    if tool in EDIT_TOOLS:
+        path = _edit_target_path(payload)
+        if not path:
+            allow()  # no resolvable path => fail open
+        target_dir = os.path.dirname(os.path.abspath(path)) or cwd
+        tctx = repo_context(target_dir)
+        if tctx is None or tctx["is_worktree"]:
+            allow()  # not a repo, or already isolated => allow
+        tld = lock_dir(tctx["common_dir"])
+        if (tld / OVERRIDE_FILENAME).exists():
+            allow()  # per-repo escape hatch
+        main_others = [o for o in live_others(tld, session_id) if not o.get("is_worktree")]
+        if main_others:
+            deny(deny_reason_edit(main_others, target_dir, tld, path))
+        allow()
+
+    command = (payload.get("tool_input") or {}).get("command", "")
 
     # Resolve the effective repo of each git op (honoring cd / git -C) and block
     # only the first contended op against a shared, contended main checkout.
