@@ -42,6 +42,17 @@ Pre-spec checks (run IN ORDER, before drafting BRD/PRD/ADR or writing code):
 
 Custom shapes that diverge from the canonical require an explicit "why not canonical" sentence in the spec — name the canonical, name the disqualifier, choose the alternative. Silence is not an acceptable answer.
 
+## Calibrate rigor to stakes, not to an architectural proxy
+
+A piece of work's quality bar is set by **its true stakes — who depends on it and what they decide or risk** — not by an easy proxy like where it sits in the architecture. Classifying by the proxy ("it's just an index page," "it's only an internal endpoint," "it's just a util") and inheriting that proxy's default bar is the recurring miss. The absence of a mechanical gate (lint, type check, review) that would have forced the higher bar is **not** permission to lower it.
+
+This is a thermostat, not a hammer — it moves **both** directions, and effort scales to stakes:
+
+- **Frontend / design.** The bar is set by audience. Anything a non-engineer will see and judge the product by — landing pages, demo galleries, shareable or offsite links, marketing and stakeholder-facing pages, even standalone static HTML outside the app's design-system routes — clears the flagship bar regardless of where the file lives. A surface only engineers see keeps a low bar; gold-plating it is the same error inverted. Match the response to stakes: full design discipline for high-stakes judged surfaces, design-system + sane defaults for simpler judged ones, ship-it-working for engineer-only.
+- **The general shape, watch for it elsewhere.** Security rigor set by data sensitivity and reachability, not by "internal vs external" labels. Test depth set by blast radius, not by "it's a small module." API/contract durability set by who consumes it, not by where the handler lives. Doc depth set by the reader, not by the filename.
+
+Pre-build check, in any domain: **who depends on this, and what are they deciding or risking?** Let that answer set the bar — then match the weight of your process to it, reaching for the heaviest tool only when the stakes earn it.
+
 ## Multi-session work isolation (worktrees mandatory)
 
 When work splits across parallel sessions or subagents — any time more than one session has independent work in flight against the same repo — each session MUST operate in its own git worktree, not the shared working directory. Sessions sharing a working directory will switch each other's branches under each other's feet; commits land on the wrong branch.
