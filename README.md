@@ -41,6 +41,7 @@ The craft skills are self-contained — drop them in and they work:
 |---|---|
 | `campsite` (command + hook) | Toggle "leave it better than you found it": no shims, fix-as-discovered, touched files end clean |
 | `deepen` | Find architectural deepening opportunities (Ousterhout's depth/seam vocabulary, the deletion test) |
+| `symbol-surgery` | Symbol-first refactoring discipline on the native LSP tool: locate by symbol, check blast radius, edit at boundaries, verify references (executes what `deepen` decides) |
 | `diagnose` | Disciplined hard-bug loop: reproduce → minimise → hypothesise → instrument → fix → regression-test |
 | `grill-with-docs` | Stress-test a plan against your domain model and documented decisions |
 | `tdd` | Red-green-refactor with deep-module and mocking guidance |
