@@ -306,8 +306,13 @@ def _edit_target_path(payload: dict) -> str | None:
 # --- block message -----------------------------------------------------------
 
 def suggest_worktree(repo_dir: str) -> str:
+    # Paste-ready: concrete generated branch + absolute path, no placeholders.
+    # Agents fumbled 2-4 turns filling in <branch> templates; a runnable
+    # command removes that. Rename the branch later if a semantic name fits.
     repo = os.path.basename(repo_dir.rstrip("/")) or "repo"
-    return f"git -C {repo_dir} worktree add ../{repo}-<branch> -b <branch> && cd ../{repo}-<branch>"
+    branch = f"wt-{time.strftime('%m%d-%H%M%S')}"
+    wt_path = os.path.normpath(os.path.join(repo_dir, f"../{repo}-{branch}"))
+    return f"git -C {repo_dir} worktree add {wt_path} -b {branch} && cd {wt_path}"
 
 
 def deny_reason(others: list[dict], repo_dir: str, ld: Path) -> str:
