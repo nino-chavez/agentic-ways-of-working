@@ -68,6 +68,50 @@ When work splits across parallel sessions or subagents — any time more than on
 
 **Enforcement (mechanical, not advisory):** [`hooks/worktree-guard.py`](../hooks/worktree-guard.py) makes this a hard gate, not a hope. Each session writes a heartbeat lock under `<repo>/.git/.claude-sessions/`. When another session's lock is live and you attempt a contended git op (`commit`, branch create/switch) from the **shared main checkout**, the PreToolUse hook DENIES it and hands back the exact `git worktree add` remedy. Commits from inside a linked worktree are always allowed (already isolated); a solo session is never blocked. It resolves the *effective* repo of the command (tracking `cd` and `git -C`), so committing to a quiet repo from a session that lives in a busy one is not blocked. Fail-open on any uncertainty. Per-repo escape hatch: `touch <repo>/.git/.claude-sessions/.guard-off`. Wired by `install.sh` (SessionStart / PreToolUse / SessionEnd).
 
+## Token economics — a payload's cost is its size times the turns that follow it
+
+The agent API is stateless: every tool call replays the entire conversation. A
+token that lands in context at turn 5 of a 200-turn session is re-read ~195
+times; the same token in a 20-turn session, ~15. Measured on a real 60-day
+corpus, the average replay multiplier was **41×** — which makes session cost
+roughly quadratic in turn count, and makes session hygiene worth more than
+every payload-trimming trick combined. Derived rules:
+
+- **Session hygiene is the biggest lever.** `/clear` between serial tasks; end
+  finished sessions instead of idling them (the prompt cache expires after ~5
+  idle minutes, so each casual resume of a fat session rewrites the whole
+  context at premium rate). Two 50-turn sessions cost roughly half the cache
+  reads of one 100-turn session doing the same work.
+- **Subagents are context firewalls, not just parallelism.** An exploration
+  subagent's file reads die with it; only the summary enters the main context
+  and gets multiplied. Delegate any "find out X" needing more than ~3 file
+  reads when the main task only needs the conclusion. Read inline only what
+  you are about to edit or must cite verbatim.
+- **Batch independent tool calls.** N reads issued as one parallel block is 2
+  context replays instead of 2N.
+- **Screenshot the element under iteration, not the page.** Images are billed
+  by pixel dimensions; a full-resolution page capture costs ~5x a component
+  crop, recurring every design-loop iteration.
+- **Measure before optimizing.** Intuitions about which tool is expensive are
+  routinely wrong — run [`tools/token-audit.py`](../tools/token-audit.py)
+  against the session logs first ([method](../docs/token-audit.md)).
+
+**Enforcement (mechanical, not advisory):**
+[`hooks/read-guard.py`](../hooks/read-guard.py) backstops the two
+mechanically-detectable violations at the Read boundary. Oversized images
+(>1400px long edge) are denied once with a 1000px downscaled copy to read
+instead; re-reads of an unchanged file within 10 minutes are denied once with
+a cite-from-context reminder. The immediate retry always passes —
+post-compaction re-reads are legitimate, so this is friction for the reflexive
+re-read, not a wall. Fail-open on any uncertainty; image branch requires macOS
+`sips` (fails open elsewhere). Escape hatch: `touch
+~/.claude/cache/read-guard/.guard-off`. The session-hygiene half is visibility,
+not blocking: [`statusline.py`](../statusline.py) shows context usage
+color-coded at 50/80% so a fattening session is seen, not discovered. Both
+wired by `install.sh`. The delegation and batching rules are judgment calls a
+hook cannot see — they live here, where the model applies intent a tool-call
+pattern can't reveal.
+
 ## Prose-voice tasks load the voice guide FIRST
 
 For any task producing prose for a human reader — blog posts, essays, decks, presentations, public-facing docs, client deliverables, anything with a byline or intended for an audience other than an agent — load your canonical voice guide BEFORE drafting. A terminal-CLI voice (short, imperative) does NOT cover prose voice; drafting prose from CLI cadence alone produces generic-thoughtful-LinkedIn output.

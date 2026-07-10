@@ -10,8 +10,9 @@
 #   5. Tells you how to point your harness's rules file at principles/working-style.md
 #
 # Symlinks (not copies) so `git pull` updates everything in place. Pass --copy
-# to copy instead. Nothing here touches secrets, and the hooks have no external
-# dependencies.
+# to copy instead. Nothing here touches secrets. Hooks are stdlib-only; the one
+# platform-specific piece is read-guard's image branch (macOS `sips`), which
+# fails open on other platforms.
 #
 set -euo pipefail
 
@@ -45,6 +46,9 @@ head "Hooks -> $CLAUDE_DIR/hooks"
 for f in "$REPO_DIR"/hooks/*.py; do
   place "$f" "$CLAUDE_DIR/hooks/$(basename "$f")"
 done
+
+head "Statusline -> $CLAUDE_DIR/statusline.py"
+place "$REPO_DIR/statusline.py" "$CLAUDE_DIR/statusline.py"
 
 head "Wiring hooks into settings.json"
 SETTINGS="$CLAUDE_DIR/settings.json"
@@ -93,6 +97,16 @@ if ensure("UserPromptSubmit", f"python3 {claude_dir}/hooks/campsite.py", 3):    
 if ensure("SessionStart",     f"python3 {claude_dir}/hooks/worktree-guard.py register", 5):                       added.append("SessionStart:worktree-guard")
 if ensure("PreToolUse",       f"python3 {claude_dir}/hooks/worktree-guard.py check", 5, matcher=GUARD_MATCHER):   added.append("PreToolUse[edit+bash]:worktree-guard")
 if ensure("SessionEnd",       f"python3 {claude_dir}/hooks/worktree-guard.py unregister", 5):                     added.append("SessionEnd:worktree-guard")
+# Read-cost guard: bounce oversized images (with a downscaled copy) and
+# redundant re-reads of unchanged files. Image branch needs macOS sips;
+# fails open elsewhere.
+if ensure("PreToolUse",       f"python3 {claude_dir}/hooks/read-guard.py", 15, matcher="Read"):                   added.append("PreToolUse[Read]:read-guard")
+
+# Context-usage statusline (session-hygiene visibility). Only set if the user
+# has no statusline configured — never clobber an existing one.
+if "statusLine" not in cfg:
+    cfg["statusLine"] = {"type": "command", "command": f"python3 {claude_dir}/statusline.py"}
+    added.append("statusLine:context-usage")
 
 with open(settings_path, "w") as f:
     json.dump(cfg, f, indent=2)
