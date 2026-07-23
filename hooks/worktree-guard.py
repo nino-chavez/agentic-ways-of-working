@@ -309,9 +309,14 @@ def suggest_worktree(repo_dir: str) -> str:
     # Paste-ready: concrete generated branch + absolute path, no placeholders.
     # Agents fumbled 2-4 turns filling in <branch> templates; a runnable
     # command removes that. Rename the branch later if a semantic name fits.
-    repo = os.path.basename(repo_dir.rstrip("/")) or "repo"
+    #
+    # Worktrees live INSIDE the repo at .worktrees/<branch> (2026-07-22): the
+    # earlier ../<repo>-wt-* sibling convention scattered per-session folders
+    # across the parent directory (film-room accumulated five). `.worktrees/`
+    # is ignored machine-wide via the dotfiles-managed ~/.config/git/ignore
+    # (git's default excludes path), so the main checkout's status stays clean.
     branch = f"wt-{time.strftime('%m%d-%H%M%S')}"
-    wt_path = os.path.normpath(os.path.join(repo_dir, f"../{repo}-{branch}"))
+    wt_path = os.path.join(repo_dir, ".worktrees", branch)
     return f"git -C {repo_dir} worktree add {wt_path} -b {branch} && cd {wt_path}"
 
 
