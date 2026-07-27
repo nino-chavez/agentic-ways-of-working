@@ -22,6 +22,13 @@ cd "$REPO" || exit 1
 # (If you WANT to use a metered API key instead, comment the next line out.)
 unset ANTHROPIC_API_KEY
 
+# Tell worktree-guard this session cannot contend for the checkout. The
+# allowlist below is git show/diff/log/blame + Read/Glob/Grep — no commit, no
+# branch switch, no edit. Without this the reviewer's session lock made every
+# commit block the next one in the same repo, because reviewing commit N is
+# still in flight when commit N+1 runs.
+export CLAUDE_GUARD_ROLE=readonly
+
 GIT_DIR="$(git rev-parse --git-dir)"
 OUT="$GIT_DIR/last-review.md"
 SHORT="${SHA:0:7}"

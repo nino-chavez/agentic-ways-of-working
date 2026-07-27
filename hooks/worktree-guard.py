@@ -21,6 +21,9 @@ shared by the main checkout and every linked worktree, so locks are visible to
 all sessions of a repo regardless of which checkout they sit in. The file mtime
 is a heartbeat, refreshed on every Bash tool call; a lock older than
 STALE_SECONDS is treated as a dead session and pruned. SessionEnd removes it.
+A session that exports CLAUDE_GUARD_ROLE=readonly (the post-commit review hook
+does) still registers, but is never counted as contention — it cannot commit,
+switch branches or edit, so it cannot stomp anyone.
 
 Effective-repo resolution: the guard does not blindly use the session cwd. It
 walks the shell command, tracking `cd <dir>` and honoring `git -C <dir>`, so a
@@ -54,6 +57,8 @@ STALE_SECONDS = 15 * 60  # a lock older than this = dead session, prune it
 LOCK_DIRNAME = ".claude-sessions"
 OVERRIDE_FILENAME = ".guard-off"
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit"}  # file-mutating tools guarded alongside Bash
+ROLE_ENV = "CLAUDE_GUARD_ROLE"  # a session may declare itself non-contending
+READONLY_ROLE = "readonly"
 
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _SEPARATORS = {"&&", "||", ";", "|", "|&", "&"}
@@ -114,6 +119,25 @@ def lock_dir(common_dir: str) -> Path:
 
 # --- lock lifecycle ----------------------------------------------------------
 
+def session_role() -> str:
+    """This session's declared role, normalized. "" when undeclared.
+
+    A session that cannot mutate the checkout cannot stomp another one, so it
+    must not be counted as contention. The post-commit `claude-review` hook is
+    the motivating case: it launches a headless session whose allowlist is
+    `git show/diff/log/blame`, Read, Glob, Grep — no commit, no branch switch,
+    no edit. Left undeclared, its lock made *every* commit block the next one in
+    the same repo, since the review of commit N is still live when commit N+1
+    runs. Declared readonly, it registers for visibility but never contends.
+
+    Opt-in by design: an undeclared session is assumed to contend, so this can
+    only ever loosen the guard for a session that has explicitly said it is safe
+    to ignore.
+    """
+    role = os.environ.get(ROLE_ENV, "").strip().lower()
+    return role if role == READONLY_ROLE else ""
+
+
 def write_lock(ld: Path, session_id: str, cwd: str, ctx: dict) -> None:
     ld.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -121,6 +145,7 @@ def write_lock(ld: Path, session_id: str, cwd: str, ctx: dict) -> None:
         "cwd": cwd,
         "branch": ctx["branch"],
         "is_worktree": ctx["is_worktree"],
+        "role": session_role(),
         "ts": int(time.time()),
     }
     tmp = ld / f".{session_id}.tmp"
@@ -149,7 +174,13 @@ def prune_stale(ld: Path, keep_session: str) -> None:
 
 
 def live_others(ld: Path, my_session: str) -> list[dict]:
-    """Other sessions whose lock is fresh (mtime within STALE_SECONDS)."""
+    """Other sessions whose lock is fresh (mtime within STALE_SECONDS).
+
+    Contention only. Sessions that declared themselves readonly are skipped —
+    they cannot stomp a checkout, so counting them would block legitimate solo
+    work, which is the failure mode this guard is explicitly built to avoid.
+    Locks written before the role field existed have no `role` and still count.
+    """
     now = time.time()
     out: list[dict] = []
     try:
@@ -162,7 +193,10 @@ def live_others(ld: Path, my_session: str) -> list[dict]:
         try:
             if now - f.stat().st_mtime > STALE_SECONDS:
                 continue
-            out.append(json.loads(f.read_text(encoding="utf-8")))
+            data = json.loads(f.read_text(encoding="utf-8"))
+            if data.get("role") == READONLY_ROLE:
+                continue
+            out.append(data)
         except Exception:
             continue
     return out
