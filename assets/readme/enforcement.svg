@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="392" viewBox="0 0 1200 392"
+     role="img" aria-labelledby="enfTitle enfDesc">
+  <title id="enfTitle">The three hooks and what each one denies</title>
+  <desc id="enfDesc">anti-hesitation bounces a turn that ends on a permission question and forces a status sentence. worktree-guard denies a contended git commit in a shared checkout and hands back the git worktree add command. read-guard denies an oversized image read and an unchanged-file re-read, handing back a downscaled copy and a cite-from-context reminder.</desc>
+
+  <rect width="1200" height="392" rx="24" fill="#0a0e14"/>
+
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+    <!-- column headers -->
+    <g font-size="16" fill="#8b949e" letter-spacing="1.4">
+      <text x="56" y="58">HOOK</text>
+      <text x="352" y="58">WHAT IT DENIES</text>
+      <text x="784" y="58">WHAT COMES BACK</text>
+    </g>
+    <line x1="56" y1="76" x2="1144" y2="76" stroke="#1c2330" stroke-width="1"/>
+
+    <!-- row 1 — anti-hesitation -->
+    <text x="56" y="124" font-size="17" fill="#e6edf3">anti-hesitation</text>
+    <text x="56" y="148" font-size="16" fill="#8b949e">Stop</text>
+    <g stroke="#f85149" stroke-width="2" stroke-linecap="round">
+      <path d="M352 112 l11 11 M363 112 l-11 11"/>
+    </g>
+    <text x="380" y="124" font-size="17" fill="#e6edf3">a turn that ends on “want me to</text>
+    <text x="380" y="148" font-size="17" fill="#e6edf3">keep going?”</text>
+    <g stroke="#3fb950" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none">
+      <path d="M784 118 l5 6 l10 -13"/>
+    </g>
+    <text x="812" y="124" font-size="17" fill="#e6edf3">bounced — restate it as a</text>
+    <text x="812" y="148" font-size="17" fill="#e6edf3">status sentence</text>
+    <line x1="56" y1="180" x2="1144" y2="180" stroke="#1c2330" stroke-width="1"/>
+
+    <!-- row 2 — worktree-guard -->
+    <text x="56" y="228" font-size="17" fill="#e6edf3">worktree-guard</text>
+    <text x="56" y="252" font-size="16" fill="#8b949e">PreToolUse · Bash</text>
+    <g stroke="#f85149" stroke-width="2" stroke-linecap="round">
+      <path d="M352 216 l11 11 M363 216 l-11 11"/>
+    </g>
+    <text x="380" y="228" font-size="17" fill="#e6edf3">git commit in a shared checkout</text>
+    <text x="380" y="252" font-size="17" fill="#e6edf3">while another session is live</text>
+    <g stroke="#3fb950" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none">
+      <path d="M784 222 l5 6 l10 -13"/>
+    </g>
+    <text x="812" y="228" font-size="17" fill="#e6edf3">the exact git worktree add</text>
+    <text x="812" y="252" font-size="17" fill="#e6edf3">remedy, paste-ready</text>
+    <line x1="56" y1="284" x2="1144" y2="284" stroke="#1c2330" stroke-width="1"/>
+
+    <!-- row 3 — read-guard -->
+    <text x="56" y="332" font-size="17" fill="#e6edf3">read-guard</text>
+    <text x="56" y="356" font-size="16" fill="#8b949e">PreToolUse · Read</text>
+    <g stroke="#f85149" stroke-width="2" stroke-linecap="round">
+      <path d="M352 320 l11 11 M363 320 l-11 11"/>
+    </g>
+    <text x="380" y="332" font-size="17" fill="#e6edf3">a 2400px screenshot, or a re-read</text>
+    <text x="380" y="356" font-size="17" fill="#e6edf3">of a file that has not changed</text>
+    <g stroke="#3fb950" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none">
+      <path d="M784 326 l5 6 l10 -13"/>
+    </g>
+    <text x="812" y="332" font-size="17" fill="#e6edf3">a 1000px copy; a reminder to</text>
+    <text x="812" y="356" font-size="17" fill="#e6edf3">cite what is already in context</text>
+  </g>
+</svg>

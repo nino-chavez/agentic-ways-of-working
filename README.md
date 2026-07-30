@@ -1,26 +1,60 @@
-# Agentic Ways of Working
+<p align="center">
+  <img src="./assets/readme/hero.svg" width="100%" alt="Agentic Ways of Working — one canonical principles doc at principles/working-style.md, read by CLAUDE.md, AGENTS.md, and GEMINI.md through thin per-tool adapters">
+</p>
 
 There are two honest ways to share how you work with AI, and both are incomplete.
 
 You can publish your dotfiles — but those carry your secrets, your machine paths, and a corpus of your own prompts. What ships isn't a method; it's a fingerprint. Or you can write the essay — the principles, the philosophy, the "here's how I think about agents" post. That travels anywhere, and installs into nothing.
 
-This repo is the layer between. The transferable middle: the rules an agent actually reads, the skills it actually runs, the hooks that actually fire — extracted from a private cross-machine setup and stripped of everything that was *me* rather than *method*. You can clone it, run one script, and have the same working stance enforced in your own sessions by tonight.
+This repo is the layer between: the rules an agent actually reads, the skills it actually runs, the hooks that actually fire. Extracted from a private cross-machine setup and stripped of everything that was *me* rather than *method*. Clone it, run one script, and the same working stance is enforced in your own sessions tonight.
 
-## The one idea worth stealing
+## Principles are prose. These have teeth.
+
+Most "how I work with AI" material is advice you have to remember. The difference here is that the highest-value rules are wired to hooks that fire whether or not the model cooperates.
+
+<p align="center">
+  <img src="./assets/readme/enforcement.svg" width="100%" alt="Three hooks and what each denies: anti-hesitation bounces a turn ending on a permission question and forces a status sentence; worktree-guard denies a git commit in a shared checkout while another session is live and hands back the git worktree add remedy; read-guard denies a 2400px screenshot or an unchanged-file re-read and returns a 1000px copy plus a cite-from-context reminder">
+</p>
+
+All three fail open: an uncertain hook allows the action rather than blocking your work. The two `PreToolUse` guards also take a per-scope escape hatch — a `.guard-off` file — when you need them out of the way entirely.
+
+## Install
+
+```bash
+git clone https://github.com/nino-chavez/agentic-ways-of-working.git
+cd agentic-ways-of-working
+./install.sh            # symlinks into ~/.claude, wires hooks, backs up settings.json
+# ./install.sh --copy   # copy instead of symlink, if you'd rather not track this repo
+```
+
+Idempotent and reversible: it backs up `settings.json` before touching it, only adds hook registrations that aren't already present, and symlinks by default so `git pull` updates everything in place. It won't overwrite your existing rules file — that one line is left for you to run deliberately, and it prints the command.
+
+Then restart your session so the hooks load.
+
+## One doc, every harness
 
 Every harness wants its own rules file. Claude Code reads `CLAUDE.md`. Codex reads `AGENTS.md`. Gemini reads `GEMINI.md`. The naive move is to maintain three copies and watch them drift until they quietly disagree about how you work.
 
 So there's exactly one canonical doc — [`principles/working-style.md`](principles/working-style.md) — and each harness gets a thin [adapter](adapters/) that points at it. Edit the principles once; every tool picks up the change on its next read. The principles themselves assume nothing about which model is driving.
 
-What's in them:
+| Principle | What it changes | Enforced by |
+|---|---|---|
+| **Default to action** | One "go" covers the thread. Turns end on a status sentence, not a permission check | [`anti-hesitation.py`](hooks/anti-hesitation.py) |
+| **Worktree isolation** | Parallel sessions never share a checkout, so commits can't land on each other's branch | [`worktree-guard.py`](hooks/worktree-guard.py) |
+| **Token economics** | Session hygiene beats payload trimming; subagents are context firewalls | [`read-guard.py`](hooks/read-guard.py) + [statusline](statusline.py) |
+| **Harness hygiene** | Know what loads, what's used, and what's backed up before it disappears | [`/doctor`](commands/doctor.md) |
+| **Canonical-pattern-first** | Read the vendor's approach before hand-rolling auth, payments, or webhooks. Custom shapes name their disqualifier | judgment |
+| **Calibrate rigor to stakes** | The bar comes from who depends on the work, not from where the file sits | judgment |
+| **Prose voice, no fabrication** | Human-facing prose loads the voice guide first, and never invents an interior state the author didn't have | judgment |
+| **Secret handling** | Secrets live in a manager; check for an existing entry before inventing a name | judgment |
 
-- **Decision bias — default to action.** The single highest-leverage rule. Agents pad turns with "want me to keep going?" permission-checks that cost you the one thing you can't get back: the time spent waiting to say yes to something that didn't need asking. The rule names the failure shape precisely, and a [Stop hook](hooks/anti-hesitation.py) enforces it — if the agent ends a turn on a hesitation question, it gets bounced back to restate it as a status sentence.
-- **Canonical-pattern-first for infrastructure.** Before writing auth or payments or webhooks, read the vendor's recommended approach and check your own repos for a working version. Custom shapes have to name what disqualified the canonical one. Silence isn't an answer.
-- **Worktree isolation.** The moment two sessions touch one repo, they get separate git worktrees — otherwise they switch each other's branches mid-flight and commits land in the wrong place. A [PreToolUse hook](hooks/worktree-guard.py) enforces it: a contended git op in a shared checkout while another session is live gets denied, with the `git worktree add` remedy handed back.
-- **Token economics.** The agent API is stateless — every tool call replays the whole conversation, so a payload's cost is its size times the turns that follow it (measured at 41× on a real 60-day corpus). Session hygiene beats payload trimming; subagents are context firewalls; a full-page screenshot costs ~5× a component crop. A [PreToolUse hook](hooks/read-guard.py) enforces the mechanically-detectable half (oversized images get a downscaled copy, redundant re-reads get bounced once), a [context statusline](statusline.py) makes the session-hygiene half visible, and [`tools/token-audit.py`](tools/token-audit.py) measures your own corpus before you optimize anything ([method](docs/token-audit.md)).
-- **Harness hygiene.** The harness (skills, commands, hooks, MCP servers, memory) rots two ways: bloat that accumulates, and good tooling that quietly disappears because it was never version-controlled. Both showed up in the same audit — a working harness-cleaner command was built, ran, and vanished in four days; a dozen more extensions were found sitting in the identical unbacked state. [`commands/doctor.md`](commands/doctor.md) maps the whole harness read-only, proposes fixes, and applies nothing without confirmation — including a check for whether each extension it finds is backed by version control at all.
-- **Prose-voice and fabrication guardrails.** Prose for a human reader loads the voice guide first; reflective prose never invents an interior state the author didn't actually have.
-- **Secret handling.** Secrets live in a manager, never in files, and you check for an existing entry before inventing a new name — the convention that prevents silent install-time drift.
+The judgment rows are deliberate. A hook can see a tool call; it can't see intent, so those rules live in prose where the model applies them.
+
+### Two of these came from measurement, not opinion
+
+**Token economics.** The agent API is stateless — every tool call replays the whole conversation, so a payload's cost is its size times the turns that follow it. Measured on a real 60-day corpus: a **41× replay multiplier**, which makes session cost roughly quadratic in turn count. Three of four starting hypotheses were wrong. The prime suspect, web fetches dumping raw HTML, was innocent in all 873 of them; the actual drivers were session length and full-page screenshots re-read dozens of times. Run [`tools/token-audit.py`](tools/token-audit.py) against your own logs before optimizing anything ([method](docs/token-audit.md)).
+
+**Harness hygiene.** The harness rots two ways: bloat that accumulates, and good tooling that quietly disappears because it was never version-controlled. Both turned up in the same audit — a working harness-cleaner command was built, ran successfully, and vanished within four days, and a dozen more extensions were found sitting in that identical unbacked state. [`/doctor`](commands/doctor.md) maps the whole harness read-only and applies nothing without confirmation, including a check for whether each extension it finds is backed by version control at all.
 
 ## What's in the box
 
@@ -29,7 +63,7 @@ principles/working-style.md   The canonical doc. Harness-agnostic. Start here.
 adapters/                     Thin pointers: CLAUDE.md, AGENTS.md, GEMINI.md
 skills/                       The methodology suite (see below)
 commands/campsite.md          /campsite — toggle the north-star working stance
-commands/doctor.md            /doctor — health-check and clean up your own Claude Code harness
+commands/doctor.md            /doctor — health-check and clean up your own harness
 hooks/                        anti-hesitation, campsite, blueprint-session-start, worktree-guard, read-guard
 git-hooks/                    Local post-commit Claude review on commits worth reviewing
 tools/token-audit.py          Measure where your sessions actually spend tokens
@@ -46,7 +80,7 @@ The craft skills are self-contained — drop them in and they work:
 |---|---|
 | `campsite` (command + hook) | Toggle "leave it better than you found it": no shims, fix-as-discovered, touched files end clean |
 | `deepen` | Find architectural deepening opportunities (Ousterhout's depth/seam vocabulary, the deletion test) |
-| `symbol-surgery` | Symbol-first refactoring discipline on the native LSP tool: locate by symbol, check blast radius, edit at boundaries, verify references (executes what `deepen` decides) |
+| `symbol-surgery` | Symbol-first refactoring on the native LSP tool: locate by symbol, check blast radius, edit at boundaries, verify references (executes what `deepen` decides) |
 | `diagnose` | Disciplined hard-bug loop: reproduce → minimise → hypothesise → instrument → fix → regression-test |
 | `grill-with-docs` | Stress-test a plan against your domain model and documented decisions |
 | `tdd` | Red-green-refactor with deep-module and mocking guidance |
@@ -55,60 +89,34 @@ The craft skills are self-contained — drop them in and they work:
 | `zoom-out` | Pull up from the diff to the system before committing to a direction |
 | `write-a-skill` | Author new skills with progressive disclosure and bundled resources |
 
-The `blueprint-*` suite (`research`, `prototype`, `docs`, `validate`, `deploy`, `dispatch`, `triage`, `handoff`, `amendment`) encodes a brownfield-redesign methodology — diagnose current state, prescribe, prototype the proposed state. These are the most opinionated artifacts here and they pair with a separate Blueprint methodology repo; point `BLUEPRINT_HOME` at your clone of it. Take them as a worked example of how far you can push a methodology into skills, not as a turnkey drop-in.
+The `blueprint-*` suite (`research`, `prototype`, `docs`, `validate`, `deploy`, `dispatch`, `triage`, `handoff`, `amendment`) encodes a brownfield-redesign methodology — diagnose current state, prescribe, prototype the proposed state. These are the most opinionated artifacts here and they pair with a separate Blueprint methodology repo; point `BLUEPRINT_HOME` at your clone of it. Take them as a worked example of how far a methodology can push into skills, not as a turnkey drop-in.
 
 ### Git hooks
 
 The Claude Code hooks above fire inside a session. [`git-hooks/`](git-hooks/) is the other direction: a git `post-commit` hook that runs a focused Claude review *after* a commit — but only on the commits worth it (a configurable line threshold, or a touched sensitive path like `auth/` or `*.sql`). It's the local-first answer to a PR-gated review action: no PR required, async so the commit returns instantly, and billed to your Claude subscription rather than a metered API key (it unsets `ANTHROPIC_API_KEY` before calling `claude`). Merge commits and rebase replays are skipped so a ten-commit rebase doesn't fan out ten reviews. Self-contained with its own `install.sh` — see [`git-hooks/README.md`](git-hooks/README.md).
 
-## Install
+## In practice
 
-```bash
-git clone https://github.com/nino-chavez/agentic-ways-of-working.git
-cd agentic-ways-of-working
-./install.sh            # symlinks into ~/.claude, wires hooks, backs up settings.json
-# ./install.sh --copy   # copy instead of symlink, if you'd rather not track this repo
-```
-
-The installer is idempotent and reversible: it backs up `settings.json` before touching it, only adds hook registrations that aren't already present, and symlinks by default so `git pull` updates everything in place. It won't overwrite your existing rules file — that one line is left for you to run deliberately (it prints the command).
-
-Then restart your session so the hooks load. Toggle the north-star stance per-project with `/campsite on`.
-
-## Usage in practice
-
-The point isn't the files — it's what changes in a session. Three things you'll notice once it's installed.
-
-**1. The agent stops asking permission to continue.** The decision-bias principle plus the `anti-hesitation` Stop hook mean a turn can't end on a permission-gating question when the direction is already set. If the model tries to close with one, the hook bounces it:
-
-```
-✗  "I've drafted the migration. Want me to apply it next, or stop here?"
-       └─ Stop hook fires → forces a restate
-
-✓  "Migration drafted and applied; tests green. Moving to the rollback script next."
-```
-
-One "go" covers the whole thread, not one step at a time.
-
-**2. Campsite Mode raises the bar, per-project.** Turn it on when you want north-star-only work — no shims, fix-as-discovered, touched files end clean:
+**Campsite Mode raises the bar, per project.** Turn it on when you want north-star-only work — no shims, fix-as-discovered, touched files end clean:
 
 ```bash
 /campsite on      # → "Campsite Mode ON — north-star only, fix-as-discovered, touched files end clean."
-# ... do the work; pre-existing defects in files you touch get fixed in the same change ...
+# ... pre-existing defects in files you touch get fixed in the same change ...
 /campsite off     # → back to scoped, surgical edits
 ```
 
 The flag lives at `<project>/.claude/campsite-mode`, so each repo opts in independently.
 
-**3. Skills fire on intent, not ceremony.** You don't memorize commands — describe the work and the matching skill engages:
+**Skills fire on intent, not ceremony.** You don't memorize commands — describe the work and the matching skill engages:
 
 ```
-"this test is flaky and I can't reproduce it"        → diagnose   (reproduce → minimise → instrument → fix)
-"does this module actually pull its weight?"          → deepen     (depth/seam/locality, the deletion test)
-"ship it"                                             → ship       (reads the project's DEPLOY.md, executes)
-"stress-test this plan against our domain model"      → grill-with-docs
+"this test is flaky and I can't reproduce it"     → diagnose   (reproduce → minimise → instrument → fix)
+"does this module actually pull its weight?"      → deepen     (depth/seam/locality, the deletion test)
+"ship it"                                         → ship      (reads the project's DEPLOY.md, executes)
+"stress-test this plan against our domain model"  → grill-with-docs
 ```
 
-Same principles apply whichever harness reads them — point Codex at `adapters/AGENTS.md` or Gemini at `adapters/GEMINI.md` and the decision-bias, canonical-first, and worktree rules travel unchanged.
+Point Codex at `adapters/AGENTS.md` or Gemini at `adapters/GEMINI.md` and the decision-bias, canonical-first, and worktree rules travel unchanged.
 
 ## What's deliberately not here
 
