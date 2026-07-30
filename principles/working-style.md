@@ -112,6 +112,50 @@ wired by `install.sh`. The delegation and batching rules are judgment calls a
 hook cannot see — they live here, where the model applies intent a tool-call
 pattern can't reveal.
 
+## Harness hygiene — a good tool that isn't durable is rot waiting to happen
+
+Everything wrapped around the model — instructions, skills, commands, hooks,
+MCP servers, memory files — is the harness, and it grows the way ships grow
+barnacles: one correction at a time, never subtracted. The instinct is to
+treat this as an accumulation problem (too much stuff) and reach for a
+cleanup pass. Measured against a real setup, accumulation was the smaller
+failure. The larger one was persistence: a genuinely good piece of harness
+tooling was built, ran successfully, and disappeared within days because it
+lived nowhere version-controlled — no error, no log, nothing to `git diff`,
+just gone, undetected until a transcript search happened to surface it. A
+harness audit of the same setup then found a dozen more extensions sitting in
+that identical unbacked state, in active use in some cases, right now.
+
+Derived rules:
+
+- **Map before you clean.** You cannot prune what you haven't inventoried.
+  Usage counters (lifetime, not windowed) plus session-transcript hits are
+  the only honest signal for "is this earning its place" — intuition about
+  which skill is dead weight is no more reliable than intuition about which
+  tool call is expensive (see Token economics, above).
+- **A tool's durability is a property of where it lives, not how well it
+  works.** Something that runs correctly and produces real fixes is not
+  "done" until it is a tracked file or a symlink into one. An untracked
+  extension — including a symlink whose target is a legitimate git checkout
+  but whose *pointer* was never committed — is exposed to total, silent loss
+  regardless of how well it performed the one time it ran.
+- **Hard requirements need hard checks, including this one.** A harness
+  cleaner that only produces advice repeats the failure it exists to catch —
+  a correct diagnosis nobody acts on is indistinguishable from no diagnosis.
+  [`commands/doctor.md`](../commands/doctor.md) audits installation health,
+  unused skills/MCP servers/plugins (with context-cost accounting that knows
+  which tool schemas are deferred and therefore free), memory-file
+  duplication, derivable content in checked-in `CLAUDE.md` files, slow hooks,
+  version currency, permission-mode defaults, and read-only commands worth
+  pre-approving — and includes a check for exactly the failure mode above:
+  whether each extension it finds is backed by version control or not. It
+  proposes every fix read-only first and applies nothing without
+  confirmation.
+- **A durable tool is re-runnable by design.** `/doctor`'s checks are
+  read-only scans before they are anything else, specifically so the same
+  audit can run again later and catch drift the first run didn't — including
+  drift in itself, now that it checks its own kind of failure.
+
 ## Prose-voice tasks load the voice guide FIRST
 
 For any task producing prose for a human reader — blog posts, essays, decks, presentations, public-facing docs, client deliverables, anything with a byline or intended for an audience other than an agent — load your canonical voice guide BEFORE drafting. A terminal-CLI voice (short, imperative) does NOT cover prose voice; drafting prose from CLI cadence alone produces generic-thoughtful-LinkedIn output.

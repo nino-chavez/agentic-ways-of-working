@@ -18,6 +18,7 @@ What's in them:
 - **Canonical-pattern-first for infrastructure.** Before writing auth or payments or webhooks, read the vendor's recommended approach and check your own repos for a working version. Custom shapes have to name what disqualified the canonical one. Silence isn't an answer.
 - **Worktree isolation.** The moment two sessions touch one repo, they get separate git worktrees — otherwise they switch each other's branches mid-flight and commits land in the wrong place. A [PreToolUse hook](hooks/worktree-guard.py) enforces it: a contended git op in a shared checkout while another session is live gets denied, with the `git worktree add` remedy handed back.
 - **Token economics.** The agent API is stateless — every tool call replays the whole conversation, so a payload's cost is its size times the turns that follow it (measured at 41× on a real 60-day corpus). Session hygiene beats payload trimming; subagents are context firewalls; a full-page screenshot costs ~5× a component crop. A [PreToolUse hook](hooks/read-guard.py) enforces the mechanically-detectable half (oversized images get a downscaled copy, redundant re-reads get bounced once), a [context statusline](statusline.py) makes the session-hygiene half visible, and [`tools/token-audit.py`](tools/token-audit.py) measures your own corpus before you optimize anything ([method](docs/token-audit.md)).
+- **Harness hygiene.** The harness (skills, commands, hooks, MCP servers, memory) rots two ways: bloat that accumulates, and good tooling that quietly disappears because it was never version-controlled. Both showed up in the same audit — a working harness-cleaner command was built, ran, and vanished in four days; a dozen more extensions were found sitting in the identical unbacked state. [`commands/doctor.md`](commands/doctor.md) maps the whole harness read-only, proposes fixes, and applies nothing without confirmation — including a check for whether each extension it finds is backed by version control at all.
 - **Prose-voice and fabrication guardrails.** Prose for a human reader loads the voice guide first; reflective prose never invents an interior state the author didn't actually have.
 - **Secret handling.** Secrets live in a manager, never in files, and you check for an existing entry before inventing a new name — the convention that prevents silent install-time drift.
 
@@ -28,6 +29,7 @@ principles/working-style.md   The canonical doc. Harness-agnostic. Start here.
 adapters/                     Thin pointers: CLAUDE.md, AGENTS.md, GEMINI.md
 skills/                       The methodology suite (see below)
 commands/campsite.md          /campsite — toggle the north-star working stance
+commands/doctor.md            /doctor — health-check and clean up your own Claude Code harness
 hooks/                        anti-hesitation, campsite, blueprint-session-start, worktree-guard, read-guard
 git-hooks/                    Local post-commit Claude review on commits worth reviewing
 tools/token-audit.py          Measure where your sessions actually spend tokens
