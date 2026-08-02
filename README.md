@@ -31,6 +31,8 @@ Idempotent and reversible: it backs up `settings.json` before touching it, only 
 
 Then restart your session so the hooks load.
 
+The installer currently targets Claude Code. For Codex, point `AGENTS.md` at [`adapters/AGENTS.md`](adapters/AGENTS.md) and link the skills you want into `~/.codex/skills/`; the [session-retention guide](docs/session-retention.md#install-the-closeout-skill) includes the exact command for `session-closeout`.
+
 ## One doc, every harness
 
 Every harness wants its own rules file. Claude Code reads `CLAUDE.md`. Codex reads `AGENTS.md`. Gemini reads `GEMINI.md`. The naive move is to maintain three copies and watch them drift until they quietly disagree about how you work.
@@ -42,6 +44,7 @@ So there's exactly one canonical doc — [`principles/working-style.md`](princip
 | **Default to action** | One "go" covers the thread. Turns end on a status sentence, not a permission check | [`anti-hesitation.py`](hooks/anti-hesitation.py) |
 | **Worktree isolation** | Parallel sessions never share a checkout, so commits can't land on each other's branch | [`worktree-guard.py`](hooks/worktree-guard.py) |
 | **Token economics** | Session hygiene beats payload trimming; subagents are context firewalls | [`read-guard.py`](hooks/read-guard.py) + [statusline](statusline.py) |
+| **Session retention** | Promote durable truth before raw transcripts expire; lifecycle hooks enqueue and background workers mine | [`session-closeout`](skills/session-closeout/SKILL.md) + [retention pattern](docs/session-retention.md) |
 | **Harness hygiene** | Know what loads, what's used, and what's backed up before it disappears | [`/doctor`](commands/doctor.md) |
 | **Canonical-pattern-first** | Read the vendor's approach before hand-rolling auth, payments, or webhooks. Custom shapes name their disqualifier | judgment |
 | **Calibrate rigor to stakes** | The bar comes from who depends on the work, not from where the file sits | judgment |
@@ -50,9 +53,11 @@ So there's exactly one canonical doc — [`principles/working-style.md`](princip
 
 The judgment rows are deliberate. A hook can see a tool call; it can't see intent, so those rules live in prose where the model applies them.
 
-### Two of these came from measurement, not opinion
+### Three of these came from measurement, not opinion
 
 **Token economics.** The agent API is stateless — every tool call replays the whole conversation, so a payload's cost is its size times the turns that follow it. Measured on a real 60-day corpus: a **41× replay multiplier**, which makes session cost roughly quadratic in turn count. Three of four starting hypotheses were wrong. The prime suspect, web fetches dumping raw HTML, was innocent in all 873 of them; the actual drivers were session length and full-page screenshots re-read dozens of times. Run [`tools/token-audit.py`](tools/token-audit.py) against your own logs before optimizing anything ([method](docs/token-audit.md)).
+
+**Session retention.** One Codex home directory reached roughly **24 GB**, split between 18.5 GiB of reproducible worktree output and 5.04 GiB of archived transcripts. Mining 605 transcripts produced a 34 MB recall database, but ingestion could not prove that every project-specific lesson had moved into its owning repository. The [`session-closeout`](skills/session-closeout/SKILL.md) skill makes that semantic gate explicit; the [retention pattern](docs/session-retention.md) keeps hooks fast, provenance attached, and deletion behind a current watermark plus human judgment.
 
 **Harness hygiene.** The harness rots two ways: bloat that accumulates, and good tooling that quietly disappears because it was never version-controlled. Both turned up in the same audit — a working harness-cleaner command was built, ran successfully, and vanished within four days, and a dozen more extensions were found sitting in that identical unbacked state. [`/doctor`](commands/doctor.md) maps the whole harness read-only and applies nothing without confirmation, including a check for whether each extension it finds is backed by version control at all.
 
@@ -68,7 +73,7 @@ hooks/                        anti-hesitation, campsite, blueprint-session-start
 git-hooks/                    Local post-commit Claude review on commits worth reviewing
 tools/token-audit.py          Measure where your sessions actually spend tokens
 statusline.py                 Context-usage statusline — the /clear signal
-docs/                         Analysis & essays — token-audit method, Aquifer substrate convergence
+docs/                         Analysis & essays — token audit, session retention, substrate convergence
 install.sh                    Symlinks it all into ~/.claude and wires the hooks
 ```
 
@@ -86,6 +91,7 @@ The craft skills are self-contained — drop them in and they work:
 | `tdd` | Red-green-refactor with deep-module and mocking guidance |
 | `triage` | Move issues through a state machine driven by triage roles |
 | `ship` | Deterministic deploy: reads a per-project `DEPLOY.md` as source of truth |
+| `session-closeout` | Promote durable lessons, name unresolved evidence, and issue an archive-safety receipt |
 | `zoom-out` | Pull up from the diff to the system before committing to a direction |
 | `write-a-skill` | Author new skills with progressive disclosure and bundled resources |
 

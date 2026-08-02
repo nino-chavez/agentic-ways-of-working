@@ -1,0 +1,4 @@
+interface:
+  display_name: "Session Closeout"
+  short_description: "Preserve lessons before archiving tasks"
+  default_prompt: "Use $session-closeout to preserve the durable lessons from this task and produce an archive-safety receipt."
