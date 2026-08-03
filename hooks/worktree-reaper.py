@@ -43,10 +43,13 @@ Safety gates, all fail-open EXCEPT the idleness check, which fails closed:
   - Honors the same `.guard-off` per-repo escape hatch, plus WORKTREE_REAPER_OFF=1.
   - Throttled per-repo via a stamp file: Codex's only hook event is `Stop`, which
     fires PER TURN, so an unthrottled reaper would run constantly. The stamp is
-    written only after a run that FINISHED — writing it first meant a hook killed
-    mid-plan marked the repo reaped for six hours having reclaimed nothing, and
-    writing it after a deadline-truncated run reaches the same place by a longer
-    road.
+    skipped only when a retry could do better — i.e. the run was cut short AND
+    freed something. Both neighbouring rules were wrong in opposite directions:
+    stamping unconditionally let a hook killed mid-plan mark the repo reaped for
+    six hours having reclaimed nothing, and skipping the stamp on any truncation
+    livelocked a repo that truncates while freeing nothing, re-running every
+    turn forever. plan() has no resume state, so a run that made no progress
+    would simply repeat itself.
   - Bounded by a wall-clock DEADLINE_SECONDS that every subprocess is clipped to,
     so it stops itself and logs rather than being killed silently mid-work. See
     the budget arithmetic under "tunables".
@@ -110,9 +113,18 @@ THROTTLE_HOURS = int(os.environ.get("WORKTREE_REAPER_THROTTLE_HOURS", "6"))
 #
 #   REMOVE_TIMEOUT is the exception to clipping: a `git worktree remove` killed
 #   part-way strands a half-deleted worktree that both gates then skip forever,
-#   so it runs only when its FULL cap is still available. That needs
-#   REMOVE_TIMEOUT < DEADLINE_SECONDS with real headroom, or the gate never
-#   fires and removal becomes dead code.
+#   so it runs only when its FULL cap is still available.
+#
+#   That leaves 5s of headroom (15 - 10), which is genuinely narrow: a single
+#   find hitting its cap consumes it, and artifact rmtree — unbounded by design —
+#   crosses it on any large reclaim. So removal IS frequently skipped whenever
+#   there is artifact work in the same pass. That is tolerable only because
+#   artifact reclamation is the documented primary action and removal the
+#   secondary one, and because skipping it no longer blocks the throttle (see
+#   cmd_reap's progress test). Widening the gap means either a smaller
+#   REMOVE_TIMEOUT — which risks the strand it exists to prevent — or a larger
+#   DEADLINE_SECONDS, which is capped by Codex's 20s. Left as is, named rather
+#   than papered over.
 #
 # Not covered: shutil.rmtree() is in-process and cannot be given a timeout. A
 # multi-GB target/ can outlive the deadline and be killed by the harness. Its
@@ -206,13 +218,22 @@ def default_branch(cwd: str) -> str | None:
     return None
 
 
-def worktrees(cwd: str) -> list[dict]:
-    """All LINKED worktrees via `git worktree list --porcelain`.
+def worktrees(cwd: str) -> list[dict] | None:
+    """All LINKED worktrees via `git worktree list --porcelain`, or None on failure.
 
     Deliberately not a `.worktrees/*` glob: Codex worktrees live outside the
     repo and would be missed entirely.
+
+    None and [] are different answers and collapsing them was a stamp bug. git()
+    returns None on a non-zero exit OR a timeout — index-lock contention, a
+    clipped budget, a broken repo — and returning [] for that made "could not
+    enumerate" indistinguishable from "this repo has no linked worktrees". The
+    caller then read it as nothing-to-do and suppressed the repo for six hours,
+    which is the same did-not-finish-yet-stamped class this file fixes elsewhere.
     """
     out = git(["worktree", "list", "--porcelain"], cwd)
+    if out is None:
+        return None
     if not out:
         return []
     entries: list[dict] = []
@@ -408,7 +429,9 @@ def touch_stamp(cd: str) -> None:
 
 # --- core --------------------------------------------------------------------
 
-def plan(cwd: str, cd: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]], bool]:
+def plan(
+    cwd: str, cd: str, wts: list[dict]
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]], bool]:
     """Compute (artifact_targets, removable_worktrees, truncated) without mutating.
 
     artifact_targets  : [(worktree_path, artifact_abs_path)]
@@ -417,6 +440,13 @@ def plan(cwd: str, cd: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]
                         repo. Callers must not read an empty list as "nothing to
                         do" — that is how a repo gets stamped as reaped having
                         looked at four of its fifty-two worktrees.
+
+    There is NO resume state: this restarts at the head of `git worktree list`
+    every run, so truncation always re-walks the same prefix. A previous commit
+    message claimed a truncated run "picks up where it stopped" — it does not.
+    Progress comes only from the prefix getting cheaper as its artifacts are
+    deleted, which is why the caller stamps on a run that made no progress
+    rather than retrying an identical computation forever.
     """
     artifacts: list[tuple[str, str]] = []
     removable: list[tuple[str, str]] = []
@@ -426,7 +456,7 @@ def plan(cwd: str, cd: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]
     me = os.path.abspath(cwd)
     dflt = default_branch(cwd)
 
-    for wt in worktrees(cwd):
+    for wt in wts:
         path = os.path.abspath(wt["path"])
         if not os.path.isdir(path):
             continue
@@ -514,24 +544,35 @@ def cmd_reap(payload: dict) -> None:
     if throttled(cd):
         sys.exit(0)
 
+    # Enumeration failure is not "no worktrees". git() returns None on a non-zero
+    # exit or a timeout, and reading that as an empty repo stamped a six-hour
+    # suppression on a transient index-lock collision, silently. Retrying costs
+    # one git call, so it retries — and says so, because a repo that fails to
+    # enumerate every turn is a real problem that should not be inferred from a
+    # reaper that never seems to run.
+    wts = worktrees(cwd)
+    if wts is None:
+        log(f"repo={cwd} could not enumerate worktrees, not stamping")
+        sys.exit(0)
+
     try:
-        artifacts, removable, truncated = plan(cwd, cd)
+        artifacts, removable, truncated = plan(cwd, cd, wts)
     except Exception as exc:
         # Stamping happens only after work completes, so a failure here retries
         # on the next session end instead of suppressing the repo for six hours.
         log(f"repo={cwd} plan failed: {exc.__class__.__name__}: {exc}")
         sys.exit(0)
     if not artifacts and not removable:
-        # "Nothing found" and "ran out of budget before finding anything" are
-        # different answers and only one of them may stamp. Truncated-and-empty
-        # used to stamp silently, which is the original write-the-stamp-first bug
-        # arrived at down a longer road — and with no log line it was
-        # indistinguishable from a repo that was simply already clean.
+        # Nothing to do, whether or not the budget ran out. plan() has no resume
+        # state, so a truncated run that found nothing will find nothing again
+        # next turn from an identical starting point — declining to stamp there
+        # buys no progress and, under Codex's per-turn Stop, re-runs forever.
+        # Stamp, and log when the answer was a prefix rather than the whole repo.
         if truncated:
-            log(f"repo={cwd} truncated before finding anything, not stamping "
-                f"(budget {DEADLINE_SECONDS}s)")
-        else:
-            touch_stamp(cd)
+            log(f"repo={cwd} budget {DEADLINE_SECONDS}s exhausted before finding "
+                f"work; stamping anyway (no resume state — a retry recomputes "
+                f"the same prefix). Run `worktree-reaper.py report` by hand.")
+        touch_stamp(cd)
         sys.exit(0)
 
     # Gates that plan() evaluated are re-read here, because the plan phase is the
@@ -540,10 +581,19 @@ def cmd_reap(payload: dict) -> None:
     # per-item recently_touched() re-check below covers the deletion phase too;
     # these two cover the plan->delete gap, which is the wide one.
     live_now = live_session_dirs(cd)
-    locked_now = {os.path.abspath(w["path"]) for w in worktrees(cwd) if w.get("locked")}
+    wts_now = worktrees(cwd)
+    # None here means the lock state cannot be read at all. This gates deletion,
+    # so it fails CLOSED: without knowing what is locked, nothing is eligible.
+    locked_now = (
+        {os.path.abspath(w["path"]) for w in wts_now if w.get("locked")}
+        if wts_now is not None
+        else None
+    )
+    if locked_now is None:
+        log(f"repo={cwd} lost worktree enumeration before deleting; skipping this pass")
 
     def still_eligible(wt_path: str) -> bool:
-        if wt_path in locked_now:
+        if locked_now is None or wt_path in locked_now:
             return False
         return not any(d == wt_path or d.startswith(wt_path + os.sep) for d in live_now)
 
@@ -587,16 +637,34 @@ def cmd_reap(payload: dict) -> None:
         git(["worktree", "prune"], cwd)
     freed = max(0, shutil.disk_usage(cwd).free - before)
 
-    # A truncated run did NOT finish, so it does not get to suppress the repo for
-    # six hours; the next session end picks up where it stopped. It is logged
-    # either way, so a repo that truncates habitually is visible rather than
-    # inferred from a reap that never seems to converge.
-    if not truncated:
+    # The throttle is skipped only when a retry can do better, and the test for
+    # that is PROGRESS, not truncation.
+    #
+    # Gating on truncation alone was a livelock. Missing the removal budget gate
+    # sets truncated, and with only 5s of headroom between REMOVE_TIMEOUT and
+    # DEADLINE_SECONDS that happens readily — one find hitting its cap is enough.
+    # A run that deleted nothing then declined to stamp, and since plan() has no
+    # resume state the next turn recomputed exactly the same thing and declined
+    # again. Under Codex's per-turn Stop that is every turn, forever, with zero
+    # work done. Before this file gained a conditional stamp the throttle always
+    # armed, so the regression made the pathological repos the ones that never
+    # throttle.
+    #
+    # With progress as the test it converges: a run that freed something leaves
+    # less work behind, so the next one gets further; a run that freed nothing
+    # would repeat itself, so it arms the throttle and logs why.
+    progressed = n_art or n_wt
+    if not (truncated and progressed):
         touch_stamp(cd)
     log(
         f"repo={cwd} artifacts={n_art} worktrees_removed={n_wt} "
         f"freed={freed // (1024*1024)}MB elapsed={time.time() - _STARTED_AT:.1f}s"
-        + (f" TRUNCATED at {DEADLINE_SECONDS}s budget, not stamped" if truncated else "")
+        + (
+            f" TRUNCATED at {DEADLINE_SECONDS}s budget"
+            + (", not stamped (progress made, retry next session)" if progressed
+               else ", stamped anyway (no progress — a retry would repeat it)")
+            if truncated else ""
+        )
     )
     sys.exit(0)
 
@@ -615,14 +683,18 @@ def cmd_report(payload: dict) -> None:
     if cd is None:
         print("not a git repo:", cwd)
         sys.exit(0)
-    artifacts, removable, _ = plan(cwd, cd)
+    wts = worktrees(cwd)
+    if wts is None:
+        print("could not enumerate worktrees (`git worktree list` failed):", cwd)
+        sys.exit(1)
+    artifacts, removable, _ = plan(cwd, cd, wts)
 
     print(f"repo: {cwd}")
     print(
         f"gates: artifacts idle>{ARTIFACT_IDLE_HOURS}h, "
         f"remove merged+clean idle>{REMOVE_IDLE_DAYS}d, throttle {THROTTLE_HOURS}h"
     )
-    print(f"linked worktrees: {len(worktrees(cwd))}")
+    print(f"linked worktrees: {len(wts)}")
     if throttled(cd):
         print("NOTE: currently throttled — a live `reap` would no-op right now.")
     print()
