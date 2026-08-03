@@ -43,10 +43,13 @@ Safety gates, all fail-open EXCEPT the idleness check, which fails closed:
   - Honors the same `.guard-off` per-repo escape hatch, plus WORKTREE_REAPER_OFF=1.
   - Throttled per-repo via a stamp file: Codex's only hook event is `Stop`, which
     fires PER TURN, so an unthrottled reaper would run constantly. The stamp is
-    written only AFTER the work finishes — writing it first meant a hook killed
-    mid-plan marked the repo reaped for six hours having reclaimed nothing.
-  - Bounded by a wall-clock DEADLINE_SECONDS below the hook's own timeout, so it
-    stops itself and logs rather than being killed silently mid-work.
+    written only after a run that FINISHED — writing it first meant a hook killed
+    mid-plan marked the repo reaped for six hours having reclaimed nothing, and
+    writing it after a deadline-truncated run reaches the same place by a longer
+    road.
+  - Bounded by a wall-clock DEADLINE_SECONDS that every subprocess is clipped to,
+    so it stops itself and logs rather than being killed silently mid-work. See
+    the budget arithmetic under "tunables".
   - Enumerates via `git worktree list`, NOT a `.worktrees/*` glob — Codex places
     its worktrees at ~/.codex/worktrees/<id>/<repo>, outside the repo entirely.
     A glob would silently skip every Codex worktree.
@@ -57,13 +60,18 @@ Modes (argv[1]):
 
 Wiring (this repo installs only the Claude half):
   Claude Code : SessionEnd -> python3 ~/.claude/hooks/worktree-reaper.py reap
-                installed by install.sh in this repo.
+                installed by install.sh in this repo, timeout 60s. The extra
+                slack over the deadline is for rmtree, which cannot be bounded.
   Codex       : Stop       -> python3 ~/.codex/hooks/worktree-reaper.py reap
                 declared in the CONSUMING dotfiles repo, at
                 files/home/.codex/hooks.json — Codex hook config is a single
                 user-level file, not composable the way install.sh's ensure()
                 is, so this repo does not write it. Adopting this hook under
                 Codex means adding that entry there.
+                Its timeout is 20s: the TIGHTEST budget this hook runs under,
+                and therefore the one DEADLINE_SECONDS is derived from. Raising
+                the Claude side without reading this one is how the deadline
+                came to be set at double the harness limit on the per-turn path.
 
 Pure stdlib. Log: ~/.claude/logs/worktree-reaper.log
 """
@@ -83,12 +91,41 @@ ARTIFACT_IDLE_HOURS = int(os.environ.get("WORKTREE_REAPER_ARTIFACT_IDLE_HOURS", 
 REMOVE_IDLE_DAYS = int(os.environ.get("WORKTREE_REAPER_REMOVE_IDLE_DAYS", "7"))
 THROTTLE_HOURS = int(os.environ.get("WORKTREE_REAPER_THROTTLE_HOURS", "6"))
 
-# Wall-clock budget, and the per-subprocess cap inside it. Both must stay BELOW
-# the hook's own timeout (see install.sh), or the harness kills this process
-# mid-work with nothing logged and no way to tell a slow run from a broken one.
-DEADLINE_SECONDS = int(os.environ.get("WORKTREE_REAPER_DEADLINE_SECONDS", "40"))
+# Wall-clock budget, and the per-subprocess caps inside it.
+#
+# The binding constraint is the TIGHTEST harness timeout this hook runs under,
+# which is Codex's `Stop` at 20s (files/home/.codex/hooks.json in the consuming
+# dotfiles repo) — not Claude's SessionEnd at 60s (install.sh). An earlier
+# version set the deadline to 40 and claimed the limits sat under the harness;
+# under Codex they sat at double it, so the guarantee was backwards on the very
+# path the per-turn throttle exists for.
+#
+# The arithmetic, so the claim is checkable rather than asserted:
+#
+#   every subprocess timeout is CLIPPED to the remaining budget (see clipped()),
+#   so no call can outlive DEADLINE_SECONDS
+#     => total wall clock <= DEADLINE_SECONDS + startup/teardown (~1s)
+#     => 15 + 1 < 20, the Codex Stop budget.  Claude's 60 leaves slack for the
+#        one genuinely unbounded step below.
+#
+#   REMOVE_TIMEOUT is the exception to clipping: a `git worktree remove` killed
+#   part-way strands a half-deleted worktree that both gates then skip forever,
+#   so it runs only when its FULL cap is still available. That needs
+#   REMOVE_TIMEOUT < DEADLINE_SECONDS with real headroom, or the gate never
+#   fires and removal becomes dead code.
+#
+# Not covered: shutil.rmtree() is in-process and cannot be given a timeout. A
+# multi-GB target/ can outlive the deadline and be killed by the harness. Its
+# worst case is a partially deleted build dir — gitignored output, finished on
+# the next pass — so it is left uncovered rather than pretended away.
+DEADLINE_SECONDS = int(os.environ.get("WORKTREE_REAPER_DEADLINE_SECONDS", "15"))
 FIND_TIMEOUT = int(os.environ.get("WORKTREE_REAPER_FIND_TIMEOUT", "10"))
+REMOVE_TIMEOUT = int(os.environ.get("WORKTREE_REAPER_REMOVE_TIMEOUT", "10"))
 _STARTED_AT = time.time()
+# Report mode runs from a shell, not under a harness, so it has no budget to
+# respect — and a truncated dry run silently under-reports what a live reap
+# would do, which is the operator's only verification surface.
+_DEADLINE_ON = True
 
 # Mirrors worktree-guard.py so the two agree on what "live" means.
 STALE_SECONDS = 15 * 60
@@ -124,22 +161,25 @@ def read_payload() -> dict:
         return {}
 
 
-def git(args: list[str], cwd: str, timeout: int = 10) -> str | None:
+# `clip` defaults to True so the budget holds without every call site
+# remembering — a bound that depends on discipline at a dozen call sites is not a
+# bound. Pass clip=False only where being cut short is worse than overrunning.
+def git(args: list[str], cwd: str, timeout: int = 10, clip: bool = True) -> str | None:
     try:
         r = subprocess.run(
             ["git", "-C", cwd, *args],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, timeout=clipped(timeout) if clip else timeout,
         )
     except Exception:
         return None
     return r.stdout.strip() if r.returncode == 0 else None
 
 
-def git_ok(args: list[str], cwd: str, timeout: int = 10) -> bool:
+def git_ok(args: list[str], cwd: str, timeout: int = 10, clip: bool = True) -> bool:
     try:
         r = subprocess.run(
             ["git", "-C", cwd, *args],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, timeout=clipped(timeout) if clip else timeout,
         )
     except Exception:
         return False
@@ -229,15 +269,42 @@ def live_session_dirs(cd: str) -> list[str]:
     return out
 
 
+def budget_left() -> float:
+    """Seconds remaining before this run must stop. Infinite in report mode."""
+    if not _DEADLINE_ON:
+        return float("inf")
+    return DEADLINE_SECONDS - (time.time() - _STARTED_AT)
+
+
 def past_deadline() -> bool:
     """True once this run has used its wall-clock budget.
 
     The hook harness kills the process at its configured timeout, mid-work and
-    without a log line. A reaper that walks 39 worktrees with a find apiece can
-    reach that, so it stops itself first and reports what it did. Checked between
-    worktrees and between deletions, never inside one.
+    without a log line, so this stops it first and reports what it did.
+
+    Checking this ONCE per worktree does not bound anything: everything after the
+    check — up to nine artifact scans plus three git calls — ran at full cap, a
+    per-iteration worst case in the hundreds of seconds against a budget of tens.
+    It is now checked before every subprocess, and every subprocess timeout is
+    additionally clipped to what is left, so the budget holds even if a check is
+    ever missed.
     """
-    return time.time() - _STARTED_AT > DEADLINE_SECONDS
+    return budget_left() <= 0
+
+
+def clipped(cap: int) -> int:
+    """A subprocess timeout that cannot outlive the run's remaining budget.
+
+    Clipping is safe for every caller here because each fails toward doing
+    nothing: a truncated find reports "active" (skip), a truncated check-ignore
+    reports "not ignored" (skip), a truncated `git status` returns None and is
+    read as dirty (skip). `git worktree remove` is deliberately NOT clipped —
+    interrupting it mid-delete strands the worktree — so it is gated on having
+    its whole cap available instead.
+    """
+    if not _DEADLINE_ON:
+        return cap
+    return max(1, min(cap, int(budget_left())))
 
 
 def recently_touched(path: str, hours: float, prune: tuple[str, ...] = ()) -> bool:
@@ -256,24 +323,41 @@ def recently_touched(path: str, hours: float, prune: tuple[str, ...] = ()) -> bo
     blind spot cost a live browser profile elsewhere on 2026-08-02: an open-handle
     check said idle, and only a deep timestamp check saw the work in progress.
 
-    `find -newermt ... -print -quit` stops at the first hit, so this stays cheap
-    even on a multi-GB tree.
+    `find -newermt ... -print -quit` stops at the first hit, but the answer that
+    matters here is "idle", and an idle tree has no hit to stop at — so the cost
+    of the deciding case is a FULL walk. Measured 2026-08-03 on this machine
+    (warm cache), which is why FIND_TIMEOUT of 10s is not tight:
+
+        rally-hq/node_modules        79,111 files   974 MB   full walk 0.40s
+        creative-floors/node_modules 78,452 files   971 MB   full walk 0.47s
+        local-meeting-notes target/  41,646 files   8.5 GB   full walk 0.22s
+
+    Size is nearly irrelevant; file COUNT is the cost, and a Rust target/ is
+    mostly a few large artifacts. Roughly 20x headroom warm.
 
     Fails CLOSED — an unreadable or slow tree reports "active". This gates a
     deletion, and the cost of a false "active" is deferred cleanup, while the cost
-    of a false "idle" is destroying work.
+    of a false "idle" is destroying work. Failing closed is silent by nature,
+    though: "active" and "could not tell" produce identical output and the run
+    would report `artifacts=0` either way. So the uncertain paths log.
     """
     cmd = ["find", path]
     for name in prune:
         cmd += ["-name", name, "-prune", "-o"]
     cmd += ["-newermt", f"-{hours} hours", "-print", "-quit"]
+    budget = clipped(FIND_TIMEOUT)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=FIND_TIMEOUT)
-        if r.returncode != 0:
-            return True
-        return bool(r.stdout.strip())
-    except Exception:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=budget)
+    except subprocess.TimeoutExpired:
+        log(f"idleness scan exceeded {budget}s, treating as active: {path}")
         return True
+    except Exception as exc:
+        log(f"idleness scan failed ({exc.__class__.__name__}), treating as active: {path}")
+        return True
+    if r.returncode != 0:
+        log(f"idleness scan exited {r.returncode}, treating as active: {path}")
+        return True
+    return bool(r.stdout.strip())
 
 
 def is_ignored(wt: str, name: str) -> bool:
@@ -324,14 +408,19 @@ def touch_stamp(cd: str) -> None:
 
 # --- core --------------------------------------------------------------------
 
-def plan(cwd: str, cd: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
-    """Compute (artifact_targets, removable_worktrees) without mutating anything.
+def plan(cwd: str, cd: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]], bool]:
+    """Compute (artifact_targets, removable_worktrees, truncated) without mutating.
 
     artifact_targets  : [(worktree_path, artifact_abs_path)]
     removable_worktrees: [(worktree_path, branch)]
+    truncated         : the budget ran out, so the lists are a PREFIX of the
+                        repo. Callers must not read an empty list as "nothing to
+                        do" — that is how a repo gets stamped as reaped having
+                        looked at four of its fifty-two worktrees.
     """
     artifacts: list[tuple[str, str]] = []
     removable: list[tuple[str, str]] = []
+    truncated = False
 
     live = live_session_dirs(cd)
     me = os.path.abspath(cwd)
@@ -349,6 +438,7 @@ def plan(cwd: str, cd: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]
         if wt.get("locked"):
             continue
         if past_deadline():
+            truncated = True
             break
 
         # Idleness is measured on the artifact dir ITSELF, deeply. The worktree
@@ -356,17 +446,26 @@ def plan(cwd: str, cd: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]
         # previous root-level gate would have deleted a target/ mid-build.
         for name in ARTIFACT_DIRS:
             target = os.path.join(path, name)
-            if not (os.path.isdir(target) and is_ignored(path, name)):
+            if not os.path.isdir(target):
+                continue
+            if past_deadline():
+                truncated = True
+                break
+            if not is_ignored(path, name):
                 continue
             if recently_touched(target, ARTIFACT_IDLE_HOURS):
                 continue
             artifacts.append((path, target))
+        if truncated:
+            break
 
         # Cheap gates BEFORE the deep scan. `and` short-circuits left to right,
         # and recently_touched() is a full-tree find while merge-base is a
         # sub-millisecond rev-walk that rejects almost everything: zero of the 52
         # worktrees that motivated this tool were merged. Ordered the other way,
         # every worktree paid a complete deep walk only to fail the next gate.
+        # (Measured on 40 worktrees: the deep finds cost 0.14s total, merge-base
+        # 0.61s — so this ordering is discipline, not a measured speedup.)
         #
         # `git status` returning None means the command FAILED, and `None or ""`
         # made that read as "clean" — inverting this file's own rule that
@@ -374,20 +473,33 @@ def plan(cwd: str, cd: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]
         branch = wt.get("branch")
         if not (dflt and branch and not wt.get("detached") and branch != dflt):
             continue
-        if not git_ok(["merge-base", "--is-ancestor", branch, dflt], cwd):
+        if past_deadline():
+            truncated = True
+            break
+        if not git_ok(["merge-base", "--is-ancestor", branch, dflt], cwd, timeout=10):
             continue
-        status = git(["status", "--porcelain"], path)
+        if past_deadline():
+            truncated = True
+            break
+        status = git(["status", "--porcelain"], path, timeout=10)
         if status is None or status.strip():
             continue
-        # Scan with the build dirs excluded. They are the bulk of a worktree and
-        # are already handled above; including them meant a multi-GB idle tree
-        # found no early exit, hit the find timeout, failed closed, and could
-        # therefore never become removable.
+        if past_deadline():
+            truncated = True
+            break
+        # Scan with the build dirs excluded — they are the bulk of a worktree and
+        # are already handled above, so including them is redundant work on the
+        # one path where the artifact scan has already answered the question.
+        # (An earlier comment justified this prune by claiming a multi-GB idle
+        # tree "hit the find timeout and failed closed". Measurement contradicts
+        # that: see recently_touched(), where the largest tree on this machine
+        # full-walks in 0.47s. The claim was never observed, and a reviewer later
+        # cited it back as evidence for a defect that does not exist.)
         if recently_touched(path, REMOVE_IDLE_DAYS * 24, prune=ARTIFACT_DIRS):
             continue
         removable.append((path, branch))
 
-    return artifacts, removable
+    return artifacts, removable, truncated
 
 
 def cmd_reap(payload: dict) -> None:
@@ -403,21 +515,46 @@ def cmd_reap(payload: dict) -> None:
         sys.exit(0)
 
     try:
-        artifacts, removable = plan(cwd, cd)
+        artifacts, removable, truncated = plan(cwd, cd)
     except Exception as exc:
         # Stamping happens only after work completes, so a failure here retries
         # on the next session end instead of suppressing the repo for six hours.
         log(f"repo={cwd} plan failed: {exc.__class__.__name__}: {exc}")
         sys.exit(0)
     if not artifacts and not removable:
-        touch_stamp(cd)
+        # "Nothing found" and "ran out of budget before finding anything" are
+        # different answers and only one of them may stamp. Truncated-and-empty
+        # used to stamp silently, which is the original write-the-stamp-first bug
+        # arrived at down a longer road — and with no log line it was
+        # indistinguishable from a repo that was simply already clean.
+        if truncated:
+            log(f"repo={cwd} truncated before finding anything, not stamping "
+                f"(budget {DEADLINE_SECONDS}s)")
+        else:
+            touch_stamp(cd)
         sys.exit(0)
+
+    # Gates that plan() evaluated are re-read here, because the plan phase is the
+    # long window: a session that starts inside a worktree, or a `git worktree
+    # lock` taken while planning, would otherwise still lose its build dirs. The
+    # per-item recently_touched() re-check below covers the deletion phase too;
+    # these two cover the plan->delete gap, which is the wide one.
+    live_now = live_session_dirs(cd)
+    locked_now = {os.path.abspath(w["path"]) for w in worktrees(cwd) if w.get("locked")}
+
+    def still_eligible(wt_path: str) -> bool:
+        if wt_path in locked_now:
+            return False
+        return not any(d == wt_path or d.startswith(wt_path + os.sep) for d in live_now)
 
     before = shutil.disk_usage(cwd).free
     n_art = 0
-    for _, target in artifacts:
+    for wt_path, target in artifacts:
         if past_deadline():
+            truncated = True
             break
+        if not still_eligible(wt_path):
+            continue
         # Re-check immediately before deleting. plan() evaluated every worktree
         # up front, so its reading for the first entry is stale by however long
         # the whole plan phase took — and a build started in that window would
@@ -431,31 +568,54 @@ def cmd_reap(payload: dict) -> None:
             pass
     n_wt = 0
     for path, _branch in removable:
-        if past_deadline():
+        # Removal is the one call that must not be cut short. A `git worktree
+        # remove` SIGKILLed part-way leaves a half-deleted checkout with its
+        # admin entry intact: `git status` there then reports mass deletions, so
+        # the dirty gate skips it forever, and the artifact gate has nothing left
+        # to find. Unreachable by both paths. So it runs only with its whole cap
+        # in hand, and the run truncates rather than starting one it cannot
+        # finish.
+        if budget_left() < REMOVE_TIMEOUT:
+            truncated = True
             break
-        # No --force: a tree that turned dirty since planning must survive, and
-        # neither may a worktree someone locked in the meantime.
-        if git_ok(["worktree", "remove", path], cwd, timeout=FIND_TIMEOUT):
+        if not still_eligible(path):
+            continue
+        # No --force: a tree that turned dirty since planning must survive.
+        if git_ok(["worktree", "remove", path], cwd, timeout=REMOVE_TIMEOUT, clip=False):
             n_wt += 1
     if n_wt:
         git(["worktree", "prune"], cwd)
     freed = max(0, shutil.disk_usage(cwd).free - before)
 
-    touch_stamp(cd)
+    # A truncated run did NOT finish, so it does not get to suppress the repo for
+    # six hours; the next session end picks up where it stopped. It is logged
+    # either way, so a repo that truncates habitually is visible rather than
+    # inferred from a reap that never seems to converge.
+    if not truncated:
+        touch_stamp(cd)
     log(
         f"repo={cwd} artifacts={n_art} worktrees_removed={n_wt} "
         f"freed={freed // (1024*1024)}MB elapsed={time.time() - _STARTED_AT:.1f}s"
+        + (f" TRUNCATED at {DEADLINE_SECONDS}s budget, not stamped" if truncated else "")
     )
     sys.exit(0)
 
 
 def cmd_report(payload: dict) -> None:
+    # No budget in report mode. cmd_report shares plan() with the hook, so the
+    # deadline truncated the DRY RUN too — while the header below went on
+    # printing the true worktree count, so the output claimed full coverage over
+    # a prefix, with nothing marking the cut. This is the operator's only
+    # verification surface and it is run by hand, where slow beats wrong.
+    global _DEADLINE_ON
+    _DEADLINE_ON = False
+
     cwd = payload.get("cwd") or os.getcwd()
     cd = common_dir(cwd)
     if cd is None:
         print("not a git repo:", cwd)
         sys.exit(0)
-    artifacts, removable = plan(cwd, cd)
+    artifacts, removable, _ = plan(cwd, cd)
 
     print(f"repo: {cwd}")
     print(
