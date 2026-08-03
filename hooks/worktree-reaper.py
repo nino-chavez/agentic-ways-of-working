@@ -37,9 +37,16 @@ Safety gates, all fail-open EXCEPT the idleness check, which fails closed:
   - Skips any worktree occupied by a live session, reusing worktree-guard.py's
     existing lock dir (<git-common-dir>/.claude-sessions) rather than inventing
     a second liveness model that could disagree with the first.
+  - Honors `git worktree lock`, git's own don't-touch marker. `git worktree
+    remove` already refuses a locked tree, which covered removal but left the
+    PRIMARY path (rmtree of its build dirs) unguarded.
   - Honors the same `.guard-off` per-repo escape hatch, plus WORKTREE_REAPER_OFF=1.
   - Throttled per-repo via a stamp file: Codex's only hook event is `Stop`, which
-    fires PER TURN, so an unthrottled reaper would run constantly.
+    fires PER TURN, so an unthrottled reaper would run constantly. The stamp is
+    written only AFTER the work finishes — writing it first meant a hook killed
+    mid-plan marked the repo reaped for six hours having reclaimed nothing.
+  - Bounded by a wall-clock DEADLINE_SECONDS below the hook's own timeout, so it
+    stops itself and logs rather than being killed silently mid-work.
   - Enumerates via `git worktree list`, NOT a `.worktrees/*` glob — Codex places
     its worktrees at ~/.codex/worktrees/<id>/<repo>, outside the repo entirely.
     A glob would silently skip every Codex worktree.
@@ -48,9 +55,15 @@ Modes (argv[1]):
   reap    — hook mode: throttled, silent, exits 0 always.
   report  — dry run: prints what it WOULD do, with sizes. Never deletes.
 
-Wiring:
+Wiring (this repo installs only the Claude half):
   Claude Code : SessionEnd -> python3 ~/.claude/hooks/worktree-reaper.py reap
+                installed by install.sh in this repo.
   Codex       : Stop       -> python3 ~/.codex/hooks/worktree-reaper.py reap
+                declared in the CONSUMING dotfiles repo, at
+                files/home/.codex/hooks.json — Codex hook config is a single
+                user-level file, not composable the way install.sh's ensure()
+                is, so this repo does not write it. Adopting this hook under
+                Codex means adding that entry there.
 
 Pure stdlib. Log: ~/.claude/logs/worktree-reaper.log
 """
@@ -69,6 +82,13 @@ from pathlib import Path
 ARTIFACT_IDLE_HOURS = int(os.environ.get("WORKTREE_REAPER_ARTIFACT_IDLE_HOURS", "48"))
 REMOVE_IDLE_DAYS = int(os.environ.get("WORKTREE_REAPER_REMOVE_IDLE_DAYS", "7"))
 THROTTLE_HOURS = int(os.environ.get("WORKTREE_REAPER_THROTTLE_HOURS", "6"))
+
+# Wall-clock budget, and the per-subprocess cap inside it. Both must stay BELOW
+# the hook's own timeout (see install.sh), or the harness kills this process
+# mid-work with nothing logged and no way to tell a slow run from a broken one.
+DEADLINE_SECONDS = int(os.environ.get("WORKTREE_REAPER_DEADLINE_SECONDS", "40"))
+FIND_TIMEOUT = int(os.environ.get("WORKTREE_REAPER_FIND_TIMEOUT", "10"))
+_STARTED_AT = time.time()
 
 # Mirrors worktree-guard.py so the two agree on what "live" means.
 STALE_SECONDS = 15 * 60
@@ -161,13 +181,24 @@ def worktrees(cwd: str) -> list[dict]:
         if line.startswith("worktree "):
             if cur.get("path"):
                 entries.append(cur)
-            cur = {"path": line[len("worktree "):].strip(), "branch": None, "detached": False}
+            cur = {
+                "path": line[len("worktree "):].strip(),
+                "branch": None,
+                "detached": False,
+                "locked": False,
+            }
         elif line.startswith("branch "):
             cur["branch"] = line[len("branch "):].strip().replace("refs/heads/", "")
         elif line.strip() == "detached":
             cur["detached"] = True
         elif line.startswith("bare"):
             cur["bare"] = True
+        elif line.startswith("locked"):
+            # git's own don't-touch marker. `git worktree remove` already refuses
+            # a locked worktree without --force, which protected the SECONDARY
+            # path while leaving the primary one — rmtree of its build dirs —
+            # completely unguarded. Honour it for both.
+            cur["locked"] = True
     if cur.get("path"):
         entries.append(cur)
     if not entries:
@@ -198,7 +229,18 @@ def live_session_dirs(cd: str) -> list[str]:
     return out
 
 
-def recently_touched(path: str, hours: float) -> bool:
+def past_deadline() -> bool:
+    """True once this run has used its wall-clock budget.
+
+    The hook harness kills the process at its configured timeout, mid-work and
+    without a log line. A reaper that walks 39 worktrees with a find apiece can
+    reach that, so it stops itself first and reports what it did. Checked between
+    worktrees and between deletions, never inside one.
+    """
+    return time.time() - _STARTED_AT > DEADLINE_SECONDS
+
+
+def recently_touched(path: str, hours: float, prune: tuple[str, ...] = ()) -> bool:
     """True if ANYTHING anywhere under `path` was modified within `hours`.
 
     A directory's own mtime is not this answer. It records entry changes in that
@@ -221,13 +263,12 @@ def recently_touched(path: str, hours: float) -> bool:
     deletion, and the cost of a false "active" is deferred cleanup, while the cost
     of a false "idle" is destroying work.
     """
+    cmd = ["find", path]
+    for name in prune:
+        cmd += ["-name", name, "-prune", "-o"]
+    cmd += ["-newermt", f"-{hours} hours", "-print", "-quit"]
     try:
-        r = subprocess.run(
-            ["find", path, "-newermt", f"-{hours} hours", "-print", "-quit"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=FIND_TIMEOUT)
         if r.returncode != 0:
             return True
         return bool(r.stdout.strip())
@@ -305,6 +346,10 @@ def plan(cwd: str, cd: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]
             continue
         if any(d == path or d.startswith(path + os.sep) for d in live):
             continue
+        if wt.get("locked"):
+            continue
+        if past_deadline():
+            break
 
         # Idleness is measured on the artifact dir ITSELF, deeply. The worktree
         # root's mtime does not move when a build writes into target/**, so the
@@ -317,17 +362,30 @@ def plan(cwd: str, cd: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]
                 continue
             artifacts.append((path, target))
 
+        # Cheap gates BEFORE the deep scan. `and` short-circuits left to right,
+        # and recently_touched() is a full-tree find while merge-base is a
+        # sub-millisecond rev-walk that rejects almost everything: zero of the 52
+        # worktrees that motivated this tool were merged. Ordered the other way,
+        # every worktree paid a complete deep walk only to fail the next gate.
+        #
+        # `git status` returning None means the command FAILED, and `None or ""`
+        # made that read as "clean" — inverting this file's own rule that
+        # uncertainty skips. An unreadable tree is treated as dirty.
         branch = wt.get("branch")
-        if (
-            dflt
-            and branch
-            and not wt.get("detached")
-            and branch != dflt
-            and not recently_touched(path, REMOVE_IDLE_DAYS * 24)
-            and git_ok(["merge-base", "--is-ancestor", branch, dflt], cwd)
-            and not (git(["status", "--porcelain"], path) or "")
-        ):
-            removable.append((path, branch))
+        if not (dflt and branch and not wt.get("detached") and branch != dflt):
+            continue
+        if not git_ok(["merge-base", "--is-ancestor", branch, dflt], cwd):
+            continue
+        status = git(["status", "--porcelain"], path)
+        if status is None or status.strip():
+            continue
+        # Scan with the build dirs excluded. They are the bulk of a worktree and
+        # are already handled above; including them meant a multi-GB idle tree
+        # found no early exit, hit the find timeout, failed closed, and could
+        # therefore never become removable.
+        if recently_touched(path, REMOVE_IDLE_DAYS * 24, prune=ARTIFACT_DIRS):
+            continue
+        removable.append((path, branch))
 
     return artifacts, removable
 
@@ -343,18 +401,29 @@ def cmd_reap(payload: dict) -> None:
         sys.exit(0)
     if throttled(cd):
         sys.exit(0)
-    touch_stamp(cd)
 
     try:
         artifacts, removable = plan(cwd, cd)
-    except Exception:
+    except Exception as exc:
+        # Stamping happens only after work completes, so a failure here retries
+        # on the next session end instead of suppressing the repo for six hours.
+        log(f"repo={cwd} plan failed: {exc.__class__.__name__}: {exc}")
         sys.exit(0)
     if not artifacts and not removable:
+        touch_stamp(cd)
         sys.exit(0)
 
     before = shutil.disk_usage(cwd).free
     n_art = 0
     for _, target in artifacts:
+        if past_deadline():
+            break
+        # Re-check immediately before deleting. plan() evaluated every worktree
+        # up front, so its reading for the first entry is stale by however long
+        # the whole plan phase took — and a build started in that window would
+        # lose its tree, the exact failure the deep check exists to prevent.
+        if recently_touched(target, ARTIFACT_IDLE_HOURS):
+            continue
         try:
             shutil.rmtree(target)
             n_art += 1
@@ -362,16 +431,20 @@ def cmd_reap(payload: dict) -> None:
             pass
     n_wt = 0
     for path, _branch in removable:
-        # No --force: a tree that turned dirty since planning must survive.
-        if git_ok(["worktree", "remove", path], cwd, timeout=30):
+        if past_deadline():
+            break
+        # No --force: a tree that turned dirty since planning must survive, and
+        # neither may a worktree someone locked in the meantime.
+        if git_ok(["worktree", "remove", path], cwd, timeout=FIND_TIMEOUT):
             n_wt += 1
     if n_wt:
         git(["worktree", "prune"], cwd)
     freed = max(0, shutil.disk_usage(cwd).free - before)
 
+    touch_stamp(cd)
     log(
         f"repo={cwd} artifacts={n_art} worktrees_removed={n_wt} "
-        f"freed={freed // (1024*1024)}MB"
+        f"freed={freed // (1024*1024)}MB elapsed={time.time() - _STARTED_AT:.1f}s"
     )
     sys.exit(0)
 
