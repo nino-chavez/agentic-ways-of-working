@@ -97,6 +97,11 @@ if ensure("UserPromptSubmit", f"python3 {claude_dir}/hooks/campsite.py", 3):    
 if ensure("SessionStart",     f"python3 {claude_dir}/hooks/worktree-guard.py register", 5):                       added.append("SessionStart:worktree-guard")
 if ensure("PreToolUse",       f"python3 {claude_dir}/hooks/worktree-guard.py check", 5, matcher=GUARD_MATCHER):   added.append("PreToolUse[edit+bash]:worktree-guard")
 if ensure("SessionEnd",       f"python3 {claude_dir}/hooks/worktree-guard.py unregister", 5):                     added.append("SessionEnd:worktree-guard")
+# Worktree reaper: the cleanup-side counterpart. `.worktrees/` is machine-ignored,
+# so stale worktrees never show in `git status` and their build artifacts pile up
+# invisibly (measured: 52 worktrees / 74 GB, 68 GB of it Rust target/, none merged).
+# Reclaims build dirs from idle worktrees; removes merged+clean ones. Throttled.
+if ensure("SessionEnd",       f"python3 {claude_dir}/hooks/worktree-reaper.py reap", 20):                          added.append("SessionEnd:worktree-reaper")
 # Read-cost guard: bounce oversized images (with a downscaled copy) and
 # redundant re-reads of unchanged files. Image branch needs macOS sips;
 # fails open elsewhere.
