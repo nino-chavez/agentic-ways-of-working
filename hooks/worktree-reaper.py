@@ -60,6 +60,9 @@ Safety gates, all fail-open EXCEPT the idleness check, which fails closed:
 Modes (argv[1]):
   reap    — hook mode: throttled, silent, exits 0 always.
   report  — dry run: prints what it WOULD do, with sizes. Never deletes.
+  closeout — SessionEnd mode: remove this linked worktree immediately when it is
+             clean and merged; otherwise record the handoff state. It never
+             removes a branch or a dirty, detached, locked, or main checkout.
 
 Wiring (this repo installs only the Claude half):
   Claude Code : SessionEnd -> python3 ~/.claude/hooks/worktree-reaper.py reap
@@ -162,6 +165,12 @@ ARTIFACT_DIRS = (
 # only inspects the worktree root, so listing it would imply coverage it lacks.
 
 LOG_PATH = Path.home() / ".claude" / "logs" / "worktree-reaper.log"
+CLOSEOUT_LOG_PATH = Path(
+    os.environ.get(
+        "WORKTREE_CLOSEOUT_LOG",
+        str(Path.home() / ".claude" / "logs" / "worktree-closeout.log"),
+    )
+)
 
 
 # --- helpers -----------------------------------------------------------------
@@ -218,8 +227,8 @@ def default_branch(cwd: str) -> str | None:
     return None
 
 
-def worktrees(cwd: str) -> list[dict] | None:
-    """All LINKED worktrees via `git worktree list --porcelain`, or None on failure.
+def all_worktrees(cwd: str) -> list[dict] | None:
+    """All worktrees via `git worktree list --porcelain`, or None on failure.
 
     Deliberately not a `.worktrees/*` glob: Codex worktrees live outside the
     repo and would be missed entirely.
@@ -264,8 +273,16 @@ def worktrees(cwd: str) -> list[dict] | None:
         entries.append(cur)
     if not entries:
         return []
-    # First entry is the main checkout — never touched.
-    return [e for e in entries[1:] if not e.get("bare")]
+    return entries
+
+
+def worktrees(cwd: str) -> list[dict] | None:
+    """All LINKED worktrees, excluding the main checkout and bare entries."""
+    entries = all_worktrees(cwd)
+    if entries is None:
+        return None
+    # First entry is the main checkout — never touched by the reaper.
+    return [entry for entry in entries[1:] if not entry.get("bare")]
 
 
 def live_session_dirs(cd: str) -> list[str]:
@@ -405,6 +422,17 @@ def log(msg: str) -> None:
         pass
 
 
+def log_closeout(msg: str) -> None:
+    """Best-effort SessionEnd record kept separate from periodic reaping."""
+    try:
+        CLOSEOUT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with CLOSEOUT_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(f"{stamp} {msg}\n")
+    except Exception:
+        pass
+
+
 # --- throttle ----------------------------------------------------------------
 
 def throttled(cd: str) -> bool:
@@ -428,6 +456,87 @@ def touch_stamp(cd: str) -> None:
 
 
 # --- core --------------------------------------------------------------------
+
+def cmd_closeout(payload: dict) -> None:
+    """Close the current linked worktree when the session has safely finished.
+
+    This is intentionally a narrow completion path rather than another reaping
+    pass: no idle window, no artifact deletion, no branch deletion, and no
+    remote fetch. It only inspects the worktree from the ending session and
+    removes its checkout after proving the local default branch contains it.
+    """
+    if os.environ.get("WORKTREE_REAPER_OFF") == "1":
+        return
+    cwd = os.path.abspath(payload.get("cwd") or os.getcwd())
+    cd = common_dir(cwd)
+    if cd is None or (Path(cd) / LOCK_DIRNAME / OVERRIDE_FILENAME).exists():
+        return
+
+    root = git(["rev-parse", "--show-toplevel"], cwd, timeout=5)
+    entries = all_worktrees(cwd)
+    if root is None or entries is None:
+        log_closeout(f"repo={cwd} state=unknown action=skip reason=enumeration_failed")
+        return
+
+    root = os.path.abspath(root)
+    current_index = next(
+        (
+            index
+            for index, entry in enumerate(entries)
+            if os.path.abspath(str(entry.get("path", ""))) == root
+        ),
+        None,
+    )
+    if current_index is None:
+        log_closeout(f"repo={root} state=unknown action=skip reason=not_listed")
+        return
+    if current_index == 0:
+        log_closeout(f"repo={root} state=main action=keep")
+        return
+
+    current = entries[current_index]
+    branch = current.get("branch")
+    if current.get("bare") or current.get("locked") or current.get("detached") or not branch:
+        reason = (
+            "bare"
+            if current.get("bare")
+            else "locked"
+            if current.get("locked")
+            else "detached"
+            if current.get("detached")
+            else "no_branch"
+        )
+        log_closeout(f"repo={root} state={reason} action=keep")
+        return
+
+    status = git(["status", "--porcelain", "--untracked-files=normal"], root, timeout=10)
+    if status is None:
+        log_closeout(f"repo={root} branch={branch} state=unknown action=keep reason=status_failed")
+        return
+    if status.strip():
+        log_closeout(f"repo={root} branch={branch} state=dirty action=handoff")
+        return
+
+    dflt = default_branch(root)
+    if not dflt:
+        log_closeout(f"repo={root} branch={branch} state=clean action=keep reason=default_unknown")
+        return
+    if not git_ok(["merge-base", "--is-ancestor", branch, dflt], root, timeout=10):
+        log_closeout(
+            f"repo={root} branch={branch} default={dflt} state=unmerged-clean "
+            "action=open-pr-or-hold"
+        )
+        return
+
+    primary = os.path.abspath(str(entries[0].get("path", "")))
+    if not primary or not os.path.isdir(primary):
+        log_closeout(f"repo={root} branch={branch} state=merged-clean action=keep reason=primary_missing")
+        return
+    if git_ok(["worktree", "remove", root], primary, timeout=REMOVE_TIMEOUT, clip=False):
+        log_closeout(f"repo={root} branch={branch} state=merged-clean action=removed")
+        return
+    log_closeout(f"repo={root} branch={branch} state=merged-clean action=keep reason=remove_failed")
+
 
 def plan(
     cwd: str, cd: str, wts: list[dict]
@@ -720,6 +829,8 @@ def main() -> None:
     if mode == "report":
         # Never touches stdin: run by hand from a shell, not by a hook.
         cmd_report({"cwd": sys.argv[2] if len(sys.argv) > 2 else os.getcwd()})
+    elif mode == "closeout":
+        cmd_closeout(read_payload())
     else:
         cmd_reap(read_payload())
 
