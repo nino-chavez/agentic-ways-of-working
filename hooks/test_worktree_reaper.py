@@ -56,6 +56,12 @@ class WorktreeCloseoutTests(unittest.TestCase):
             env=environment,
         )
 
+    def test_main_checkout_is_never_removed(self) -> None:
+        self.closeout(self.root)
+
+        self.assertTrue(self.root.exists())
+        self.assertIn("state=main action=keep", self.log.read_text(encoding="utf-8"))
+
     def test_merged_clean_linked_worktree_is_removed_without_deleting_branch(self) -> None:
         worktree = self.add_worktree("task")
         (worktree / "task.txt").write_text("done\n", encoding="utf-8")
