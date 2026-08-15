@@ -15,7 +15,7 @@ from pathlib import Path
 SCRIPT = Path(__file__).with_name("worktree-reaper.py")
 
 
-class WorktreeCloseoutTests(unittest.TestCase):
+class _RepoFixture(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -56,6 +56,8 @@ class WorktreeCloseoutTests(unittest.TestCase):
             env=environment,
         )
 
+
+class WorktreeCloseoutTests(_RepoFixture):
     def test_main_checkout_is_never_removed(self) -> None:
         self.closeout(self.root)
 
@@ -98,6 +100,50 @@ class WorktreeCloseoutTests(unittest.TestCase):
             "branch=unmerged-task default=main state=unmerged-clean action=open-pr-or-hold",
             self.log.read_text(encoding="utf-8"),
         )
+
+
+
+class ReapAccountingTests(_RepoFixture):
+    """The log is the only record of what this hook did, so its numbers must hold."""
+
+    def reap(self) -> str:
+        environment = os.environ.copy()
+        environment["WORKTREE_REAPER_LOG"] = str(self.log)
+        environment["WORKTREE_REAPER_ARTIFACT_IDLE_HOURS"] = "0"
+        subprocess.run(
+            [sys.executable, str(SCRIPT), "reap"],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        return self.log.read_text(encoding="utf-8") if self.log.exists() else ""
+
+    def test_freed_reports_the_deleted_tree_not_a_volume_delta(self) -> None:
+        worktree = self.add_worktree("stale-build")
+        (self.root / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+        self.git("add", ".gitignore", cwd=self.root)
+        self.git("commit", "-m", "ignore build output", cwd=self.root)
+        self.git("merge", "main", cwd=worktree)
+
+        build = worktree / "node_modules"
+        build.mkdir()
+        # ~4 MB, large enough that a wrong number is unambiguous.
+        (build / "blob.bin").write_bytes(b"x" * 4_000_000)
+        old = 1_600_000_000  # well past any idle gate
+        os.utime(build / "blob.bin", (old, old))
+        os.utime(build, (old, old))
+
+        line = self.reap()
+
+        self.assertFalse(build.exists(), "the stale build dir should be gone")
+        self.assertIn("artifacts=1", line)
+        # Volume free space is contaminated by any concurrent writer; the size of
+        # the tree that was deleted is not.
+        freed = int(line.split("freed")[1].lstrip("=>").split("MB")[0])
+        self.assertGreaterEqual(freed, 3)
+        self.assertLessEqual(freed, 8)
 
 
 if __name__ == "__main__":

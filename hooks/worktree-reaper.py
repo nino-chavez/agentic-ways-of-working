@@ -134,6 +134,9 @@ THROTTLE_HOURS = int(os.environ.get("WORKTREE_REAPER_THROTTLE_HOURS", "6"))
 # worst case is a partially deleted build dir — gitignored output, finished on
 # the next pass — so it is left uncovered rather than pretended away.
 DEADLINE_SECONDS = int(os.environ.get("WORKTREE_REAPER_DEADLINE_SECONDS", "15"))
+# Measuring a tree costs ~0.5s. Skip it rather than eat into deletion time.
+SIZE_MEASURE_RESERVE_SECONDS = 4.0
+SIZE_MEASURE_TIMEOUT_SECONDS = 3
 FIND_TIMEOUT = int(os.environ.get("WORKTREE_REAPER_FIND_TIMEOUT", "10"))
 REMOVE_TIMEOUT = int(os.environ.get("WORKTREE_REAPER_REMOVE_TIMEOUT", "10"))
 _STARTED_AT = time.time()
@@ -164,7 +167,13 @@ ARTIFACT_DIRS = (
 # Deliberately NOT here: __pycache__. It appears at every depth, and this reaper
 # only inspects the worktree root, so listing it would imply coverage it lacks.
 
-LOG_PATH = Path.home() / ".claude" / "logs" / "worktree-reaper.log"
+# Overridable so a test can assert on the log without writing the real one.
+LOG_PATH = Path(
+    os.environ.get(
+        "WORKTREE_REAPER_LOG",
+        str(Path.home() / ".claude" / "logs" / "worktree-reaper.log"),
+    )
+)
 CLOSEOUT_LOG_PATH = Path(
     os.environ.get(
         "WORKTREE_CLOSEOUT_LOG",
@@ -403,10 +412,15 @@ def is_ignored(wt: str, name: str) -> bool:
     return git_ok(["check-ignore", "-q", name], wt, timeout=5)
 
 
-def dir_size_kb(path: str) -> int:
-    """Only used in report mode — du is slow and never runs in the hook path."""
+def dir_size_kb(path: str, timeout: int = 120) -> int:
+    """Size of a tree, or 0 when it cannot be measured in the time allowed.
+
+    Report mode can afford the default. The reap path passes a short timeout and
+    treats 0 as "unmeasured", because a wrong number in the log is worse than an
+    honest gap: the log is the only record of what this hook did.
+    """
     try:
-        r = subprocess.run(["du", "-sk", path], capture_output=True, text=True, timeout=120)
+        r = subprocess.run(["du", "-sk", path], capture_output=True, text=True, timeout=timeout)
         return int(r.stdout.split()[0]) if r.returncode == 0 else 0
     except Exception:
         return 0
@@ -706,7 +720,14 @@ def cmd_reap(payload: dict) -> None:
             return False
         return not any(d == wt_path or d.startswith(wt_path + os.sep) for d in live_now)
 
-    before = shutil.disk_usage(cwd).free
+    # Sum the trees actually deleted. The previous accounting diffed volume free
+    # space across the run, which any concurrent writer contaminates: measured
+    # 2026-08-15, a pass that deleted a 1017 MB node_modules logged freed=24MB
+    # and one that deleted 581 MB logged freed=0MB, because agents were building
+    # on the same volume. A log that understates its own work reads as a hook
+    # that is not running.
+    freed_kb = 0
+    unmeasured = False
     n_art = 0
     for wt_path, target in artifacts:
         if past_deadline():
@@ -720,6 +741,16 @@ def cmd_reap(payload: dict) -> None:
         # lose its tree, the exact failure the deep check exists to prevent.
         if recently_touched(target, ARTIFACT_IDLE_HOURS):
             continue
+        # Measure before deleting, and only with budget to spare — a full walk of
+        # a node_modules runs ~0.5s. No budget means no number, never a guess.
+        if budget_left() > SIZE_MEASURE_RESERVE_SECONDS:
+            kb = dir_size_kb(target, timeout=SIZE_MEASURE_TIMEOUT_SECONDS)
+            if kb:
+                freed_kb += kb
+            else:
+                unmeasured = True
+        else:
+            unmeasured = True
         try:
             shutil.rmtree(target)
             n_art += 1
@@ -744,7 +775,6 @@ def cmd_reap(payload: dict) -> None:
             n_wt += 1
     if n_wt:
         git(["worktree", "prune"], cwd)
-    freed = max(0, shutil.disk_usage(cwd).free - before)
 
     # The throttle is skipped only when a retry can do better, and the test for
     # that is PROGRESS, not truncation.
@@ -767,7 +797,8 @@ def cmd_reap(payload: dict) -> None:
         touch_stamp(cd)
     log(
         f"repo={cwd} artifacts={n_art} worktrees_removed={n_wt} "
-        f"freed={freed // (1024*1024)}MB elapsed={time.time() - _STARTED_AT:.1f}s"
+        f"freed{'>=' if unmeasured else '='}{freed_kb // 1024}MB "
+        f"elapsed={time.time() - _STARTED_AT:.1f}s"
         + (
             f" TRUNCATED at {DEADLINE_SECONDS}s budget"
             + (", not stamped (progress made, retry next session)" if progressed
