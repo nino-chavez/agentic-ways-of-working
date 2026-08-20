@@ -87,6 +87,16 @@ every payload-trimming trick combined. Derived rules:
   and gets multiplied. Delegate any "find out X" needing more than ~3 file
   reads when the main task only needs the conclusion. Read inline only what
   you are about to edit or must cite verbatim.
+- **Route each subagent to the cheapest model adequate for its job.** Keep the
+  strongest model in the parent when it owns synthesis or final judgment.
+  Classify complexity, task, domain, and modifiers as separate axes. A Cost,
+  Balance, or Intelligence mode may move routine and standard work along the
+  cost-quality curve; explicitly deep, adversarial, security, or architecture
+  work stays on the strongest tier in every mode. Explicit user or caller
+  choices override automation. A model override uses a bounded or context-free
+  fork rather than full history. If the router records decisions, retain only
+  structured route metadata — never task names, descriptions, or prompt text —
+  and support shadow evaluation that records without rewriting the tool call.
 - **Batch independent tool calls.** N reads issued as one parallel block is 2
   context replays instead of 2N.
 - **Screenshot the element under iteration, not the page.** Images are billed
@@ -108,9 +118,11 @@ re-read, not a wall. Fail-open on any uncertainty; image branch requires macOS
 ~/.claude/cache/read-guard/.guard-off`. The session-hygiene half is visibility,
 not blocking: [`statusline.py`](../statusline.py) shows context usage
 color-coded at 50/80% so a fattening session is seen, not discovered. Both
-wired by `install.sh`. The delegation and batching rules are judgment calls a
-hook cannot see — they live here, where the model applies intent a tool-call
-pattern can't reveal.
+wired by `install.sh`. Whether to delegate and how to batch remain judgment
+calls a hook cannot see. Once a subagent spawn exists, a platform-specific
+hook may apply the routing rule above by filling missing model and effort
+fields; it must preserve explicit choices. The hook must fail open if telemetry
+cannot be written.
 
 ## Harness hygiene — a good tool that isn't durable is rot waiting to happen
 
