@@ -19,7 +19,7 @@ Load order (codified, not arbitrary):
 This order matches the question hierarchy any consumer session needs to answer
 before proposing methodology changes from scratch.
 
-Resolution: BLUEPRINT_HOME env var, else `~/Workspace/dev/wip/blueprint`.
+Resolution: BLUEPRINT_HOME env var, else `~/Workspace/dev/tools/blueprint`.
 
 Output protocol: Claude Code SessionStart hooks emit a JSON object on stdout
 with a `hookSpecificOutput.additionalContext` field. The content of that field
