@@ -167,6 +167,44 @@ Derived rules:
   read-only scans before they are anything else, specifically so the same
   audit can run again later and catch drift the first run didn't — including
   drift in itself, now that it checks its own kind of failure.
+- **Connectors are processes, and nothing reaps them.** Every stdio MCP
+  server is a local process tree the client spawns and is supposed to clean
+  up. Measured on a real setup after a forced reboot: three loaded tasks
+  against seven groups of one connector and seven of another, an idle task
+  still holding a full set, ~7 GiB RSS across 60 processes — and before the
+  reboot, 17 launcher processes still alive after both agent clients had
+  exited. Count process groups against *loaded tasks*, not against config
+  entries; one config line is not one process, and a ratio above 1:1 is
+  duplicate-spawn. Prefer the vendor's hosted HTTP endpoint over a local
+  wrapper (it spawns nothing and cannot leak) — this is
+  canonical-pattern-first applied to connectors. Enable per-task what only
+  some tasks need; always-on pays startup on every task including the ones
+  that never call it. Audit login-time model warmers in the same pass: one
+  eagerly loading a 9 GB model at login held more memory than every
+  connector combined.
+- **A 200 is not an authentication.** "The handshake returned HTTP 200" is
+  the connector-config form of self-attestation — it proves the endpoint
+  answered, not that your credential arrived or that anyone checked it.
+  Measured: a hosted MCP endpoint returned 200 with a full capability
+  payload to a **fabricated** API key. Prove the endpoint rejects a wrong
+  credential before treating success as proof of auth — send a garbage
+  token once and compare; if it answers the same either way you need an
+  authenticated *call*, not a connect.
+- **Check the environment the process has, not the one you can grep.** The
+  same audit nearly shipped the mirror-image false finding: a config named
+  an env var that appeared in no shell profile and read empty in every
+  shell, which looked conclusive. It had been wired correctly all along —
+  published to the OS login session by a launch agent, so the GUI-launched
+  client inherited it. On macOS a GUI-launched app inherits launchd's
+  environment, not your shell's: a var that works in a terminal can be
+  empty in the app, and a var absent from every rc file can be present in
+  it. Neither the config file nor your shell is evidence; the running
+  process's own environment is. Prefer the shape that cannot silently
+  degrade — a secrets-manager reference materialized into the config fails
+  loudly at inject time when the item is missing, where an env-var name the
+  config merely mentions fails silently forever. If you use the env-var
+  indirection anyway, document where it gets published next to the config
+  that depends on it.
 
 ## Prose-voice tasks load the voice guide FIRST
 
@@ -211,3 +249,13 @@ Secrets always live in a secrets manager, never in repo files. The reference imp
 **Why "check first"**: inventing item names creates silent drift — install/bootstrap fails when injection can't find the item, and the operator either creates-with-wrong-name (worsening drift) or renames templates after the fact. Checking first is one command and prevents the whole class of failure.
 
 Secret-bearing files are stored as templates (`<name>.opvault`) containing `op://...` URIs; an install step materializes them via `op inject`. The materialized real files are gitignored — they never enter version control.
+
+**The template extension is a claim, not a guarantee.** Measured on a real setup: a tracked `.opvault` template held a live API key in plaintext three lines above two correct `op://` references in the same file, committed and pushed. The naming convention had been carrying the whole burden of enforcement, which is to say none. The mixed case is the dangerous one — real references beside a real key read as a compliant file. Detection is one command that runs clean on a real repo:
+
+```
+git grep -nIE "(sk-ant-|sk-proj-|ghp_|gho_|AKIA|xox[baprs]-|ctx7sk-)"
+```
+
+Wire it as a pre-commit hook rather than a habit, per **Harness hygiene** above — a rule with no mechanical check is the failure mode that section exists to name. The provider prefix list is the part that rots: adding a service means adding its prefix. And a passing hook says nothing about history; a key already pushed needs rotation, not a scrub.
+
+**The template is the source of truth; a fix applied to the materialized file is not applied.** Same setup: a fix disabled always-on connectors in the live config and left the template describing the pre-fix world, so the next install silently reverted it on every machine. Any edit to a materialized secret-bearing file is half-done until the same change reaches its template. Diff them with the `op://` placeholders redacted to prove it.
