@@ -90,10 +90,25 @@ else
   # Nothing surfaced until someone opened last-review.md by hand ~16 hours later.
   # The exit status was already captured here; it was thrown away at the one
   # point a human would have seen it.
+  # The CLI reports an auth failure on STDOUT, not stderr, so $OUT.err is
+  # created empty while the reason sits in $OUT. Verified 2026-08-31 against the
+  # real binary: exit 1, stderr empty, "Failed to authenticate ..." on stdout.
+  # Read .err first, fall back to the body, and never point a human at a
+  # zero-byte file.
   ERRLINE="$(grep -m1 -v '^[[:space:]]*$' "$OUT.err" 2>/dev/null | cut -c1-160)"
+  if [ -z "$ERRLINE" ]; then
+    ERRLINE="$(grep -v '^[[:space:]]*$' "$OUT" 2>/dev/null \
+               | grep -vE '^(#|>)' | head -1 | cut -c1-160)"
+  fi
+  if [ -s "$OUT.err" ]; then
+    WHERE="see ${OUT}.err"
+  else
+    rm -f "$OUT.err"
+    WHERE="reason above"
+  fi
   {
     echo
-    echo "_(review failed; see ${OUT}.err)_"
+    echo "_(review failed — ${WHERE})_"
   } >> "$OUT"
   case "$ERRLINE" in
     *uthenticat*|*OAuth*|*oauth*|*"ogged out"*|*"og in"*)
