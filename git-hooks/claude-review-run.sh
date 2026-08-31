@@ -82,10 +82,32 @@ if claude -p "$PROMPT" \
      >> "$OUT" 2>>"$OUT.err"; then
   rm -f "$OUT.err"
 else
+  # A failed review must not be able to look like a finished one. It could, and
+  # did: an expired OAuth session on 2026-08-30 produced a "review ready"
+  # notification for 24 consecutive commits across four repos, because the only
+  # notification that said anything specific was the "Looks good to me" one and
+  # everything else — including total failure — fell through to "review ready".
+  # Nothing surfaced until someone opened last-review.md by hand ~16 hours later.
+  # The exit status was already captured here; it was thrown away at the one
+  # point a human would have seen it.
+  ERRLINE="$(grep -m1 -v '^[[:space:]]*$' "$OUT.err" 2>/dev/null | cut -c1-160)"
   {
     echo
     echo "_(review failed; see ${OUT}.err)_"
   } >> "$OUT"
+  case "$ERRLINE" in
+    *uthenticat*|*OAuth*|*oauth*|*"ogged out"*|*"og in"*)
+      # Machine state, not a bad commit. Every later commit fails the same way
+      # until a human re-authenticates, so name the remedy in the notification.
+      notify "Claude review FAILED — not signed in" \
+             "$(basename "$REPO") ${SHORT} was NOT reviewed. Run: claude auth login" ;;
+    *)
+      notify "Claude review FAILED" \
+             "$(basename "$REPO") ${SHORT} was NOT reviewed. ${ERRLINE:-see ${OUT}.err}" ;;
+  esac
+  # nohup'd and disowned by post-commit, so this is invisible to git. It matters
+  # when the script is run directly, including by its own test.
+  exit 1
 fi
 
 if grep -q "Looks good to me" "$OUT" 2>/dev/null; then
