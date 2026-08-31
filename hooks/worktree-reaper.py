@@ -52,7 +52,8 @@ Safety gates, all fail-open EXCEPT the idleness check, which fails closed:
     would simply repeat itself.
   - Bounded by a wall-clock DEADLINE_SECONDS that every subprocess is clipped to,
     so it stops itself and logs rather than being killed silently mid-work. See
-    the budget arithmetic under "tunables".
+    the budget arithmetic under "tunables". The stdin payload read is bounded
+    separately, because it is the one blocking call that is not a subprocess.
   - Enumerates via `git worktree list`, NOT a `.worktrees/*` glob — Codex places
     its worktrees at ~/.codex/worktrees/<id>/<repo>, outside the repo entirely.
     A glob would silently skip every Codex worktree.
@@ -85,6 +86,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import shutil
 import subprocess
 import sys
@@ -114,6 +116,12 @@ THROTTLE_HOURS = int(os.environ.get("WORKTREE_REAPER_THROTTLE_HOURS", "6"))
 #     => 15 + 1 < 20, the Codex Stop budget.  Claude's 60 leaves slack for the
 #        one genuinely unbounded step below.
 #
+#   STDIN_PAYLOAD_TIMEOUT is charged against the same budget rather than added
+#   to it: _STARTED_AT is stamped at import, before the payload is read, so a
+#   stalled stdin shortens the work that follows instead of extending the run.
+#   That is the safe direction, and it is why the cap is 2s and not 10 — the
+#   pathological case must not eat the headroom below.
+#
 #   REMOVE_TIMEOUT is the exception to clipping: a `git worktree remove` killed
 #   part-way strands a half-deleted worktree that both gates then skip forever,
 #   so it runs only when its FULL cap is still available.
@@ -139,6 +147,11 @@ SIZE_MEASURE_RESERVE_SECONDS = 4.0
 SIZE_MEASURE_TIMEOUT_SECONDS = 3
 FIND_TIMEOUT = int(os.environ.get("WORKTREE_REAPER_FIND_TIMEOUT", "10"))
 REMOVE_TIMEOUT = int(os.environ.get("WORKTREE_REAPER_REMOVE_TIMEOUT", "10"))
+# The stdin payload is the one blocking read clipped() does not cover, because
+# it is not a subprocess. A real harness writes a few dozen bytes and closes in
+# microseconds, so nothing legitimate comes near this; it exists only to break a
+# deadlock. See read_payload() for the failure it was measured against.
+STDIN_PAYLOAD_TIMEOUT = float(os.environ.get("WORKTREE_REAPER_STDIN_TIMEOUT", "2"))
 _STARTED_AT = time.time()
 # Report mode runs from a shell, not under a harness, so it has no budget to
 # respect — and a truncated dry run silently under-reports what a live reap
@@ -184,9 +197,57 @@ CLOSEOUT_LOG_PATH = Path(
 
 # --- helpers -----------------------------------------------------------------
 
-def read_payload() -> dict:
+def read_payload(note=None, timeout: float = STDIN_PAYLOAD_TIMEOUT) -> dict:
+    """The hook payload from stdin, or {} if it does not arrive in `timeout`.
+
+    This was `json.load(sys.stdin)`, which reads to EOF — and an INHERITED stdin
+    may never deliver one. A TTY, or a pipe the parent holds open, parks the
+    process indefinitely at 0% CPU with nothing written to any log, which is the
+    hardest possible shape to diagnose: it does not look like a reaper failure,
+    it looks like the machine stopped.
+
+    Measured 2026-08-27: `python3 -m unittest discover` over this directory hung
+    for 7+ minutes here. test_worktree_reaper's reap helper passed no stdin, so
+    the child inherited the runner's, and the flake tracked nothing but whether
+    that stdin happened to be at EOF — /dev/null exits in 0.13s, an open pipe
+    never exits. The closeout helper passed `input=`, which closes the pipe, and
+    so never hung. That asymmetry was the whole bug.
+
+    Waiting on readiness alone would not be enough: a stream can go ready, hand
+    over half a payload and stall, so the deadline covers the whole read.
+
+    Fails toward {} on every uncertain path, like the rest of this file — but
+    unlike the gates above, {} here is not always harmless, so it is logged.
+    cmd_reap falls back to os.getcwd(), which is the directory the harness would
+    have named anyway. cmd_closeout uses payload["cwd"] to identify WHICH
+    worktree just ended; falling back there reads the repo root and logs
+    `state=main action=keep` instead of removing a merged worktree. Hence a cap
+    a real harness cannot reach rather than a tight one.
+    """
     try:
-        return json.load(sys.stdin)
+        fd = sys.stdin.fileno()
+    except Exception:
+        return {}
+    deadline = time.time() + timeout
+    chunks: list[bytes] = []
+    while True:
+        left = deadline - time.time()
+        if left <= 0:
+            if note:
+                note(f"stdin payload did not arrive within {timeout}s; "
+                     "continuing without it")
+            return {}
+        try:
+            if not select.select([fd], [], [], left)[0]:
+                continue
+            chunk = os.read(fd, 65536)
+        except Exception:
+            return {}
+        if not chunk:
+            break
+        chunks.append(chunk)
+    try:
+        return json.loads(b"".join(chunks))
     except Exception:
         return {}
 
@@ -861,9 +922,9 @@ def main() -> None:
         # Never touches stdin: run by hand from a shell, not by a hook.
         cmd_report({"cwd": sys.argv[2] if len(sys.argv) > 2 else os.getcwd()})
     elif mode == "closeout":
-        cmd_closeout(read_payload())
+        cmd_closeout(read_payload(log_closeout))
     else:
-        cmd_reap(read_payload())
+        cmd_reap(read_payload(log))
 
 
 if __name__ == "__main__":

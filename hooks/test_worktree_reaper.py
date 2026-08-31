@@ -3,16 +3,38 @@
 
 from __future__ import annotations
 
+import faulthandler
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 
 SCRIPT = Path(__file__).with_name("worktree-reaper.py")
+
+# Every child spawned here gets its own timeout, so a hang fails as a test
+# failure rather than a stalled run. This is the backstop for the ones nobody
+# has written yet: a hang anywhere in this module dumps every thread's stack and
+# exits, instead of parking a `unittest discover` run indefinitely with no
+# output. Scoped to this module via setUpModule/tearDownModule so it cannot cut
+# short a sibling module's tests in the same discover run. Generous — this
+# module runs in seconds; the number only has to beat a human's patience.
+MODULE_TIMEOUT_SECONDS = 180
+# Long enough that a healthy child is never cut off, short enough that a
+# regression is a fast red instead of a coffee break.
+CHILD_TIMEOUT_SECONDS = 60
+
+
+def setUpModule() -> None:
+    faulthandler.dump_traceback_later(MODULE_TIMEOUT_SECONDS, exit=True)
+
+
+def tearDownModule() -> None:
+    faulthandler.cancel_dump_traceback_later()
 
 
 class _RepoFixture(unittest.TestCase):
@@ -54,6 +76,7 @@ class _RepoFixture(unittest.TestCase):
             capture_output=True,
             text=True,
             env=environment,
+            timeout=CHILD_TIMEOUT_SECONDS,
         )
 
 
@@ -117,6 +140,13 @@ class ReapAccountingTests(_RepoFixture):
             capture_output=True,
             text=True,
             env=environment,
+            # Not decoration. Without stdin= this child inherits the RUNNER's
+            # stdin, and the reaper reads its payload to EOF — so the test hung
+            # or passed purely on whether that stdin happened to be closed. The
+            # closeout helper above never hung only because `input=` closes the
+            # pipe for it. See StdinPayloadTests.
+            stdin=subprocess.DEVNULL,
+            timeout=CHILD_TIMEOUT_SECONDS,
         )
         return self.log.read_text(encoding="utf-8") if self.log.exists() else ""
 
@@ -145,6 +175,56 @@ class ReapAccountingTests(_RepoFixture):
         self.assertGreaterEqual(freed, 3)
         self.assertLessEqual(freed, 8)
 
+
+class StdinPayloadTests(unittest.TestCase):
+    """A child must never outlive the stdin it was handed.
+
+    `json.load(sys.stdin)` reads to EOF, so a reaper that inherits a stdin which
+    never closes parks forever at 0% CPU with nothing in any log. Measured
+    2026-08-27: that hung a `python3 -m unittest discover` over this directory
+    for 7+ minutes, and the intermittency was nothing but the runner's stdin —
+    /dev/null exits in 0.13s, a held-open pipe never exits at all.
+
+    The opposite direction — that bounding the read did not cost the payload the
+    hook depends on — is already covered by WorktreeCloseoutTests: each of those
+    runs the child with cwd=repo root and a payload naming a LINKED worktree, so
+    a payload that failed to arrive would log `state=main action=keep` and fail
+    the assertion.
+    """
+
+    def elapsed_with_stdin_held_open(self, mode: str) -> float:
+        read_fd, write_fd = os.pipe()
+        # The write end stays open for the whole test, so the child's stdin is
+        # readable-but-never-EOF: the exact shape that used to block forever.
+        self.addCleanup(os.close, write_fd)
+        with tempfile.TemporaryDirectory() as workdir:
+            environment = os.environ.copy()
+            environment["WORKTREE_REAPER_STDIN_TIMEOUT"] = "1"
+            environment["WORKTREE_REAPER_LOG"] = str(Path(workdir) / "reap.log")
+            environment["WORKTREE_CLOSEOUT_LOG"] = str(Path(workdir) / "closeout.log")
+            started = time.time()
+            process = subprocess.Popen(
+                [sys.executable, str(SCRIPT), mode],
+                cwd=workdir,
+                stdin=read_fd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+            )
+            os.close(read_fd)
+            try:
+                process.communicate(timeout=CHILD_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                self.fail(f"`{mode}` blocked on an stdin that never reaches EOF")
+            return time.time() - started
+
+    def test_reap_gives_up_on_an_stdin_that_never_closes(self) -> None:
+        self.assertLess(self.elapsed_with_stdin_held_open("reap"), 30)
+
+    def test_closeout_gives_up_on_an_stdin_that_never_closes(self) -> None:
+        self.assertLess(self.elapsed_with_stdin_held_open("closeout"), 30)
 
 if __name__ == "__main__":
     unittest.main()
