@@ -72,6 +72,30 @@ CLAUDE_REVIEW_DRY=1 REVIEW=1 git commit -m "wiring test"
 cat "$(git rev-parse --git-dir)/last-review.md"   # shows a dry-run stub
 ```
 
+## Regression test for failure signalling
+
+```sh
+bash git-hooks/claude-review-run.test.sh
+```
+
+Stubs `claude` and `osascript`, spends no quota, and asserts that a failed
+review says so. It exists because the script used to notify "review ready" on
+*any* outcome other than "Looks good to me" — including an auth failure — so on
+2026-08-30 twenty-four unreviewed commits looked exactly like reviewed ones for
+sixteen hours. If you touch `notify()` or the `claude` invocation, run this.
+
+## When a review fails
+
+`last-review.md.err` holds the error and the notification says **FAILED**
+rather than "review ready". The common cause is an expired login: the runner
+unsets `ANTHROPIC_API_KEY` on purpose to force subscription billing, so an
+expired OAuth session leaves no fallback. Check and fix with:
+
+```sh
+claude auth status      # {"loggedIn": false, ...} means every review is failing
+claude auth login       # or: claude setup-token, for a long-lived token
+```
+
 ## Note on global `core.hooksPath`
 
 Git honors exactly one `hooksPath`. Repos that set their own (Husky, lefthook)
