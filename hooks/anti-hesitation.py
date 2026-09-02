@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Stop hook — catches end-of-turn hesitation in the assistant response.
 
+Public, Poe-free variant. The live hook is
+~/.dotfiles/files/home/.claude/hooks/anti-hesitation.py (private); it depends on the
+Poe classifier and owns the detection logic. Changes land there first.
+
 Reads the session transcript, finds the last assistant message, and blocks the
 stop with a corrective reason if the closing reads as a permission-seeking
 question — exactly the pattern the "decision bias" principle prohibits.

@@ -109,6 +109,7 @@ The craft skills are self-contained — drop them in and they work:
 | `symbol-surgery` | Symbol-first refactoring on the native LSP tool: locate by symbol, check blast radius, edit at boundaries, verify references (executes what `deepen` decides) |
 | `diagnose` | Disciplined hard-bug loop: reproduce → minimise → hypothesise → instrument → fix → regression-test |
 | `grill-with-docs` | Stress-test a plan against your domain model and documented decisions |
+| `evidence-audit` | Adversarial provenance audit of a draft before it ships: re-derive load-bearing claims at their sources, downgrade what fails |
 | `tdd` | Red-green-refactor with deep-module and mocking guidance |
 | `triage` | Move issues through a state machine driven by triage roles |
 | `ship` | Deterministic deploy: reads a per-project `DEPLOY.md` as source of truth |
@@ -141,6 +142,7 @@ The flag lives at `<project>/.claude/campsite-mode`, so each repo opts in indepe
 "does this module actually pull its weight?"      → deepen     (depth/seam/locality, the deletion test)
 "ship it"                                         → ship      (reads the project's DEPLOY.md, executes)
 "stress-test this plan against our domain model"  → grill-with-docs
+"is this actually verified?"                       → evidence-audit  (claims re-derived at source, labels downgraded)
 ```
 
 Point Codex at `adapters/AGENTS.md` or Gemini at `adapters/GEMINI.md` and the decision-bias, canonical-first, and worktree rules travel unchanged.
