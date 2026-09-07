@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Fixture coverage for the SessionEnd worktree closeout path."""
+"""Fixture coverage for worktree-reaper.py: closeout, reap accounting, nested
+artifact paths, reap-now, and the stdin bound."""
 
 from __future__ import annotations
 
@@ -79,6 +80,37 @@ class _RepoFixture(unittest.TestCase):
             timeout=CHILD_TIMEOUT_SECONDS,
         )
 
+    def ignore(self, pattern: str) -> None:
+        """Commit a .gitignore line on main; call BEFORE add_worktree so the
+        branch inherits it."""
+        gitignore = self.root / ".gitignore"
+        existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+        gitignore.write_text(existing + pattern + "\n", encoding="utf-8")
+        self.git("add", ".gitignore", cwd=self.root)
+        self.git("commit", "-m", f"ignore {pattern}", cwd=self.root)
+
+    def reap(self, mode: str = "reap", idle_hours: str = "0") -> str:
+        """Run `reap` (or `reap-now`) against the fixture repo; return the log."""
+        environment = os.environ.copy()
+        environment["WORKTREE_REAPER_LOG"] = str(self.log)
+        environment["WORKTREE_REAPER_ARTIFACT_IDLE_HOURS"] = idle_hours
+        subprocess.run(
+            [sys.executable, str(SCRIPT), mode, str(self.root)],
+            cwd=self.root,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+            # Not decoration. Without stdin= this child inherits the RUNNER's
+            # stdin, and the reaper reads its payload to EOF — so the test hung
+            # or passed purely on whether that stdin happened to be closed. The
+            # closeout helper above never hung only because `input=` closes the
+            # pipe for it. See StdinPayloadTests.
+            stdin=subprocess.DEVNULL,
+            timeout=CHILD_TIMEOUT_SECONDS,
+        )
+        return self.log.read_text(encoding="utf-8") if self.log.exists() else ""
+
 
 class WorktreeCloseoutTests(_RepoFixture):
     def test_main_checkout_is_never_removed(self) -> None:
@@ -129,27 +161,6 @@ class WorktreeCloseoutTests(_RepoFixture):
 class ReapAccountingTests(_RepoFixture):
     """The log is the only record of what this hook did, so its numbers must hold."""
 
-    def reap(self) -> str:
-        environment = os.environ.copy()
-        environment["WORKTREE_REAPER_LOG"] = str(self.log)
-        environment["WORKTREE_REAPER_ARTIFACT_IDLE_HOURS"] = "0"
-        subprocess.run(
-            [sys.executable, str(SCRIPT), "reap"],
-            cwd=self.root,
-            check=True,
-            capture_output=True,
-            text=True,
-            env=environment,
-            # Not decoration. Without stdin= this child inherits the RUNNER's
-            # stdin, and the reaper reads its payload to EOF — so the test hung
-            # or passed purely on whether that stdin happened to be closed. The
-            # closeout helper above never hung only because `input=` closes the
-            # pipe for it. See StdinPayloadTests.
-            stdin=subprocess.DEVNULL,
-            timeout=CHILD_TIMEOUT_SECONDS,
-        )
-        return self.log.read_text(encoding="utf-8") if self.log.exists() else ""
-
     def test_freed_reports_the_deleted_tree_not_a_volume_delta(self) -> None:
         worktree = self.add_worktree("stale-build")
         (self.root / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
@@ -174,6 +185,179 @@ class ReapAccountingTests(_RepoFixture):
         freed = int(line.split("freed")[1].lstrip("=>").split("MB")[0])
         self.assertGreaterEqual(freed, 3)
         self.assertLessEqual(freed, 8)
+
+
+OLD = 1_600_000_000  # 2020 — well past any idle gate
+
+
+def backdate(path: Path) -> None:
+    """Set every file and directory under `path` (inclusive) to OLD."""
+    for entry in sorted(path.rglob("*"), key=lambda e: len(e.parts), reverse=True):
+        os.utime(entry, (OLD, OLD), follow_symlinks=False)
+    os.utime(path, (OLD, OLD))
+
+
+class NestedArtifactTests(_RepoFixture):
+    """ARTIFACT_DIRS entries are worktree-relative paths, matched at exactly that
+    location. Measured 2026-09-07: minder redirects Xcode DerivedData into
+    `.artifacts/derived-data` under each worktree — 127 GB across 67 worktrees,
+    98 GB of it idle past the gate — and `report` said "artifact dirs to delete
+    (0)" because the tuple only knew root-level names."""
+
+    def derived_data_worktree(self, ignored: bool = True) -> tuple[Path, Path, Path]:
+        if ignored:
+            self.ignore(".artifacts/")
+        worktree = self.add_worktree("xcode-task")
+        derived = worktree / ".artifacts" / "derived-data" / "Build" / "Intermediates.noindex"
+        derived.mkdir(parents=True)
+        (derived / "Module.pcm").write_bytes(b"x" * 100_000)
+        sibling = worktree / ".artifacts" / "captures"
+        sibling.mkdir()
+        (sibling / "screen.png").write_bytes(b"png")
+        backdate(worktree / ".artifacts")
+        return worktree, worktree / ".artifacts" / "derived-data", sibling
+
+    def test_idle_ignored_nested_derived_data_is_reaped_and_sibling_survives(self) -> None:
+        worktree, derived, sibling = self.derived_data_worktree()
+
+        line = self.reap(idle_hours="48")
+
+        self.assertFalse(derived.exists(), "idle .artifacts/derived-data should be gone")
+        self.assertTrue((sibling / "screen.png").exists(), "the parent's other children are not ours")
+        self.assertTrue((worktree / "tracked.txt").exists())
+        self.assertIn("artifacts=1", line)
+
+    def test_nested_tree_with_a_fresh_deep_file_is_kept(self) -> None:
+        """The idle gate is deep. A build writing into Intermediates.noindex leaves
+        derived-data's own mtime untouched, so a root-mtime check would delete a
+        tree mid-build; the deep find must see the fresh file and skip."""
+        worktree, derived, _ = self.derived_data_worktree()
+        (derived / "Build" / "Intermediates.noindex" / "fresh.o").write_bytes(b"o")
+        # The write refreshed the leaf dir; put the dir mtimes back so only the
+        # file itself is what the scan can find.
+        os.utime(derived / "Build" / "Intermediates.noindex", (OLD, OLD))
+
+        line = self.reap(idle_hours="48")
+
+        self.assertTrue((derived / "Build" / "Intermediates.noindex" / "fresh.o").exists())
+        # A run that finds no work stamps and logs nothing.
+        self.assertNotIn("artifacts=", line)
+
+    def test_nested_tree_that_git_does_not_ignore_is_kept(self) -> None:
+        worktree, derived, _ = self.derived_data_worktree(ignored=False)
+
+        line = self.reap(idle_hours="48")
+
+        self.assertTrue(derived.exists(), "an un-ignored dir is never build output to us")
+        self.assertNotIn("artifacts=", line)
+
+    def test_nested_tree_in_a_worktree_with_a_live_session_is_kept(self) -> None:
+        worktree, derived, _ = self.derived_data_worktree()
+        common = Path(self.git("rev-parse", "--git-common-dir", cwd=self.root))
+        if not common.is_absolute():
+            common = self.root / common
+        locks = common / ".claude-sessions"
+        locks.mkdir(parents=True, exist_ok=True)
+        (locks / "live.json").write_text(json.dumps({"cwd": str(worktree)}), encoding="utf-8")
+
+        line = self.reap(mode="reap-now", idle_hours="48")
+
+        self.assertTrue(derived.exists(), "a worktree with a fresh session lock is occupied")
+        self.assertNotIn("artifacts=", line)
+
+
+class ReapNowTests(_RepoFixture):
+    """`reap-now` is the hand-run reap: no throttle, no deadline, same gates."""
+
+    def stale_build(self) -> Path:
+        self.ignore("node_modules/")
+        worktree = self.add_worktree("stale")
+        build = worktree / "node_modules"
+        build.mkdir()
+        (build / "blob.bin").write_bytes(b"x" * 10_000)
+        backdate(build)
+        return build
+
+    def stamp_recent_reap(self) -> None:
+        common = Path(self.git("rev-parse", "--git-common-dir", cwd=self.root))
+        if not common.is_absolute():
+            common = self.root / common
+        (common / ".claude-sessions").mkdir(parents=True, exist_ok=True)
+        (common / ".claude-sessions" / ".last-reap").write_text("now", encoding="utf-8")
+
+    def test_hook_reap_honours_the_throttle_and_reap_now_does_not(self) -> None:
+        build = self.stale_build()
+        self.stamp_recent_reap()
+
+        throttled_log = self.reap(mode="reap")
+        self.assertTrue(build.exists(), "a throttled hook run must not delete")
+        self.assertEqual(throttled_log, "", "a throttled hook run is silent")
+
+        line = self.reap(mode="reap-now")
+        self.assertFalse(build.exists())
+        self.assertIn("reap-now artifacts=1", line)
+        self.assertNotIn("TRUNCATED", line)
+
+    def test_reap_now_still_never_touches_the_main_checkout(self) -> None:
+        self.ignore("node_modules/")
+        build = self.root / "node_modules"
+        build.mkdir()
+        (build / "blob.bin").write_bytes(b"x")
+        backdate(build)
+
+        line = self.reap(mode="reap-now")
+
+        self.assertTrue(build.exists())
+        self.assertNotIn("artifacts=", line)
+
+
+class RecentlyTouchedPruneTests(unittest.TestCase):
+    """The removal-path scan prunes ARTIFACT_DIRS with -path, so a nested entry
+    is actually excluded. The old -name form could never match a slash."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("worktree_reaper", SCRIPT)
+        cls.reaper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.reaper)
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / "wt"
+        (self.root / "src").mkdir(parents=True)
+        (self.root / "src" / "main.swift").write_text("", encoding="utf-8")
+        (self.root / ".artifacts" / "derived-data" / "Build").mkdir(parents=True)
+        (self.root / "target" / "debug").mkdir(parents=True)
+        backdate(self.root)
+        self.reaper.LOG_PATH = Path(self.temporary.name) / "reap.log"
+
+    def test_fresh_file_inside_a_pruned_nested_path_reads_idle(self) -> None:
+        (self.root / ".artifacts" / "derived-data" / "Build" / "x.o").write_bytes(b"o")
+        os.utime(self.root / ".artifacts" / "derived-data" / "Build", (OLD, OLD))
+        os.utime(self.root / ".artifacts" / "derived-data", (OLD, OLD))
+
+        self.assertTrue(self.reaper.recently_touched(str(self.root), 48))
+        self.assertFalse(
+            self.reaper.recently_touched(str(self.root), 48, prune=(".artifacts/derived-data",))
+        )
+
+    def test_top_level_prune_still_works_with_path_matching(self) -> None:
+        (self.root / "target" / "debug" / "build.o").write_bytes(b"o")
+        os.utime(self.root / "target" / "debug", (OLD, OLD))
+        os.utime(self.root / "target", (OLD, OLD))
+
+        self.assertTrue(self.reaper.recently_touched(str(self.root), 48))
+        self.assertFalse(self.reaper.recently_touched(str(self.root), 48, prune=("target",)))
+
+    def test_pruning_a_nested_path_does_not_hide_a_fresh_sibling(self) -> None:
+        (self.root / ".artifacts" / "captures.png").write_bytes(b"png")
+
+        self.assertTrue(
+            self.reaper.recently_touched(str(self.root), 48, prune=(".artifacts/derived-data",))
+        )
 
 
 class StdinPayloadTests(unittest.TestCase):

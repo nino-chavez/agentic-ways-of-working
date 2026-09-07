@@ -60,6 +60,12 @@ Safety gates, all fail-open EXCEPT the idleness check, which fails closed:
 
 Modes (argv[1]):
   reap    — hook mode: throttled, silent, exits 0 always.
+  reap-now — hand-run reap: the same gates and the same deletions as `reap`,
+             but no throttle and no wall-clock budget, like `report`. For the
+             reclaim a hook run cannot fit: 22 idle DerivedData trees totalling
+             98 GB under minder's worktrees would never clear in 15s windows,
+             and each hook pass that plans past the budget deletes nothing and
+             stamps the repo for six hours. Optional argv[2] names the repo.
   report  — dry run: prints what it WOULD do, with sizes. Never deletes.
   closeout — SessionEnd mode: remove this linked worktree immediately when it is
              clean and merged; otherwise record the handoff state. It never
@@ -166,6 +172,13 @@ STAMP_FILENAME = ".last-reap"
 
 # Build output only. Every candidate must ALSO be confirmed gitignored before
 # deletion, so an unusual repo that tracks one of these names is never harmed.
+#
+# Each entry is a path RELATIVE TO THE WORKTREE ROOT, and is looked for at that
+# one location only — never searched for at every depth. A nested entry such as
+# ".artifacts/derived-data" names exactly <worktree>/.artifacts/derived-data;
+# its parent is left alone, so siblings under .artifacts/ (captures, receipts)
+# survive. Same gates as a top-level entry: git-ignored, deep-idle, not the main
+# checkout, not a worktree with a live session lock.
 ARTIFACT_DIRS = (
     "target",         # rust/cargo — the 68 GB case
     "node_modules",
@@ -176,9 +189,16 @@ ARTIFACT_DIRS = (
     "dist",
     "build",
     ".venv",
+    # Xcode DerivedData redirected into the worktree (minder's build setup).
+    # Measured 2026-09-07: 67 of minder's 170 worktrees carried it, 127 GB, of
+    # which 98 GB across 22 trees was idle past the 48h gate — and the reaper
+    # reported "artifact dirs to delete (0)" because it only knew root names.
+    ".artifacts/derived-data",
+    ".artifacts/test-results",   # xcresult bundles, 6.3 GB in the same measurement
 )
 # Deliberately NOT here: __pycache__. It appears at every depth, and this reaper
-# only inspects the worktree root, so listing it would imply coverage it lacks.
+# only inspects the listed paths under the worktree root, so listing it would
+# imply coverage it lacks.
 
 # Overridable so a test can assert on the log without writing the real one.
 LOG_PATH = Path(
@@ -371,7 +391,13 @@ def live_session_dirs(cd: str) -> list[str]:
             data = json.loads(f.read_text(encoding="utf-8"))
             c = data.get("cwd")
             if isinstance(c, str) and c:
-                out.append(os.path.abspath(c))
+                # realpath, not abspath: `git worktree list` reports paths with
+                # symlinks resolved, and a lock written from a symlinked cwd
+                # (macOS /var -> /private/var, a ~/code symlink) compared by
+                # abspath never matches — so the occupancy gate reads the
+                # worktree as free. Caught by the live-session fixture, whose
+                # tempdir lives under /var.
+                out.append(os.path.realpath(c))
         except Exception:
             continue
     return out
@@ -449,9 +475,15 @@ def recently_touched(path: str, hours: float, prune: tuple[str, ...] = ()) -> bo
     though: "active" and "could not tell" produce identical output and the run
     would report `artifacts=0` either way. So the uncertain paths log.
     """
+    # `prune` entries are worktree-relative paths, matched with -path against
+    # the exact location under `path`. The earlier `-name` form matched a bare
+    # basename at any depth, and a nested entry like ".artifacts/derived-data"
+    # contains a slash, which -name can never match — so it would have been
+    # walked in full on the removal path despite the artifact scan having
+    # already answered for it.
     cmd = ["find", path]
-    for name in prune:
-        cmd += ["-name", name, "-prune", "-o"]
+    for rel in prune:
+        cmd += ["-path", os.path.join(path, rel), "-prune", "-o"]
     cmd += ["-newermt", f"-{hours} hours", "-print", "-quit"]
     budget = clipped(FIND_TIMEOUT)
     try:
@@ -637,11 +669,11 @@ def plan(
     truncated = False
 
     live = live_session_dirs(cd)
-    me = os.path.abspath(cwd)
+    me = os.path.realpath(cwd)
     dflt = default_branch(cwd)
 
     for wt in wts:
-        path = os.path.abspath(wt["path"])
+        path = os.path.realpath(wt["path"])
         if not os.path.isdir(path):
             continue
         # Occupied by this session or another live one? Leave it alone.
@@ -716,7 +748,22 @@ def plan(
     return artifacts, removable, truncated
 
 
-def cmd_reap(payload: dict) -> None:
+def cmd_reap(payload: dict, now: bool = False) -> None:
+    """Hook reap, or — with `now` — the hand-run, unbudgeted version.
+
+    `now` is what `reap-now` sets. It drops the throttle and the deadline and
+    nothing else: every safety gate in plan() and the pre-delete re-checks below
+    still apply. The budget exists to fit under a hook harness timeout, and a
+    hand-run has none — the same reasoning that already exempts `report`. The
+    deletion this was added for (98 GB of idle DerivedData across 22 minder
+    worktrees) does not fit 15s windows: rmtree is unbounded, and minder's hook
+    runs were already truncating with nothing freed and stamping the repo for
+    six hours (log 2026-09-04, elapsed=5.2s, "stamped anyway (no progress)") —
+    the removal gate below needs REMOVE_TIMEOUT of headroom, which a 170-entry
+    worktree list uses up in planning. A hand-run is the honest fix rather than
+    a bigger hook budget that Codex's 20s Stop cannot honour.
+    """
+    global _DEADLINE_ON
     if os.environ.get("WORKTREE_REAPER_OFF") == "1":
         sys.exit(0)
     cwd = payload.get("cwd") or os.getcwd()
@@ -725,7 +772,9 @@ def cmd_reap(payload: dict) -> None:
         sys.exit(0)
     if (Path(cd) / LOCK_DIRNAME / OVERRIDE_FILENAME).exists():
         sys.exit(0)
-    if throttled(cd):
+    if now:
+        _DEADLINE_ON = False
+    elif throttled(cd):
         sys.exit(0)
 
     # Enumeration failure is not "no worktrees". git() returns None on a non-zero
@@ -805,7 +854,12 @@ def cmd_reap(payload: dict) -> None:
         # Measure before deleting, and only with budget to spare — a full walk of
         # a node_modules runs ~0.5s. No budget means no number, never a guess.
         if budget_left() > SIZE_MEASURE_RESERVE_SECONDS:
-            kb = dir_size_kb(target, timeout=SIZE_MEASURE_TIMEOUT_SECONDS)
+            # Unbudgeted (reap-now), a 3s cap under-reports every large tree —
+            # the trees it exists for — so give it report mode's allowance.
+            kb = dir_size_kb(
+                target,
+                timeout=SIZE_MEASURE_TIMEOUT_SECONDS if _DEADLINE_ON else 120,
+            )
             if kb:
                 freed_kb += kb
             else:
@@ -857,7 +911,8 @@ def cmd_reap(payload: dict) -> None:
     if not (truncated and progressed):
         touch_stamp(cd)
     log(
-        f"repo={cwd} artifacts={n_art} worktrees_removed={n_wt} "
+        f"repo={cwd} {'reap-now ' if now else ''}"
+        f"artifacts={n_art} worktrees_removed={n_wt} "
         f"freed{'>=' if unmeasured else '='}{freed_kb // 1024}MB "
         f"elapsed={time.time() - _STARTED_AT:.1f}s"
         + (
@@ -921,6 +976,10 @@ def main() -> None:
     if mode == "report":
         # Never touches stdin: run by hand from a shell, not by a hook.
         cmd_report({"cwd": sys.argv[2] if len(sys.argv) > 2 else os.getcwd()})
+    elif mode == "reap-now":
+        # Hand-run like report, so it takes the repo from argv rather than a
+        # payload and never touches stdin either.
+        cmd_reap({"cwd": sys.argv[2] if len(sys.argv) > 2 else os.getcwd()}, now=True)
     elif mode == "closeout":
         cmd_closeout(read_payload(log_closeout))
     else:
