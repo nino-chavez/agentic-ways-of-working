@@ -43,6 +43,7 @@ So there's exactly one canonical doc — [`principles/working-style.md`](princip
 |---|---|---|
 | **Default to action** | One "go" covers the thread. Turns end on a status sentence, not a permission check | [`anti-hesitation.py`](hooks/anti-hesitation.py) |
 | **Worktree isolation** | Parallel sessions never share a checkout, so commits can't land on each other's branch | [`worktree-guard.py`](hooks/worktree-guard.py) |
+| **Resource cleanup** | What a session starts, something ends: build output on disk, orphaned connector processes, and dev servers, browser tabs and local database stacks left running. Each reaper fails closed when ownership is unclear | [`worktree-reaper.py`](hooks/worktree-reaper.py) (disk) + [`connector-reaper.py`](hooks/connector-reaper.py) (MCP processes) + [`session-reaper.py`](hooks/session-reaper.py) (servers, tabs, stacks) |
 | **Token economics** | Session hygiene beats payload trimming; subagents are context firewalls | [`read-guard.py`](hooks/read-guard.py) + [statusline](statusline.py) |
 | **Subagent model routing** | Keep synthesis in the strongest parent; send each child to the cheapest adequate model | platform adapter + judgment |
 | **Session retention** | Promote durable truth before raw transcripts expire; lifecycle hooks enqueue and background workers mine | [`session-closeout`](skills/session-closeout/SKILL.md) + [retention pattern](docs/session-retention.md) |
@@ -90,7 +91,8 @@ adapters/                     Thin pointers: CLAUDE.md, AGENTS.md, GEMINI.md
 skills/                       The methodology suite (see below)
 commands/campsite.md          /campsite — toggle the north-star working stance
 commands/doctor.md            /doctor — health-check and clean up your own harness
-hooks/                        anti-hesitation, campsite, blueprint-session-start, worktree-guard, read-guard
+hooks/                        anti-hesitation, campsite, blueprint-session-start, worktree-guard, read-guard,
+                              worktree-reaper, connector-reaper, session-reaper (each docstring carries its measurements)
 git-hooks/                    Local post-commit Claude review on commits worth reviewing
 tools/token-audit.py          Measure where your sessions actually spend tokens
 statusline.py                 Context-usage statusline — the /clear signal
