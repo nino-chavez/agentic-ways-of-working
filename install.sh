@@ -102,6 +102,12 @@ if ensure("SessionEnd",       f"python3 {claude_dir}/hooks/worktree-guard.py unr
 # invisibly (measured: 52 worktrees / 74 GB, 68 GB of it Rust target/, none merged).
 # Reclaims build dirs from idle worktrees; removes merged+clean ones. Throttled.
 if ensure("SessionEnd",       f"python3 {claude_dir}/hooks/worktree-reaper.py reap", 60):                          added.append("SessionEnd:worktree-reaper")
+# Session reaper: what an ended session leaves RUNNING, where worktree-reaper
+# covers what it leaves on disk. Orphaned dev servers, browser tabs pointed at
+# ports nothing listens on, and idle local supabase stacks (measured: 7 vite
+# servers up to 22h, 211 browser tabs / 18.6 GB, 3 stacks idle four days).
+# Throttled per repo; every gate fails closed. `report` dry-runs it.
+if ensure("SessionEnd",       f"python3 {claude_dir}/hooks/session-reaper.py reap", 30):                           added.append("SessionEnd:session-reaper")
 # Read-cost guard: bounce oversized images (with a downscaled copy) and
 # redundant re-reads of unchanged files. Image branch needs macOS sips;
 # fails open elsewhere.
