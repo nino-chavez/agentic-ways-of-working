@@ -120,6 +120,48 @@ class ClientScanTests(unittest.TestCase):
     def test_stripping_is_confined_to_path_tokens(self) -> None:
         self.assertIn("--port", sr._client_text(self.CMD, self.REPO))
 
+    def test_an_agent_state_path_after_the_executable_is_not_an_owner(self) -> None:
+        """The Bash-tool shell wrapper outlives its session and carries a
+        transcript path under ~/.claude. Left matching, it would exempt every
+        dev server beneath it forever."""
+        wrapper = (
+            "/bin/zsh -c source /Users/n/.claude/shell-snapshots/snap.sh "
+            "&& export CODEX_COMPANION_TRANSCRIPT_PATH=/Users/n/.claude/projects/x.jsonl "
+            "&& npx vite dev --port 5213"
+        )
+        prefixes = ("/Users/n/.claude", "/Users/n/.codex")
+        self.assertTrue(sr._is_client(wrapper))              # the bug
+        self.assertFalse(sr._is_client(wrapper, prefixes))   # the fix
+
+    def test_an_agent_binary_living_in_a_state_dir_is_still_a_client(self) -> None:
+        """`~/.codex/computer-use/Codex Computer Use.app/…` is running on this
+        machine. Stripping the EXECUTABLE would hide a live client — the one
+        direction that destroys work — so token 0 is never stripped."""
+        exe = "/Users/n/.codex/computer-use/Codex.app/Contents/MacOS/Codex --flag"
+        self.assertTrue(sr._is_client(exe, ("/Users/n/.claude", "/Users/n/.codex")))
+
+    def test_a_node_launched_claude_cli_is_still_a_client(self) -> None:
+        """The shape that rules out "test the executable only" (`ps -o comm=`):
+        the CLI's comm is the node binary, and only argv[1] says claude."""
+        cmd = (
+            "node /Users/n/.nvm/versions/node/v22/lib/node_modules"
+            "/@anthropic-ai/claude-code/cli.js"
+        )
+        self.assertTrue(sr._is_client(cmd, ("/Users/n/.claude", "/Users/n/.codex")))
+
+    def test_a_flag_with_an_equals_sign_is_not_mistaken_for_an_env_assignment(self) -> None:
+        self.assertIn("--port=5198", sr._client_text("node x --port=5198", ("/nope",)))
+
+    def test_a_macos_agent_path_with_spaces_survives(self) -> None:
+        """Why this is not "test argv[0] only": the whitespace split puts the
+        identifying part of `~/Library/Application Support/Claude/…` in a later
+        token, so an argv[0]-only rule would miss the real Claude Code."""
+        cmd = (
+            "/Users/n/Library/Application Support/Claude/claude-code/2.1.266"
+            "/claude.app/Contents/MacOS/claude"
+        )
+        self.assertTrue(sr._is_client(cmd, ("/Users/n/.claude", "/Users/n/.codex")))
+
 
 class AncestorOwnerTests(unittest.TestCase):
     def test_chain_through_a_live_client_is_owned(self) -> None:
@@ -250,8 +292,11 @@ class _RepoFixture(unittest.TestCase):
     def plan_dev(self) -> tuple[list[dict], list[dict]]:
         return sr.plan_dev_servers(str(self.root), str(self.common))
 
-    def plan_stacks(self) -> tuple[list[dict], list[dict]]:
-        return sr.plan_stacks(str(self.root), str(self.common))
+    def plan_stacks(self, sweep: bool = True) -> tuple[list[dict], list[dict]]:
+        """Defaults to sweep: most of these tests exercise a gate OTHER than
+        scope, and hook mode's declaration requirement would mask it. The two
+        scope tests pass sweep=False explicitly."""
+        return sr.plan_stacks(str(self.root), str(self.common), sweep=sweep)
 
 
 class DevServerPlanTests(_RepoFixture):
@@ -410,7 +455,9 @@ class StackPlanTests(_RepoFixture):
             self._stack("wave-proj"),
             {"supabase_db_wave-proj": time.time() - 4 * self.DAY},
         )
-        stop, _keep = self.plan_stacks()
+        # sweep=False: hook mode, and the worktree DECLARES wave-proj, so this
+        # is the one stack shape the unattended hook is entitled to stop.
+        stop, _keep = self.plan_stacks(sweep=False)
         self.assertEqual([r["project"] for r in stop], ["wave-proj"])
         self.assertTrue(wt.exists())
 
@@ -436,6 +483,40 @@ class StackPlanTests(_RepoFixture):
         stop, keep = self.plan_stacks()
         self.assertEqual(stop, [])
         self.assertEqual(keep[0]["reason"], "docker_unavailable")
+
+    def test_a_repo_with_no_supabase_never_stops_another_repos_stack(self) -> None:
+        """The blocking scope bug. `docker ps` is machine-wide while the locks
+        and worktrees are this repo's, so an unqualified rule let a SessionEnd
+        in blog or dotfiles stop rally-hq's database."""
+        # This fixture repo declares no project_id anywhere.
+        self.stub_docker(
+            self._stack("someone-elses-project"),
+            {"supabase_db_someone-elses-project": time.time() - 4 * self.DAY},
+        )
+        stop, keep = self.plan_stacks(sweep=False)
+        self.assertEqual(stop, [])
+        self.assertEqual(keep[0]["reason"], "not_declared_by_this_repo")
+
+    def test_reap_now_sweeps_what_the_hook_leaves_alone(self) -> None:
+        """The operator-present path reaches a stack whose creating worktree has
+        since been reset — measured, `rally-bloom-journey-20260910` is in no
+        config.toml on disk."""
+        self.stub_docker(
+            self._stack("orphaned-by-a-reset"),
+            {"supabase_db_orphaned-by-a-reset": time.time() - 4 * self.DAY},
+        )
+        stop, _keep = sr.plan_stacks(str(self.root), str(self.common), sweep=True)
+        self.assertEqual([r["project"] for r in stop], ["orphaned-by-a-reset"])
+
+    def test_sweep_still_never_touches_a_claimed_stack(self) -> None:
+        self.set_project_id(self.root, "main-proj")
+        self.stub_docker(
+            self._stack("main-proj"),
+            {"supabase_db_main-proj": time.time() - 4 * self.DAY},
+        )
+        stop, keep = sr.plan_stacks(str(self.root), str(self.common), sweep=True)
+        self.assertEqual(stop, [])
+        self.assertEqual(keep[0]["reason"], "claimed_by_live_session_or_main")
 
     def test_a_short_project_id_does_not_steal_a_longer_ones_containers(self) -> None:
         """"hq" is a suffix of "supabase_db_rally-hq". Longest project wins."""

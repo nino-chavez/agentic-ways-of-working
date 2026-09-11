@@ -172,6 +172,17 @@ DEV_SERVER_ARGV0 = {
 # killed", which is the safe direction.
 CLIENT_PATTERNS = ("claude", "codex", "chatgpt", "node_repl")
 
+# Agent state/transcript directories. A path under one of these, appearing
+# AFTER the executable, is data the agent passed to something else — a shell
+# snapshot, a transcript path, an env export — not an identification of the
+# process. See _client_text(); the leading token is never stripped, so an agent
+# binary that genuinely lives in one of these is still recognised.
+AGENT_STATE_DIRS = (".claude", ".codex")
+
+# `NAME=value` — an environment assignment, which names no process. Flags are
+# excluded by the leading-character class, so `--port=5198` is untouched.
+_ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0", "[::1]"}
 
 # Connect errors that say "this address family goes nowhere on this machine",
@@ -477,29 +488,54 @@ def snapshot_processes() -> dict[int, dict] | None:
 
 
 def _client_text(command: str, strip_prefixes: tuple[str, ...]) -> str:
-    """A command line with any token that names a path INSIDE this repo removed.
+    """A command line with non-leading tokens naming "noise" paths removed.
 
-    Measured while building this, and the reason the rule exists rather than
-    connector-reaper's plain substring test: pid 30300's argv was
+    Two measured false positives, both of which make an orphan read as owned and
+    so quietly switch the dev-server action off:
 
-        node /Users/nino/.../rally-hq/.worktrees/codex/bloom-application-journey/
-             node_modules/.bin/vite dev --host 127.0.0.1 --port 5198
+      1. A repo path. pid 30300's argv was `node
+         /Users/nino/.../rally-hq/.worktrees/codex/bloom-application-journey/
+         node_modules/.bin/vite dev --port 5198` — which contains "codex", a
+         BRANCH NAME. Its npm parent carried no path and was correctly read as
+         an orphan, so the pass would have SIGTERMed half the process group.
+      2. An agent's own plumbing, quoted inside a shell wrapper. The shell
+         Claude's Bash tool wraps a command in survives as long as its child
+         does: `/bin/zsh -c source /Users/nino/.claude/shell-snapshots/….sh …
+         export CODEX_COMPANION_TRANSCRIPT_PATH=/Users/nino/.claude/projects/
+         ….jsonl`. Both "claude" and "codex" are in there as DATA — and note
+         the second one twice over, in the path AND in the VARIABLE NAME, which
+         is why stripping paths alone did not fix it. Reparented to pid 1 after
+         its session ends, that wrapper would exempt every dev server beneath
+         it, forever.
 
-    which contains "codex" — a BRANCH NAME — so the client test matched and the
-    reaper reported an orphaned dev server as owned by a live Codex. Its npm
-    parent, whose argv carries no path, was correctly read as an orphan, so the
-    pass would have SIGTERMed half the process group and left the node half
-    running. Not dangerous, but it defeats the action.
+    So two kinds of token go: a path under one of `strip_prefixes`, and an
+    environment assignment (`NAME=…`), which is never how a process is named.
 
-    Connector-reaper does not hit this because MCP argv is package names, not
-    repo paths. A path under the repo being inspected never identifies an agent
-    client, so dropping those tokens is precise rather than a fudge.
+    THE FIRST TOKEN IS NEVER STRIPPED, and that is the part that keeps this
+    safe rather than clever. A real agent process can live inside one of these
+    directories — `/Users/nino/.codex/computer-use/Codex Computer Use.app/…` is
+    running on this machine right now — and stripping its executable would hide
+    a live client, which is the one direction that destroys work. Only what
+    comes AFTER the executable is treated as noise.
+
+    Nor can this be replaced by "test argv[0] only": macOS agent paths contain
+    spaces (`~/Library/Application Support/Claude/claude-code/…`), so a
+    whitespace split puts the identifying part in a later token.
+
+    connector-reaper.py does not need any of this — MCP argv is package names,
+    not paths — which is why the rule lives here and not there.
     """
     if not strip_prefixes:
         return command
+
+    def drop(tok: str) -> bool:
+        return bool(_ENV_ASSIGNMENT_RE.match(tok)) or any(
+            tok.startswith(p) for p in strip_prefixes
+        )
+
     return " ".join(
-        "" if any(tok.startswith(p) for p in strip_prefixes) else tok
-        for tok in command.split()
+        tok if i == 0 or not drop(tok) else ""
+        for i, tok in enumerate(command.split())
     )
 
 
@@ -624,12 +660,16 @@ def plan_dev_servers(cwd: str, cd: str) -> tuple[list[dict], list[dict]]:
         for e in entries
         if not e.get("main") and not e.get("bare") and os.path.isdir(e["path"])
     ]
-    # Every worktree path, main included, so a branch or directory name that
-    # happens to contain "codex"/"claude" cannot pass for an agent client.
-    # See _client_text() for the measured case.
+    # Paths that never IDENTIFY an agent client when they appear after the
+    # executable: every worktree of this repo (a branch named `codex/…`), and
+    # the agents' own state directories (a wrapped shell carrying a transcript
+    # path under ~/.claude). See _client_text() for both measured cases.
     repo_paths = tuple(
-        sorted({os.path.realpath(e["path"]) for e in entries} |
-               {os.path.realpath(e["path"]) + os.sep for e in entries})
+        sorted(
+            {os.path.realpath(e["path"]) for e in entries}
+            | {os.path.realpath(e["path"]) + os.sep for e in entries}
+            | {str(Path.home() / d) for d in AGENT_STATE_DIRS}
+        )
     )
 
     live, live_ok = live_session_dirs(cd)
@@ -873,19 +913,37 @@ def parse_docker_time(raw: str) -> float | None:
     return dt.timestamp()
 
 
-def plan_stacks(cwd: str, cd: str) -> tuple[list[dict], list[dict]]:
+def plan_stacks(cwd: str, cd: str, sweep: bool = False) -> tuple[list[dict], list[dict]]:
     """(stop, keep) rows, one per local supabase project.
 
-    Claimed (never stopped):
+    Claimed (never stopped, in either mode):
       - the MAIN checkout's own project id, unconditionally exempt
       - the project id of any worktree holding a live session lock
 
-    Stopped only when unclaimed AND its db container has been RUNNING longer
-    than STACK_IDLE_HOURS. Uptime is `State.StartedAt`, not `Created`: a stack
-    created four days ago but started an hour ago (a Docker Desktop restart)
-    reads as one hour, which defers the reap. Wrong in the safe direction — it
-    waits longer, never shorter — and `Created` is reported alongside so the
-    operator can see the difference.
+    SCOPE, and the reason `sweep` exists. `docker ps` is machine-wide while the
+    session locks and worktrees are this repo's, so an unqualified rule lets one
+    repo judge another repo's stacks. Traced before shipping: a SessionEnd in a
+    repo with no supabase at all (blog, website-nc, dotfiles) reads every
+    project_id as None, computes an EMPTY claimed set, and makes every stack on
+    the machine eligible — including `supabase_db_rally-hq` at any moment no
+    rally-hq session happens to be live. Volumes survive, so it is recoverable,
+    but it interrupts live work, and this hook fires on every session end in
+    every repo.
+
+    So hook mode (sweep=False) only considers a project that some worktree of
+    THIS repo declares in its supabase/config.toml. A repo that knows nothing
+    about a stack does not get to stop it.
+
+    `reap-now` and `report` pass sweep=True, which drops the declaration
+    requirement and keeps every other gate. That is the operator-present path,
+    and it is the one that reaches a stack whose creating worktree has since
+    been reset — measured 2026-09-11, `rally-bloom-journey-20260910` appears in
+    no config.toml on disk, so the hook alone would never reclaim it.
+
+    Uptime is `State.StartedAt`, not `Created`: a stack created four days ago
+    but started an hour ago (a Docker Desktop restart) reads as one hour, which
+    defers the reap. Wrong in the safe direction — it waits longer, never
+    shorter — and `Created` is reported alongside so the difference is visible.
     """
     stop: list[dict] = []
     keep: list[dict] = []
@@ -909,7 +967,8 @@ def plan_stacks(cwd: str, cd: str) -> tuple[list[dict], list[dict]]:
         keep.append({"reason": "session_locks_unreadable", "scope": "action"})
         return stop, keep
 
-    claimed: set[str] = set()
+    claimed: set[str] = set()   # in use right now — never stopped
+    declared: set[str] = set()  # this repo knows about it — hook mode's scope
     me = os.path.realpath(cwd)
     for e in entries:
         path = os.path.realpath(e["path"])
@@ -923,7 +982,10 @@ def plan_stacks(cwd: str, cd: str) -> tuple[list[dict], list[dict]]:
                 keep.append({"reason": "config_toml_unreadable", "scope": "action"})
                 return [], keep
             continue
-        if pid_ and occupied:
+        if not pid_:
+            continue
+        declared.add(pid_)
+        if occupied:
             claimed.add(pid_)
 
     projects = sorted(
@@ -958,23 +1020,30 @@ def plan_stacks(cwd: str, cd: str) -> tuple[list[dict], list[dict]]:
     now = time.time()
     for project in sorted(projects):
         db = DB_CONTAINER_PREFIX + project
+        # Uptime is filled in BEFORE the gates rather than inside them, so a row
+        # kept for some other reason still carries the number. A report line
+        # reading `up ?` next to "claimed" tells the operator nothing about
+        # whether the stack is one they have forgotten.
+        start_at, created_at = started.get(db, (None, None))
         row = {
             "project": project,
             "containers": containers_of(project),
-            "uptime_s": None,
-            "created_age_s": None,
+            "uptime_s": (now - start_at) if start_at else None,
+            "created_age_s": (now - created_at) if created_at else None,
         }
         if project in claimed:
             row["reason"] = "claimed_by_live_session_or_main"
             keep.append(row)
             continue
-        start_at, created_at = started.get(db, (None, None))
+        if not sweep and project not in declared:
+            # Not this repo's stack to judge. See the SCOPE note above.
+            row["reason"] = "not_declared_by_this_repo"
+            keep.append(row)
+            continue
         if start_at is None:
             row["reason"] = "uptime_unknown"
             keep.append(row)
             continue
-        row["uptime_s"] = now - start_at
-        row["created_age_s"] = (now - created_at) if created_at else None
         if row["uptime_s"] <= STACK_IDLE_HOURS * 3600:
             row["reason"] = f"running_less_than_{STACK_IDLE_HOURS:.0f}h"
             keep.append(row)
@@ -1117,7 +1186,9 @@ def cmd_reap(payload: dict, now: bool = False) -> None:
 
     if "stacks" in actions and not past_deadline():
         try:
-            stop, _keep = plan_stacks(cwd, cd)
+            # sweep only with the operator present. The hook confines itself to
+            # stacks this repo declares; see plan_stacks()'s SCOPE note.
+            stop, _keep = plan_stacks(cwd, cd, sweep=now)
         except Exception as exc:
             stop = []
             log(f"repo={cwd} stacks action failed: {exc.__class__.__name__}: {exc}")
@@ -1231,6 +1302,8 @@ def cmd_report(cwd: str) -> None:
 
     if "stacks" in actions:
         stop, keep = plan_stacks(cwd, cd)
+        sweep_stop, _sweep_keep = plan_stacks(cwd, cd, sweep=True)
+        extra = [r for r in sweep_stop if r["project"] not in {s["project"] for s in stop}]
         print(f"[3] supabase stacks to `docker stop` ({len(stop)}):")
         for row in stop:
             print(
@@ -1240,6 +1313,15 @@ def cmd_report(cwd: str) -> None:
             )
         if not stop:
             print("  (none)")
+        if extra:
+            print(f"    `reap-now` would ALSO stop ({len(extra)}) — "
+                  "unclaimed, but declared in no worktree of this repo, so the "
+                  "hook leaves them to the operator:")
+            for row in extra:
+                print(
+                    f"      {row['project']}  up {fmt_hours(row['uptime_s'])}, "
+                    f"{len(row['containers'])} container(s)"
+                )
         print(f"    keeping ({len([r for r in keep if r.get('scope') != 'action'])}):")
         for row in keep:
             if row.get("scope") == "action":
