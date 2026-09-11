@@ -704,6 +704,75 @@ class CliTests(_RepoFixture):
         self.assertGreater(len(after), len(before))
         self.assertIn("reap-now", after)
 
+    def isolate_in_process(self) -> None:
+        """Point the two machine-global actions at nothing before calling
+        cmd_reap() in-process.
+
+        Without this the module defaults apply — sr.CDP_URL is the REAL browser
+        on 9339 and sr.docker shells out to the REAL daemon — so an in-process
+        reap would act on the operator's live session. The gates happened to
+        hold when this was first written (every stack was under the 24h gate and
+        the only page target was about:blank), but a test that depends on the
+        machine's state for its safety is not safe.
+        """
+        saved_url, saved_docker = sr.CDP_URL, sr.docker
+        self.addCleanup(lambda: setattr(sr, "CDP_URL", saved_url))
+        self.addCleanup(lambda: setattr(sr, "docker", saved_docker))
+        sr.CDP_URL = self.cdp.url          # the fixture server, serving no targets
+        sr.docker = lambda *a, **k: None   # reads as "docker unavailable"
+
+    def test_a_session_that_starts_while_planning_saves_its_dev_server(self) -> None:
+        """The plan->kill gap is the wide window, so the lock set is re-read.
+
+        Simulated by writing the lock only after plan_dev_servers has returned,
+        which is exactly what a session starting mid-pass looks like."""
+        self.isolate_in_process()
+        wt = self.wt
+        procs = {
+            1: proc(0, "/sbin/launchd"),
+            300: proc(1, f"node {wt}/node_modules/.bin/vite dev --port 5198"),
+        }
+        planned = []
+
+        def plan_then_lock(cwd: str, cd: str):
+            result = ([{"pid": 300, "age_s": 72000.0, "rss_kb": 70000,
+                        "command": "node vite dev", "worktree": str(wt)}], [])
+            self.add_lock(wt)  # a session arrives after the plan
+            planned.append(True)
+            return result
+
+        saved_plan, saved_kill = sr.plan_dev_servers, sr.kill_pid
+        killed: list[int] = []
+        sr.plan_dev_servers = plan_then_lock
+        sr.kill_pid = lambda pid: killed.append(pid) or True
+        sr.snapshot_processes = lambda: procs
+        try:
+            sr.cmd_reap({"cwd": str(self.root)})
+        finally:
+            sr.plan_dev_servers, sr.kill_pid = saved_plan, saved_kill
+        self.assertTrue(planned)
+        self.assertEqual(killed, [])
+        self.assertIn(
+            "reason=session_started_while_planning",
+            self.log.read_text(encoding="utf-8"),
+        )
+
+    def test_a_failing_action_is_logged_and_never_fails_the_hook(self) -> None:
+        self.isolate_in_process()
+        saved = sr.plan_dev_servers
+
+        def boom(cwd: str, cd: str):
+            raise RuntimeError("synthetic")
+
+        sr.plan_dev_servers = boom
+        try:
+            sr.cmd_reap({"cwd": str(self.root)})
+        finally:
+            sr.plan_dev_servers = saved
+        text = self.log.read_text(encoding="utf-8")
+        self.assertIn("dev action failed: RuntimeError: synthetic", text)
+        self.assertIn("dev_servers=0", text)  # the summary line still lands
+
     def test_an_open_stdin_that_never_closes_does_not_hang_the_hook(self) -> None:
         """The 56087f7 hang, from the other side: the reaper reads its payload
         from stdin, and an inherited pipe nobody closes must time out rather

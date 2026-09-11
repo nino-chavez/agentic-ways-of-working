@@ -799,7 +799,6 @@ def plan_tabs() -> tuple[list[dict], list[dict]]:
             keep.append(row)
             continue
         row["port"] = port
-        from urllib.parse import urlsplit
         host = (urlsplit(url).hostname or "127.0.0.1").lower()
         if port not in port_state:
             # Cached per pass: the measured case had 52 tabs on one dead port.
@@ -1033,8 +1032,19 @@ def cmd_reap(payload: dict, now: bool = False) -> None:
     """Hook reap, or — with `now` — the hand-run, unthrottled, unbudgeted one.
 
     `now` drops the throttle and the deadline and NOTHING else: every gate in
-    every plan_* function still applies, and the eligibility of each item is
-    re-read immediately before acting on it.
+    every plan_* function still applies.
+
+    The session-lock set is re-read once between planning and killing, because
+    that gap is the wide one — a session can start in a worktree while the
+    plan phase is walking the rest of the repo, and it would lose its dev
+    server. worktree-reaper.py does the same for the same reason. Tabs and
+    stacks get no second read: a dead port and a 24-hour-idle container do not
+    become live inside a few hundred milliseconds, and a second `docker ps`
+    would cost more budget than it protects.
+
+    Every action is wrapped, so a failure in one cannot take the hook down
+    with a traceback or stop the other two. A hook that exits non-zero is a
+    visible error in the harness for something the operator did not ask for.
     """
     global _DEADLINE_ON
     if os.environ.get("SESSION_REAPER_OFF") == "1":
@@ -1053,11 +1063,28 @@ def cmd_reap(payload: dict, now: bool = False) -> None:
     truncated = False
 
     if "dev" in actions and not past_deadline():
-        kill, _keep = plan_dev_servers(cwd, cd)
+        try:
+            kill, _keep = plan_dev_servers(cwd, cd)
+        except Exception as exc:
+            kill = []
+            log(f"repo={cwd} dev action failed: {exc.__class__.__name__}: {exc}")
+        # Re-read the lock set: the plan phase is the wide window, and a session
+        # that started in one of these worktrees while it ran would otherwise
+        # lose its dev server. Unreadable now means nothing is eligible.
+        live_now, live_ok_now = live_session_dirs(cd)
+        if kill and not live_ok_now:
+            log(f"repo={cwd} session locks became unreadable before killing; skipping")
+            kill = []
         for row in kill:
             if past_deadline():
                 truncated = True
                 break
+            if any(under(d, row["worktree"]) for d in live_now):
+                log(
+                    f"skip pid={row['pid']} reason=session_started_while_planning "
+                    f"worktree={row['worktree']}"
+                )
+                continue
             if kill_pid(row["pid"]):
                 n_dev += 1
                 dev_kb += row["rss_kb"]
@@ -1070,7 +1097,11 @@ def cmd_reap(payload: dict, now: bool = False) -> None:
                 log(f"kill_failed pid={row['pid']} cmd={row['command']}")
 
     if "tabs" in actions and not past_deadline():
-        close, _keep = plan_tabs()
+        try:
+            close, _keep = plan_tabs()
+        except Exception as exc:
+            close = []
+            log(f"repo={cwd} tabs action failed: {exc.__class__.__name__}: {exc}")
         for row in close:
             if past_deadline():
                 truncated = True
@@ -1085,7 +1116,11 @@ def cmd_reap(payload: dict, now: bool = False) -> None:
                 log(f"close_tab_failed port={row['port']} url={row['url']}")
 
     if "stacks" in actions and not past_deadline():
-        stop, _keep = plan_stacks(cwd, cd)
+        try:
+            stop, _keep = plan_stacks(cwd, cd)
+        except Exception as exc:
+            stop = []
+            log(f"repo={cwd} stacks action failed: {exc.__class__.__name__}: {exc}")
         for row in stop:
             # Not clipped, so it runs only with its whole cap in hand. Being cut
             # short here is benign — some containers stay up and the next pass
