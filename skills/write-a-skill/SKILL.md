@@ -115,3 +115,4 @@ After drafting, verify:
 - [ ] Consistent terminology
 - [ ] Concrete examples included
 - [ ] References one level deep
+- [ ] Every referenced file exists, and every pointer to another skill says what that skill actually contains — open the target and check, don't describe it from its name
