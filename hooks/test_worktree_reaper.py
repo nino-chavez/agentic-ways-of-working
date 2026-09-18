@@ -7,6 +7,7 @@ from __future__ import annotations
 import faulthandler
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -412,3 +413,75 @@ class StdinPayloadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DerivedDataByContents(unittest.TestCase):
+    """The name of an Xcode build cache is whatever the session chose; the
+    contents are not. Regression for minder 2026-09-18, where the literal
+    `.artifacts/derived-data` entry matched none of the 16 real caches on disk
+    and the reaper reported "artifact dirs to delete (0)" against 17.23 GB."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("worktree_reaper", SCRIPT)
+        cls.reaper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.reaper)
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / "wt"
+        self.artifacts = self.root / ".artifacts"
+        self.artifacts.mkdir(parents=True)
+
+    def _make(self, name: str, children: tuple[str, ...]) -> None:
+        for child in children:
+            (self.artifacts / name / child).mkdir(parents=True, exist_ok=True)
+
+    def test_catches_caches_under_any_name(self) -> None:
+        # Every name here was on disk in minder, and the literal entry missed
+        # all of them.
+        for name in (
+            "DerivedData",
+            "deriveddata-central-mount",
+            "DerivedData-preferences-final-r2",
+            "nitpick-remediation-derived",
+            "remediation-physical-build",
+            "nitpick-device",
+            "app-store-build35-derived",
+        ):
+            with self.subTest(name=name):
+                for stale in self.artifacts.iterdir():
+                    shutil.rmtree(stale)
+                self._make(name, ("Build", "ModuleCache.noindex"))
+                self.assertEqual(
+                    self.reaper.derived_data_children(str(self.root)),
+                    (f".artifacts/{name}",),
+                )
+
+    def test_spares_evidence_including_build_named_captures(self) -> None:
+        # All observed in minder, all kept. The captures dirs carry "build" in
+        # the name, so a substring rule would have destroyed device evidence,
+        # and the .xcarchive holds the only dSYMs for a shipped build.
+        self._make("nitpick-copy-build25-verified-captures", ("frames",))
+        self._make("remediation-unit.xcresult", ("Data",))
+        self._make("Minder-1.0-build37.xcarchive", ("dSYMs", "Products"))
+        self._make("build-results", ("reports",))
+        self._make("remediation-phone-backup", ("AppGroup", "Documents", "Library"))
+        self.assertEqual(self.reaper.derived_data_children(str(self.root)), ())
+
+    def test_build_alone_is_not_a_cache(self) -> None:
+        self._make("some-output", ("Build",))
+        self.assertEqual(self.reaper.derived_data_children(str(self.root)), ())
+
+    def test_parent_artifacts_is_never_returned(self) -> None:
+        self._make("DerivedData", ("Build", "SDKStatCaches.noindex"))
+        for got in self.reaper.derived_data_children(str(self.root)):
+            self.assertNotEqual(got, ".artifacts")
+            self.assertTrue(got.startswith(".artifacts/"))
+
+    def test_missing_artifacts_dir_is_empty_not_an_error(self) -> None:
+        shutil.rmtree(self.artifacts)
+        self.assertEqual(self.reaper.derived_data_children(str(self.root)), ())

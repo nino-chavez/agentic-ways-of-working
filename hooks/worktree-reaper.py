@@ -196,6 +196,30 @@ ARTIFACT_DIRS = (
     ".artifacts/derived-data",
     ".artifacts/test-results",   # xcresult bundles, 6.3 GB in the same measurement
 )
+
+# Xcode DerivedData is identified by CONTENTS, not by name, because the name is
+# whatever the session that ran the build chose. Measured in minder 2026-09-18:
+# `.artifacts/derived-data` (added 2026-09-07 for this exact repo) matched none
+# of the 16 build caches actually on disk — they were named DerivedData,
+# deriveddata-central-mount, DerivedData-preferences-final-r2,
+# nitpick-remediation-derived, remediation-physical-build, nitpick-device,
+# app-store-build35-derived. The reaper reported "artifact dirs to delete (0)"
+# against 17.23 GB. A name list cannot win this: the next wave invents a new one.
+#
+# The contents do not vary. Xcode writes Build/ beside its own caches, and
+# nothing else under .artifacts/ does. Verified against the 176 sibling dirs that
+# survived that cleanup — 107 .xcresult bundles, 20 capture dirs, 3 .xcarchive
+# (which hold the only dSYMs for shipped builds), 15 build-results, and an app
+# container pulled off a physical phone: zero matched. Note that several of those
+# carry "build" in the name (nitpick-copy-build25-verified-captures), which is
+# why a substring rule is not safe here either.
+ARTIFACT_PARENT = ".artifacts"
+DERIVED_CACHE_MARKERS = frozenset((
+    "ModuleCache.noindex",
+    "SDKStatCaches.noindex",
+    "CompilationCache.noindex",
+    "Index.noindex",
+))
 # Deliberately NOT here: __pycache__. It appears at every depth, and this reaper
 # only inspects the listed paths under the worktree root, so listing it would
 # imply coverage it lacks.
@@ -500,6 +524,37 @@ def recently_touched(path: str, hours: float, prune: tuple[str, ...] = ()) -> bo
     return bool(r.stdout.strip())
 
 
+def derived_data_children(wt: str) -> tuple[str, ...]:
+    """Worktree-relative names of `.artifacts/*` children that ARE DerivedData.
+
+    Returns names in the same shape as an ARTIFACT_DIRS entry, so the caller runs
+    them through the identical gates: git-ignored, deep-idle, not the main
+    checkout, not a live-session worktree. This only DISCOVERS candidates; it
+    grants no exemption. The parent `.artifacts/` is never itself a candidate,
+    so captures and receipts beside a build cache survive.
+
+    Unreadable means not a candidate: an OSError here skips the directory rather
+    than guessing, matching this file's rule that uncertainty never deletes.
+    """
+    parent = os.path.join(wt, ARTIFACT_PARENT)
+    try:
+        kids = sorted(os.listdir(parent))
+    except OSError:
+        return ()
+    found = []
+    for name in kids:
+        child = os.path.join(parent, name)
+        if not os.path.isdir(child):
+            continue
+        try:
+            inner = set(os.listdir(child))
+        except OSError:
+            continue
+        if "Build" in inner and inner & DERIVED_CACHE_MARKERS:
+            found.append(f"{ARTIFACT_PARENT}/{name}")
+    return tuple(found)
+
+
 def is_ignored(wt: str, name: str) -> bool:
     """True only if git itself considers this path ignored."""
     return git_ok(["check-ignore", "-q", name], wt, timeout=5)
@@ -690,7 +745,7 @@ def plan(
         # Idleness is measured on the artifact dir ITSELF, deeply. The worktree
         # root's mtime does not move when a build writes into target/**, so the
         # previous root-level gate would have deleted a target/ mid-build.
-        for name in ARTIFACT_DIRS:
+        for name in ARTIFACT_DIRS + derived_data_children(path):
             target = os.path.join(path, name)
             if not os.path.isdir(target):
                 continue
