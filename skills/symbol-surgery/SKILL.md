@@ -87,3 +87,4 @@ The language server must be configured for the file type, or the operation error
 - **`deepen`** — decides which modules should be reshaped (depth/leverage). Hand its chosen refactor to this skill to execute.
 - **`simplify`** — code-quality cleanups on a diff. This skill is how those cleanups land safely when they cross call sites.
 - **`diagnose`** — when the refactor is in service of a bug, diagnose first, then operate.
+- **`blast-radius`** — what breaks where references stop: wire formats, data at rest, library internals, consumers outside the repo. Run it when the reference list looks clean and the change still feels risky.

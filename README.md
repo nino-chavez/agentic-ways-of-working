@@ -110,6 +110,7 @@ The craft skills are self-contained — drop them in and they work:
 | `campsite` (command + hook) | Toggle "leave it better than you found it": no shims, fix-as-discovered, touched files end clean |
 | `deepen` | Find architectural deepening opportunities (Ousterhout's depth/seam vocabulary, the deletion test) |
 | `symbol-surgery` | Symbol-first refactoring on the native LSP tool: locate by symbol, check blast radius, edit at boundaries, verify references (executes what `deepen` decides) |
+| `blast-radius` | What a change breaks outside its own diff: find the one fact its safety rests on, prove it by running real code, label the rest unproven (starts where `symbol-surgery`'s reference list ends) |
 | `diagnose` | Disciplined hard-bug loop: reproduce → minimise → hypothesise → instrument → fix → regression-test |
 | `grill-with-docs` | Stress-test a plan against your domain model and documented decisions |
 | `evidence-audit` | Adversarial provenance audit of a draft before it ships: re-derive load-bearing claims at their sources, downgrade what fails |
@@ -146,6 +147,7 @@ The flag lives at `<project>/.claude/campsite-mode`, so each repo opts in indepe
 "ship it"                                         → ship      (reads the project's DEPLOY.md, executes)
 "stress-test this plan against our domain model"  → grill-with-docs
 "is this actually verified?"                       → evidence-audit  (claims re-derived at source, labels downgraded)
+"what could this break?"                           → blast-radius    (one safety fact, proven by a script or marked unproven)
 ```
 
 Point Codex at `adapters/AGENTS.md` or Gemini at `adapters/GEMINI.md` and the decision-bias, canonical-first, and worktree rules travel unchanged.
