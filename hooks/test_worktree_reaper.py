@@ -411,10 +411,6 @@ class StdinPayloadTests(unittest.TestCase):
     def test_closeout_gives_up_on_an_stdin_that_never_closes(self) -> None:
         self.assertLess(self.elapsed_with_stdin_held_open("closeout"), 30)
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class DerivedDataByContents(unittest.TestCase):
     """The name of an Xcode build cache is whatever the session chose; the
     contents are not. Regression for minder 2026-09-18, where the literal
@@ -482,6 +478,23 @@ class DerivedDataByContents(unittest.TestCase):
             self.assertNotEqual(got, ".artifacts")
             self.assertTrue(got.startswith(".artifacts/"))
 
+    def test_literal_entry_and_contents_test_yield_one_target(self) -> None:
+        """A cache named exactly `.artifacts/derived-data` matches the literal
+        ARTIFACT_DIRS entry AND the contents test. Counting it twice inflated
+        the report's reclaimable total (caught in review of 9f92e0d)."""
+        self._make("derived-data", ("Build", "ModuleCache.noindex"))
+        combined = dict.fromkeys(
+            self.reaper.ARTIFACT_DIRS
+            + self.reaper.derived_data_children(str(self.root))
+        )
+        self.assertEqual(
+            sum(1 for name in combined if name == ".artifacts/derived-data"), 1
+        )
+
     def test_missing_artifacts_dir_is_empty_not_an_error(self) -> None:
         shutil.rmtree(self.artifacts)
         self.assertEqual(self.reaper.derived_data_children(str(self.root)), ())
+
+
+if __name__ == "__main__":
+    unittest.main()

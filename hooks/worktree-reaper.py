@@ -745,7 +745,13 @@ def plan(
         # Idleness is measured on the artifact dir ITSELF, deeply. The worktree
         # root's mtime does not move when a build writes into target/**, so the
         # previous root-level gate would have deleted a target/ mid-build.
-        for name in ARTIFACT_DIRS + derived_data_children(path):
+        # dict.fromkeys dedupes while preserving order: a cache literally
+        # named `.artifacts/derived-data` matches the ARTIFACT_DIRS entry AND
+        # the contents test, and counting it twice would inflate the report's
+        # reclaimable total. The reap path tolerated the duplicate (the second
+        # pass finds it already gone), but the log is the only record this hook
+        # leaves, so a wrong number there is the worse failure.
+        for name in dict.fromkeys(ARTIFACT_DIRS + derived_data_children(path)):
             target = os.path.join(path, name)
             if not os.path.isdir(target):
                 continue
