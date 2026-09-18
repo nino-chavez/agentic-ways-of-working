@@ -21,7 +21,7 @@ A blast-radius writeup reads as convincing whether or not it is true. That is au
 | 4 | You ran it: a script or test that calls the real code and fails loudly if you are wrong | Evidence |
 | 5 | You reproduced it in the running app, in the environment that actually runs it | Proof |
 
-A safety fact that stops above rung 4 is reported as **unproven**, never as settled. Rung 4 is usually one small script that imports the same library version the app ships and calls the exact function in question. Do not hand the human a check you could have run.
+A safety fact that did not reach rung 4 is reported as **unproven**, never as settled. Rung 4 is usually one small script that imports the same library version the app ships and calls the exact function in question. Do not hand the human a check you could have run.
 
 ## Process
 
@@ -56,6 +56,8 @@ Give each risk a real likelihood and a real cost. Keep the ones you confirmed. L
 
 Write the script or test that runs the real code, run it, and paste what happened: the command, the output, the exit code. If it cannot be proven cheaply, mark it unproven and name what proving it would take. If the proof is a test and it is cheap to keep, it is the regression test; say where it should live.
 
+The proof must not mutate shared or production state. Run it against a scratch copy, a fixture, a local instance, or a read-only path. If the only way to reach rung 5 is to run an evicting, writing, or deleting call against something live, stop at rung 4, report "unproven at rung 5", and name what the run would take.
+
 Prove it where it runs. A fact proven on a laptop about code that runs in CI, on a Worker, or on a device is rung 4, not rung 5.
 
 ### 6. For a wide change, get a second family's read
@@ -76,9 +78,9 @@ This is diagnosis. Do not fix what you find unless asked; a risk list that arriv
 
 - **`symbol-surgery`** — owns semantic references inside the codebase. Run its blast-radius step first when a language server is available; start here where its reference list ends.
 - **`diagnose`** — for a break that has already happened. This skill is for the break that has not.
-- **`evidence-audit`** — the same ladder applied to claims in a document instead of facts about a diff.
+- **`evidence-audit`** — the same self-attestation rule applied to claims in a document. It has no ladder; its outcomes are confirmed, contradicted, or downgraded.
 - **`/code-review`** — correctness of the diff itself. This skill is about everything the diff touches without naming.
 
 ## Provenance
 
-Adapted from the `blast-radius` skill in Lauren Tan's pstack (`github.com/cursor/plugins`, MIT, read at `e31650e`, 2026-09-16): the five-rung ladder, the single safety fact, and the cleared-versus-confirmed split are hers. The boundary checklist, the environment rule, the unproven label, and the diagnosis-only stop are local.
+Adapted from the `blast-radius` skill in Lauren Tan's pstack (`github.com/cursor/plugins`, MIT, read at `e31650e`, 2026-09-16): the five-rung ladder, the single safety fact, and the cleared-versus-confirmed split are hers. The boundary checklist, the environment rule, the unproven label, the no-mutation rule, and the diagnosis-only stop are local. pstack is Copyright (c) 2026 Lauren Tan, used under the MIT License; the full notice is in `LICENSE-pstack` beside this file.
