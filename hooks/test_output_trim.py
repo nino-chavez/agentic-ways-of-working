@@ -92,7 +92,8 @@ class OutputTrim(unittest.TestCase):
         self.assertEqual(Path(self.dir, "spill", "toolu_test1.txt").read_text(), original)
 
     def test_spill_is_private_and_pruned_by_age(self):
-        d = Path(self.dir, "spill"); d.mkdir()
+        d = Path(self.dir, "spill"); d.mkdir(mode=0o755)
+        (d / "toolu_test1.txt").write_text("stale"); (d / "toolu_test1.txt").chmod(0o644)
         old, fresh = d / "old.txt", d / "fresh.txt"
         old.write_text("x"); fresh.write_text("x")
         os.utime(old, (0, 0))
@@ -100,6 +101,15 @@ class OutputTrim(unittest.TestCase):
         self.assertFalse(old.exists())
         self.assertTrue(fresh.exists())
         self.assertEqual((d / "toolu_test1.txt").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(d.stat().st_mode & 0o777, 0o700)
+
+    def test_few_long_lines_leave_no_orphan_spill(self):
+        one_line = "{" + "x" * 20000 + "}"
+        self.assertEqual(run(bash(one_line), self.dir), (0, None))
+        _, out = run(bash("\x1b[1m" + one_line + "\x1b[0m"), self.dir)
+        got = out["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+        self.assertEqual(got, one_line)
+        self.assertFalse(Path(self.dir, "spill").exists())
 
     def test_not_smaller_means_no_rewrite(self):
         text = "\n".join(f"unique {i}" for i in range(150))

@@ -107,12 +107,14 @@ def collapse(text: str) -> str:
 def spill(original: str, tool_use_id: str) -> str | None:
     try:
         d = STATE_DIR / "spill"
-        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        d.mkdir(parents=True, exist_ok=True)
+        os.chmod(d, 0o700)  # mkdir's mode is ignored when the dir exists
         name = re.sub(r"[^A-Za-z0-9_-]", "", tool_use_id or "")[:64] or str(os.getpid())
         path = d / f"{name}.txt"
         # 0600: raw stdout is where a token lands when a command prints one.
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
+            os.fchmod(fd, 0o600)  # O_CREAT's mode is ignored for an existing file
             f.write(original)
     except OSError:
         return None
@@ -132,9 +134,12 @@ def spill(original: str, tool_use_id: str) -> str | None:
     return str(path)
 
 
-def elide(text: str, original: str, tool_use_id: str, persisted: str = "") -> str:
+def elide(stripped: str, original: str, tool_use_id: str, persisted: str = "") -> str:
+    text = collapse(stripped)
     lines = text.split("\n")
     if len(lines) <= HEAD_LINES + TAIL_LINES:
+        if text == stripped:
+            return stripped  # few long lines, nothing collapsed: no spill, no marker
         # Few, long lines: collapsing was the only loss, but it still was one.
         path = persisted or spill(original, tool_use_id)
         return text + "\n[output-trim: blank/repeated lines collapsed" + (
@@ -163,7 +168,7 @@ def transform(stdout: str, tool_use_id: str = "", persisted: str = "") -> str | 
         return None
     out = ANSI_RE.sub("", stdout)
     if len(out) > MAX_CHARS:
-        out = elide(collapse(out), stdout, tool_use_id, persisted)
+        out = elide(out, stdout, tool_use_id, persisted)
     return out if len(out) < len(stdout) else None
 
 
