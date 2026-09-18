@@ -10,13 +10,16 @@ way read-guard's does.
 
 Wired to PostToolUse (matcher "Bash"). Two tiers, stdout only:
 
-  scrub — output over 1k chars: strip ANSI escapes, collapse blank-line runs,
-          collapse 4+ identical consecutive lines to one + "[repeated Nx]".
-          Lossless.
-  elide — output over MAX_CHARS: keep the first HEAD_LINES and last
-          TAIL_LINES, rescue error-looking lines from the cut, and write the
-          original to a spill file named in the marker so the middle can be
-          grepped back instead of re-running the command. Over ~30k chars
+  strip — output over 1k chars: remove ANSI escapes. Nothing else. Bash
+          output feeds edits as often as Read does (`cat`, `sed -n`, `git
+          show`, `git diff`), so below MAX_CHARS every line and every blank
+          line survives exactly.
+  elide — output over MAX_CHARS: collapse blank-line runs and 4+ identical
+          lines, keep the first HEAD_LINES and last TAIL_LINES, rescue
+          error-looking lines from the cut, and write the original to a spill
+          file named in the marker so it can be grepped back instead of
+          re-running the command. Anything lossy happens only here, where the
+          original is always recoverable. Over ~30k chars
           Claude Code has already capped stdout and saved the full text
           (persistedOutputPath); the marker names that file instead.
 
@@ -45,6 +48,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 SCRUB_MIN_CHARS = 1000
@@ -53,7 +57,7 @@ HEAD_LINES = 60
 TAIL_LINES = 40
 MAX_SALVAGED = 12
 MAX_SALVAGE_LINE = 300
-SPILL_KEEP = 40
+SPILL_MAX_AGE_H = 24
 
 STATE_DIR = Path(os.environ.get("OUTPUT_TRIM_STATE_DIR")
                  or Path.home() / ".claude" / "cache" / "output-trim")
@@ -67,7 +71,7 @@ SALVAGE_RE = re.compile(
     r"undefined reference|cannot find)\b", re.I)
 
 
-def scrub(text: str) -> str:
+def collapse(text: str) -> str:
     out: list[str] = []
     blank = False
     prev, run = None, 0
@@ -81,7 +85,7 @@ def scrub(text: str) -> str:
         else:
             out.extend([prev] * (run - 1))
 
-    for line in ANSI_RE.sub("", text).split("\n"):
+    for line in text.split("\n"):
         if not line.strip():
             if prev is not None:
                 flush()
@@ -103,22 +107,38 @@ def scrub(text: str) -> str:
 def spill(original: str, tool_use_id: str) -> str | None:
     try:
         d = STATE_DIR / "spill"
-        d.mkdir(parents=True, exist_ok=True)
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
         name = re.sub(r"[^A-Za-z0-9_-]", "", tool_use_id or "")[:64] or str(os.getpid())
         path = d / f"{name}.txt"
-        path.write_text(original)
-        old = sorted(d.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
-        for p in old[SPILL_KEEP:]:
-            p.unlink(missing_ok=True)
-        return str(path)
+        # 0600: raw stdout is where a token lands when a command prints one.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(original)
     except OSError:
         return None
+    # Prune by age, not count: one budget is shared by every session on the
+    # machine, and a count lets parallel sessions delete a file a live marker
+    # still names. Its own try, so a prune race cannot discard a good path.
+    try:
+        cutoff = time.time() - SPILL_MAX_AGE_H * 3600
+        for p in d.glob("*.txt"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return str(path)
 
 
 def elide(text: str, original: str, tool_use_id: str, persisted: str = "") -> str:
     lines = text.split("\n")
     if len(lines) <= HEAD_LINES + TAIL_LINES:
-        return text
+        # Few, long lines: collapsing was the only loss, but it still was one.
+        path = persisted or spill(original, tool_use_id)
+        return text + "\n[output-trim: blank/repeated lines collapsed" + (
+            f"; full output: {path}" if path else "") + "]"
     middle = lines[HEAD_LINES:-TAIL_LINES]
     salvaged = [ln[:MAX_SALVAGE_LINE] for ln in middle if SALVAGE_RE.search(ln)]
     extra = len(salvaged) - MAX_SALVAGED
@@ -141,9 +161,9 @@ def transform(stdout: str, tool_use_id: str = "", persisted: str = "") -> str | 
     """Trimmed stdout, or None to leave the original alone."""
     if len(stdout) <= SCRUB_MIN_CHARS:
         return None
-    out = scrub(stdout)
+    out = ANSI_RE.sub("", stdout)
     if len(out) > MAX_CHARS:
-        out = elide(out, stdout, tool_use_id, persisted)
+        out = elide(collapse(out), stdout, tool_use_id, persisted)
     return out if len(out) < len(stdout) else None
 
 

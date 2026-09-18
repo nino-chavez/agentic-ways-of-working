@@ -74,11 +74,32 @@ class OutputTrim(unittest.TestCase):
         self.assertEqual(new["persistedOutputPath"], "/tmp/full.txt")
         self.assertFalse(Path(self.dir, "spill").exists())
 
-    def test_scrub_is_lossless_below_elide_threshold(self):
-        text = "\x1b[32mgreen\x1b[0m\n" + "same\n" * 300 + "\n\n\n\nend"
-        _, out = run(bash(text), self.dir)
+    def test_below_elide_threshold_only_ansi_is_removed(self):
+        # cat/git-diff shaped output: blank runs, whitespace-only lines and
+        # repeated rows must survive byte-for-byte, or a later Edit misses.
+        body = "def a():\n    pass\n\n\ndef b():\n    pass\n \n" + "row\n" * 300
+        _, out = run(bash("\x1b[32m" + body + "\x1b[0m"), self.dir)
         got = out["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
-        self.assertEqual(got, "green\nsame\n[repeated 300x]\n\nend")
+        self.assertEqual(got, body)
+        self.assertFalse(Path(self.dir, "spill").exists())
+
+    def test_collapse_happens_only_with_a_recoverable_original(self):
+        original = "start\n" + "same\n" * 5000 + "end"
+        _, out = run(bash(original), self.dir)
+        got = out["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+        self.assertIn("[repeated 5000x]", got)
+        self.assertIn("full output: ", got)
+        self.assertEqual(Path(self.dir, "spill", "toolu_test1.txt").read_text(), original)
+
+    def test_spill_is_private_and_pruned_by_age(self):
+        d = Path(self.dir, "spill"); d.mkdir()
+        old, fresh = d / "old.txt", d / "fresh.txt"
+        old.write_text("x"); fresh.write_text("x")
+        os.utime(old, (0, 0))
+        run(bash("\n".join(f"line {i}" for i in range(5000))), self.dir)
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
+        self.assertEqual((d / "toolu_test1.txt").stat().st_mode & 0o777, 0o600)
 
     def test_not_smaller_means_no_rewrite(self):
         text = "\n".join(f"unique {i}" for i in range(150))
