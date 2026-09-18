@@ -54,6 +54,8 @@ Do not proceed to Phase 2 until you have a loop you believe in.
 
 Run the loop. Watch the bug appear.
 
+**Doctor check first.** Before trusting any run's pass or fail, confirm the target is the one you think it is: the process is up, the build is current and not a stale dev server, the port or instance is the one you started, the auth or session is valid. Run it again after any surprising result and after any failed run, before concluding a hypothesis was wrong. A stale build looks identical to a fixed bug, and a wrong instance looks identical to a bug that will not reproduce.
+
 Confirm:
 
 - [ ] The loop produces the failure mode the **user** described — not a different failure that happens to be nearby. Wrong bug = wrong fix.
@@ -73,6 +75,10 @@ Each hypothesis must be **falsifiable**: state the prediction it makes.
 If you cannot state the prediction, the hypothesis is a vibe — discard or sharpen it.
 
 **Show the ranked list to the user before testing.** They often have domain knowledge that re-ranks instantly ("we just deployed a change to #3"), or know hypotheses they've already ruled out. Cheap checkpoint, big time saver. Don't block on it — proceed with your ranking if the user is AFK.
+
+### When two fixes under one assumption fail
+
+If two hypothesis-driven fixes that share a premise both fail the same check, do not write a third under that premise. Write the premise down as the one sentence every failed fix assumed, then test the premise itself: build a small rerunnable script that counts the failure by whatever might carry it — actor, instance, input, path. If the same few hold the failure on every run, something assigns them that role; that assignment is the next root cause, not another point fix.
 
 ### When to delegate to a specialist
 

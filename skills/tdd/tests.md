@@ -44,6 +44,13 @@ Red flags:
 - Test name describes HOW not WHAT
 - Verifying through external means instead of interface
 
+**The litmus test.** Before keeping a test, ask: would it still pass if every function it imports returned `undefined`? If yes, it observes no behavior and cannot fail for a defect. Rewrite the assertion or delete the test. Two shapes that pass this way and slip past the red flags above:
+
+- **Self-referential** — `expect(f(a)).toBe(f(a))`, or an expected value computed by the code under test. Assert against a literal.
+- **Constant pin** — `expect(LIMITS.max).toBe(8)`. It restates a hand-maintained constant instead of exercising the behavior the constant controls.
+
+(Litmus test from pstack's `principle-test-behavior-not-implementation`, MIT.)
+
 ```typescript
 // BAD: Bypasses interface to verify
 test("createUser saves to database", async () => {
