@@ -9,6 +9,8 @@ Adversarial audit pass for outbound deliverables. The rule being enforced (worki
 
 ## Procedure
 
+Honor the request's scope throughout this pass. For an audit-only request, report the exact problem, its consequence, and the smallest remedy; do not rewrite the artifact. Apply corrections when the existing task authorizes editing, without asking again for authorization already given.
+
 1. **Extract the load-bearing claims.** Scan the draft for: prices/fees, ratings and review counts, statistics ("1 in 3...", "N% of..."), superlatives tied to numbers, and every instance of "verified / confirmed / checked directly / pulled directly." Load-bearing = a claim whose failure would change the recommendation or embarrass the sender. List them with locations.
 
 2. **Trace each to its actual provenance — from the session transcript, not from memory.** For each claim, answer: was the source page fetched in-session (WebFetch/browse-tool), or did this number arrive in a search-result summary? Who owns the domain it came from? Vendor self-comparisons and competitor "analyses" are marketing, not evidence — a competitor's stat about its rival is the same failure as the vendor's stat about itself.
@@ -22,7 +24,7 @@ Adversarial audit pass for outbound deliverables. The rule being enforced (worki
 
 5. **Hunt the cost/claim gaps.** What does the draft imply is free, complete, or settled that isn't priced or checked? (Origin case: a "$0 to start" claim while the plan's only real recurring cost — video hosting — went unpriced.)
 
-6. **Report corrections, then apply them.** Lead with what changed and why; keep the deliverable's conclusions only if they survive on the downgraded evidence.
+6. **Report findings and authorized corrections.** Lead with what the evidence changes and why. In an authorized editing task, apply the corrections and retain conclusions only if the evidence still supports them. In an audit-only task, identify the required corrections and any conclusions that no longer hold.
 
 ## Notes
 
