@@ -114,6 +114,7 @@ The craft skills are self-contained — drop them in and they work:
 | `diagnose` | Disciplined hard-bug loop: reproduce → minimise → hypothesise → instrument → fix → regression-test |
 | `grill-with-docs` | Stress-test a plan against your domain model and documented decisions |
 | `evidence-audit` | Adversarial provenance audit of a draft before it ships: re-derive load-bearing claims at their sources, downgrade what fails |
+| `dispatch-wave` | Decide whether ≥2 artifacts should go to parallel agents, then brief them: five pre-flight checks, eight mandatory brief fields including cleanup, and a post-flight review that checks scope against the remote, not the report |
 | `tdd` | Red-green-refactor with deep-module and mocking guidance |
 | `triage` | Move issues through a state machine driven by triage roles |
 | `ship` | Deterministic deploy: reads a per-project `DEPLOY.md` as source of truth |
