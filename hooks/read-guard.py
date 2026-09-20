@@ -63,9 +63,12 @@ EXEMPT_EXTS = {".pdf"}       # Read uses a pages param; range varies per call
 
 def read_payload() -> dict:
     try:
-        return json.load(sys.stdin)
+        payload = json.load(sys.stdin)
     except Exception:
         return {}
+    # Valid JSON that isn't an object (null, [], "str", 123) parses fine and
+    # then blows up on .get() — fail open on shape too, not just on syntax.
+    return payload if isinstance(payload, dict) else {}
 
 
 def allow() -> None:
@@ -92,9 +95,10 @@ def state_path(session_id: str) -> Path:
 
 def load_state(session_id: str) -> dict:
     try:
-        return json.loads(state_path(session_id).read_text(encoding="utf-8"))
+        state = json.loads(state_path(session_id).read_text(encoding="utf-8"))
     except Exception:
         return {}
+    return state if isinstance(state, dict) else {}
 
 
 def save_state(session_id: str, state: dict) -> None:
@@ -213,7 +217,9 @@ def cmd_check(payload: dict) -> None:
     if OVERRIDE_FILE.exists():
         allow()
 
-    tool_input = payload.get("tool_input") or {}
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        tool_input = {}  # `or {}` alone lets a truthy non-dict through to .get()
     path = tool_input.get("file_path")
     if not isinstance(path, str) or not path:
         allow()
@@ -237,7 +243,9 @@ def cmd_check(payload: dict) -> None:
 
     session_id = payload.get("session_id") or "unknown"
     state = load_state(session_id)
-    entry = state.get(path) or {}
+    entry = state.get(path)
+    if not isinstance(entry, dict):
+        entry = {}
     now = time.time()
 
     # Pending-retry escape (both branches): the immediately-prior attempt on this
