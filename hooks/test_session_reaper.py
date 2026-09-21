@@ -12,7 +12,7 @@ Three shapes, matching the two sibling suites:
     PATH and a real loopback HTTP server standing in for CDP, so the throttle,
     off switch, and stdin bound are covered end to end.
 
-Nothing here touches port 9339, the shared browse-tool profile, docker, or any
+Nothing here touches the real agent browser's port, the shared browse-tool profile, docker, or any
 process this suite did not itself spawn.
 
 EVERY subprocess.run gets BOTH `stdin=` and `timeout=`. Not decoration: the
@@ -676,6 +676,37 @@ class TabPlanTests(unittest.TestCase):
         self.assertEqual(keep[0]["reason"], "cdp_not_answering")
 
 
+class SharedBrowserPortTests(unittest.TestCase):
+    """The browser's port is read from browse-tool's state files, never recalled.
+
+    2026-09-21: the constant said 9339, the browser was on 9222, and the tab
+    action skipped as cdp_not_answering with nothing to flag it.
+    """
+
+    def _state(self, d: str, port: int, profile: str, started: int) -> None:
+        with open(os.path.join(d, f"browse-tool-state-{port}.json"), "w", encoding="utf-8") as fh:
+            json.dump({"pid": 1, "port": port, "profileName": profile, "started": started}, fh)
+
+    def test_reads_the_shared_profiles_port(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            self._state(d, 9223, "other", 300)
+            self._state(d, 9444, "shared", 100)
+            self.assertEqual(sr.shared_browser_port(d), 9444)
+
+    def test_newest_shared_record_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            self._state(d, 9339, "shared", 100)
+            self._state(d, 9222, "shared", 200)
+            self.assertEqual(sr.shared_browser_port(d), 9222)
+
+    def test_no_record_or_a_corrupt_one_falls_back_to_browse_tools_default(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(sr.shared_browser_port(d), sr.BROWSE_DEFAULT_PORT)
+            with open(os.path.join(d, "browse-tool-state-9555.json"), "w", encoding="utf-8") as fh:
+                fh.write("{not json")
+            self.assertEqual(sr.shared_browser_port(d), sr.BROWSE_DEFAULT_PORT)
+
+
 class ActionSelectionTests(unittest.TestCase):
     def setUp(self) -> None:
         self._saved = os.environ.get("SESSION_REAPER_ACTIONS")
@@ -790,7 +821,7 @@ class CliTests(_RepoFixture):
         cmd_reap() in-process.
 
         Without this the module defaults apply — sr.CDP_URL is the REAL browser
-        on 9339 and sr.docker shells out to the REAL daemon — so an in-process
+        and sr.docker shells out to the REAL daemon — so an in-process
         reap would act on the operator's live session. The gates happened to
         hold when this was first written (every stack was under the 24h gate and
         the only page target was about:blank), but a test that depends on the

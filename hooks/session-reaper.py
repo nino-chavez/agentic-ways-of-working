@@ -12,7 +12,8 @@ catch, all of it left by sessions that had already ended:
   dev servers   Seven `vite dev` processes started from .worktrees/wave/*,
                 running 13-22 hours at 0% CPU. None of their worktrees had a
                 live session lock.
-  browser tabs  The shared browse-tool Chrome (profile `shared`, CDP 9339)
+  browser tabs  The shared browse-tool Chrome (profile `shared`; CDP port read from
+                browse-tool's state file)
                 held 211 page targets across 232 processes and 18.6 GB RSS.
                 52 pointed at a preview server on localhost:8846 that no
                 longer listened, 17 at 127.0.0.1:5230, 6 at localhost:5199.
@@ -141,8 +142,36 @@ _STARTED_AT = time.time()
 _DEADLINE_ON = True
 
 # The agent browser. Overridable so the tests can point action 2 at a local
-# http.server fixture and never touch the real 9339.
-CDP_URL = os.environ.get("SESSION_REAPER_CDP_URL", "http://127.0.0.1:9339").rstrip("/")
+# http.server fixture and never touch the real browser.
+#
+# The port is read, not remembered. browse-tool records each browser it starts in
+# $TMPDIR/browse-tool-state-<port>.json, and the shared profile runs on whatever
+# port browse-start was last given. This constant used to be 9339; on 2026-09-21
+# the browser was on 9222 and nothing listened on 9339, so action 2 reported
+# cdp_not_answering, the same answer as "no browser running", and reaped nothing.
+BROWSE_DEFAULT_PORT = 9222  # browse-tool lib/state.js DEFAULT_PORT
+BROWSE_PROFILE = "shared"
+
+
+def shared_browser_port(state_dir: str | None = None) -> int:
+    """Port of the browse-tool Chrome on the shared profile, newest record first."""
+    import glob
+    import tempfile
+    state_dir = state_dir or tempfile.gettempdir()
+    found: list[tuple[float, int]] = []
+    for f in glob.glob(os.path.join(state_dir, "browse-tool-state-*.json")):
+        try:
+            with open(f, encoding="utf-8") as fh:
+                rec = json.load(fh)
+            if rec.get("profileName") == BROWSE_PROFILE and isinstance(rec.get("port"), int):
+                found.append((float(rec.get("started") or 0), rec["port"]))
+        except Exception:
+            continue
+    return max(found)[1] if found else BROWSE_DEFAULT_PORT
+
+
+CDP_URL = (os.environ.get("SESSION_REAPER_CDP_URL")
+           or f"http://127.0.0.1:{shared_browser_port()}").rstrip("/")
 
 # Mirrors worktree-guard.py / worktree-reaper.py so all three agree on what
 # "live" means. Copied rather than imported: these files are hyphenated and so

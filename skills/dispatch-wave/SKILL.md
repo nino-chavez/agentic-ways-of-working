@@ -1,6 +1,6 @@
 ---
 name: dispatch-wave
-description: Use when about to produce ≥2 substantive artifacts whose specs are fully derived in-thread and whose file scopes don't overlap. Codifies the orchestrator workflow for parallel agent dispatch — brief construction (eight mandatory fields, cleanup included), model selection (Sonnet for execution-from-spec, Opus for judgment-bearing), inline work during wait, post-flight cross-review for inter-artifact consistency, and commit-and-push following the project's dev-push pattern. Triggers proactively at the end of any planning thread that produced ≥2 inspectable artifact briefs, OR when the user explicitly says "dispatch", "wave", "in parallel", "across agents". Skip for single-artifact work, vague briefs ("implement X"), or briefs missing a self-contained spec.
+description: Use when about to produce ≥2 substantive artifacts whose specs are fully derived in-thread and whose file scopes don't overlap. Codifies the orchestrator workflow for parallel agent dispatch — brief construction (nine mandatory fields, runtime isolation and cleanup included), model selection (Sonnet for execution-from-spec, Opus for judgment-bearing), inline work during wait, post-flight cross-review for inter-artifact consistency, and commit-and-push following the project's dev-push pattern. Triggers proactively at the end of any planning thread that produced ≥2 inspectable artifact briefs, OR when the user explicitly says "dispatch", "wave", "in parallel", "across agents". Skip for single-artifact work, vague briefs ("implement X"), or briefs missing a self-contained spec.
 ---
 
 # dispatch-wave
@@ -9,7 +9,7 @@ You are the orchestrator deciding whether to dispatch parallel agents and how to
 
 ## Pre-flight — should this be a wave?
 
-Answer YES to all five. If any answer is NO, do the work inline or sequentially instead.
+Answer YES to all six. If any answer is NO, do the work inline or sequentially instead.
 
 1. **≥2 artifacts** with target file paths named in-thread.
 2. **Specs are complete**: each artifact has a clear goal, output structure, and tonal model. If specs are vague, dispatching produces shallow generic work — finish the specs first.
@@ -17,7 +17,21 @@ Answer YES to all five. If any answer is NO, do the work inline or sequentially 
 4. **Execution doesn't need synthesis the brief can't carry**: agents start cold; if an artifact needs judgment calls only the orchestrator can make, do it inline.
 5. **The brief set matches the ask, not the repo.** Decompose the ask into clauses and label each by kind: experience (what a person sees, does, and judges), capability, or process/governance. Enumerate the repo's *functional* catalog (user jobs, flows, screens) separately from its *process* catalog (decisions, evidence, gates): a well-documented repo is greppable in proportion to its process surface, which pulls briefs toward governance questions. Compare the brief set's composition with the clause split. If the ask carries a judgment about quality of experience, open the rendered artifact yourself before writing the briefs; a reviewer looks with its brief's question, not the user's. Re-run this check after any advisor call: advice about the strongest finding is advice about answer quality, not question scope. Measured 2026-09-03 (a product audit of a consumer mobile app): the ask was about three-quarters experience, four of five briefs were mechanical, the one "user fit" brief asked for tap counts, and the orchestrator never opened one of eleven device captures. One sentence of correction later, job-shaped briefs (the person's actual errand, stated the way they would say it) plus the orchestrator looking first produced a different class of finding within minutes. Those are two interventions; that session confounded them, so do not report which one worked without separating them.
 
-## Brief construction — eight mandatory fields per artifact
+6. **Runtime resources don't overlap either.** A worktree isolates code and nothing else. Before writing briefs, list what the agents will share while running and state how each is separated or why sharing is safe:
+
+   | Shared resource | Separation |
+   |---|---|
+   | Browser tab lease | A `BROWSE_SESSION` slug per agent. Subagents of one session inherit one harness session id, so by default they share one leased tab. |
+   | Cookie host | A hostname per agent, `<slug>.localhost`. Browsers scope cookies by host, not port. |
+   | Ports | One assigned per agent, written in the brief. Never "pick a free one". |
+   | Database | A test user per agent on a shared database, each touching only rows it owns; a database per agent when the work changes schema or shared rows. |
+   | Docker stack | The orchestrator starts and stops it. Agents never do. |
+   | Machine load | The concurrency cap under Dispatch mechanics, and the baseline read in post-flight step 6. |
+   | The visible window | The agent browser runs headless for the wave. The operator's screen is a shared resource too. |
+
+   A row with no answer is a NO. Measured 2026-09-21 (four native subagents, each with its own worktree and dev server): every incident that day was a resource missing from this list. All four agents held one browser tab lease, and one agent's `browse-eval` POST ran in another agent's tab against that agent's dev server and created a record there. All four servers sat on bare `localhost`, so the last agent to sign in was signed in on every port, and an agent got a 404 on its own record. Field 9 (cleanup) did not help: it is an end-of-run rule and cannot separate agents that are still running.
+
+## Brief construction — nine mandatory fields per artifact
 
 Each agent gets a self-contained brief because they have zero context from your thread. Missing fields produce drift.
 
@@ -28,7 +42,8 @@ Each agent gets a self-contained brief because they have zero context from your 
 5. **Don't-do list** — no marketing copy, no emojis, no padding, no inflation to hit length targets. Add project-specific don'ts from the repo's agent instructions (`CLAUDE.md` or `AGENTS.md`).
 6. **Voice + length constraints** — match the tonal model from READ-FIRST; give a natural-fit range, not a target.
 7. **Reporting expectations** — what the agent reports back (file path, line count, cross-refs they couldn't resolve, judgment calls). This is what makes post-flight cross-review possible.
-8. **Cleanup before reporting** — every process, tab and fixture the agent starts is the agent's to stop: dev servers and watchers it launched, browse-tool tabs it opened (close by target id over CDP, never the browser — the profile is shared and holds logins), local Supabase stacks it started, throwaway fixtures it created. The report lists what was cleaned and what was deliberately left, with why. Measured 2026-09-11 (four rounds of waves on one product repo): no brief said this, so eight side sessions and four rounds of waves left seven idle dev servers running 13–22 hours, 211 tabs in the shared agent browser holding 18.6 GB, and five local Supabase stacks (5.4 GB, three idle for four days); the combined load crossed 100 and Docker crashed mid-gate for every running wave.
+8. **Runtime isolation** — the agent's own row from the pre-flight inventory, as literal values, not as a rule to interpret: its `BROWSE_SESSION=<slug>` prefix on every browse-tool command; its hostname `<slug>.localhost` for curl, the `Origin` header and every navigation, never bare `localhost` or `127.0.0.1`; its port; its test user. One tab, reused with `browse-nav`; test data is created with curl or a same-origin fetch, not a new tab per attempt. Before any browser action that writes, confirm the tab's URL is on the agent's own host and port. Never launch a Chrome binary, and never run `browse-start` or `browse-stop`: the browser belongs to the orchestrator. Measured 2026-09-21: `<slug>.localhost` resolves to loopback, Vite accepted it, and the auth cookie stayed host-only (checked with curl), which ended the cross-signing; the `BROWSE_SESSION` prefix ended the shared lease. The same wave had 14 tabs open where 4 were needed, from stale tabs after the hostname switch plus one agent opening a tab per attempt, in a headed window the operator was looking at.
+9. **Cleanup before reporting** — every process, tab and fixture the agent starts is the agent's to stop: dev servers and watchers it launched, browse-tool tabs it opened (close by target id over CDP, never the browser — the profile is shared and holds logins), local Supabase stacks it started, throwaway fixtures it created. The report lists what was cleaned and what was deliberately left, with why. Measured 2026-09-11 (four rounds of waves on one product repo): no brief said this, so eight side sessions and four rounds of waves left seven idle dev servers running 13–22 hours, 211 tabs in the shared agent browser holding 18.6 GB, and five local Supabase stacks (5.4 GB, three idle for four days); the combined load crossed 100 and Docker crashed mid-gate for every running wave.
 
 When a brief carries proposed classifications or other judgment calls the orchestrator derived from labels, summaries, or memory rather than the source artifacts, mark the proposal as a **prior, not a spec**: instruct the agent to verify every item against the artifact's own text and license evidence-based deviation with a mandatory justifying quote. Measured 2026-08-08 (a document-classification sweep): 16 of ~70 label-derived proposals were wrong; the deviation-with-quote clause caught all sixteen, and the quotes made post-flight cross-review pre-evidenced instead of a second read.
 
@@ -45,6 +60,8 @@ When a brief carries proposed classifications or other judgment calls the orches
 3. Launch all parallel agents in **a single message** with multiple `Agent` tool calls. `run_in_background: true` for each.
 4. Use `general-purpose` subagent type unless a more specific agent fits the brief.
 5. Don't poll. You get a completion notification per agent.
+6. **Cap browser-driving agents at two at a time.** Agents that only read and write files are not counted. Every agent that drives a browser also runs a dev server and a tab in one shared Chrome, and all of them contend for one profile, one window and the machine's load. Queue the rest behind the first two. The cap is a starting point from one wave (2026-09-21: four at once produced the lease, cookie and tab incidents above), not a measured limit; raise it only with the pre-flight inventory fully answered.
+7. **Run the agent browser headless for the wave** (`browse-start --headless`, started by the orchestrator before dispatch). Every browse-tool command brings its tab to the front, so a headed Chrome with several agents on it takes the operator's keyboard focus every few seconds (2026-09-21). Local pages render the same headless. If a logged-in external site or a hand-off to the operator needs the headed browser, that work is not wave work; do it inline.
 
 ## Run inline work during the wait
 
@@ -65,7 +82,7 @@ When agents return, before commit:
 3. Spot-check **frontmatter conformance** if the project has lint rules (`type:` enum, `canonical:` field, etc.).
 4. Run any **mechanical lint** the project provides (a frontmatter lint, schema validators, whatever the repo ships).
 5. Verify each agent's **file scope against the remote, not its report** — e.g. GitHub compare from the last known base to the pushed head, confirming one commit and only the briefed files. Completion reports are self-attestation: an agent saying it stayed in scope is a claim, not evidence. The compare call is the grep.
-6. Verify each agent's **resource cleanup the same way**: `ps -ax -o pid,etime,command | grep <its worktree>` shows nothing, its port is not listening, and the shared agent browser's tab count (`curl -s http://127.0.0.1:9339/json`) has not grown. "I stopped my server" is self-attestation too. Kill what it left and say so in the integration receipt. Before dispatching the next wave, read the baseline the same way (load, `docker ps` stacks, tab count) so accumulation from earlier rounds is not mistaken for this one's.
+6. Verify each agent's **resource cleanup the same way**: `ps -ax -o pid,etime,command | grep <its worktree>` shows nothing, its port is not listening, and the shared agent browser's tab count has not grown. Read the port, do not recall it: `cat "$TMPDIR"/browse-tool-state-*.json` names the port the `shared` profile is on, then `curl -s http://127.0.0.1:<port>/json`. An earlier version of this step named 9339; on 2026-09-21 the browser was on 9222 and nothing listened on 9339, so the check as written would have read an empty answer as "no tabs". Close a stale tab by target id (`curl -s http://127.0.0.1:<port>/json/close/<id>`), never the browser. "I stopped my server" is self-attestation too. Kill what it left and say so in the integration receipt. Before dispatching the next wave, read the baseline the same way (load, `docker ps` stacks, tab count) so accumulation from earlier rounds is not mistaken for this one's.
 
 An agent that goes **idle without reporting** may simply be done: check its target's ground truth first (branch heads, pushed file contents) before re-engaging. The push is the report; the narrative is optional. 2026-08-08: two of seven agents in a manifest sweep pushed correct work and idled silently — both were cross-reviewed from source faster than a re-prompt would have returned.
 
