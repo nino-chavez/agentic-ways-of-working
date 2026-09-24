@@ -1,6 +1,6 @@
 ---
 name: dispatch-wave
-description: Use when about to produce ≥2 substantive artifacts whose specs are fully derived in-thread and whose file scopes don't overlap. Codifies the orchestrator workflow for parallel agent dispatch — brief construction (nine mandatory fields, runtime isolation and cleanup included), model selection (Sonnet for execution-from-spec, Opus for judgment-bearing), inline work during wait, post-flight cross-review for inter-artifact consistency, and commit-and-push following the project's dev-push pattern. Triggers proactively at the end of any planning thread that produced ≥2 inspectable artifact briefs, OR when the user explicitly says "dispatch", "wave", "in parallel", "across agents". Skip for single-artifact work, vague briefs ("implement X"), or briefs missing a self-contained spec.
+description: Use when about to produce ≥2 substantive artifacts whose specs are fully derived in-thread and whose file scopes don't overlap. Codifies the orchestrator workflow for parallel agent dispatch — brief construction (nine mandatory fields, runtime isolation and cleanup included), model selection through the host-owned routing policy, inline work during wait, post-flight cross-review for inter-artifact consistency, and commit-and-push following the project's dev-push pattern. Triggers proactively at the end of any planning thread that produced ≥2 inspectable artifact briefs, OR when the user explicitly says "dispatch", "wave", "in parallel", "across agents". Skip for single-artifact work, vague briefs ("implement X"), or briefs missing a self-contained spec.
 ---
 
 # dispatch-wave
@@ -49,17 +49,29 @@ When a brief carries proposed classifications or other judgment calls the orches
 
 ## Model selection
 
-- **Sonnet**: execution-from-complete-brief. Markdown rendering, code mirroring a model file, mechanical work with clear acceptance criteria.
-- **Opus**: judgment-bearing dispatch. Strategic synthesis the brief can't carry, ambiguous trade-offs, work where the brief itself needs to be iterated mid-execution.
-- Default to Sonnet. Opus is the override, not the baseline.
+Use the host's owned routing policy for task classification, model, and effort.
+Do not treat a new persistent session as the meaning of “dispatch next.” The
+parent retains coordination and judgment; the default deliverable is a bounded
+worker result. See [dispatch routing](../../docs/dispatch-routing.md).
+
+When a required dispatcher is installed, use it before any worker session is
+created. It must record classification and the selected model/effort before
+launch. A classifier or receipt failure blocks dispatch; do not fall back to
+session defaults or a raw creation tool. Native agent hooks are only as strong
+as their host's enforcement and trust behavior.
+
+Without that integration, select the cheapest adequate model explicitly and
+label the route as caller-selected, not mechanically enforced. Ordinary
+execution-from-spec and judgment-heavy work are different jobs; do not assign a
+frontier model to every artifact in a wave.
 
 ## Dispatch mechanics
 
-1. Use `TaskCreate` to make the work visible — one task per artifact, plus one for orchestrator side-work, plus one for cross-review, plus one for commit-and-push.
-2. Mark each artifact task `in_progress` with the agent ID as owner before dispatching.
-3. Launch all parallel agents in **a single message** with multiple `Agent` tool calls. `run_in_background: true` for each.
-4. Use `general-purpose` subagent type unless a more specific agent fits the brief.
-5. Don't poll. You get a completion notification per agent.
+1. Use the harness's local task bookkeeping to make the work visible — one item per artifact, plus orchestrator side-work and cross-review. `TaskCreate` in this instruction is bookkeeping, not Codex `create_thread`. Separate persistent sessions require an explicit user request.
+2. Mark each artifact task `in_progress`; record the worker ID when launch returns it.
+3. Use the required dispatcher for worker sessions where installed. Independent work can run concurrently, with one isolated worktree per writer. Do not substitute raw session creation when the dispatcher blocks.
+4. For a native subagent workflow, use the host's agent API and owned routing policy. Use a general-purpose agent unless a specific role fits. Native hooks remain a separate, host-dependent path; do not describe them as the dispatcher's enforcement.
+5. Use completion notifications when the host provides them. For CLI workers, collect the process result and routing receipt with bounded waits while continuing independent work.
 6. **Cap browser-driving agents at two at a time.** Agents that only read and write files are not counted. Every agent that drives a browser also runs a dev server and a tab in one shared Chrome, and all of them contend for one profile, one window and the machine's load. Queue the rest behind the first two. The cap is a starting point from one wave (2026-09-21: four at once produced the lease, cookie and tab incidents above), not a measured limit; raise it only with the pre-flight inventory fully answered.
 7. **Run the agent browser headless for the wave** (`browse-start --headless`, started by the orchestrator before dispatch). Every browse-tool command brings its tab to the front, so a headed Chrome with several agents on it takes the operator's keyboard focus every few seconds (2026-09-21). Local pages render the same headless. If a logged-in external site or a hand-off to the operator needs the headed browser, that work is not wave work; do it inline.
 8. **A fixed pre-push or e2e harness port is shared across every worktree of the repo**, unlike a dev-server port, so concurrent pushes from parallel agents collide on it. If the project's browser test suite binds one port with `reuseExistingServer` (rally-hq: 5174), brief the remedy up front so an agent does not re-diagnose it as its own bug: read `test-results/*/error-context.md`; a connection refused on that port or an `SQLITE_BUSY` line is the shared harness, `rm -rf .wrangler/state test-results` and push again once nothing else holds the port; a real assertion is the agent's code. Measured 2026-09-21: five of six wave pushes were refused at least once on this port.

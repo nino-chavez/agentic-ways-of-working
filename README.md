@@ -45,7 +45,7 @@ So there's exactly one canonical doc — [`principles/working-style.md`](princip
 | **Worktree isolation** | Parallel sessions never share a checkout, so commits can't land on each other's branch | [`worktree-guard.py`](hooks/worktree-guard.py) |
 | **Resource cleanup** | What a session starts, something ends: build output on disk, orphaned connector processes, and dev servers, browser tabs and local database stacks left running. Each reaper fails closed when ownership is unclear | [`worktree-reaper.py`](hooks/worktree-reaper.py) (disk) + [`connector-reaper.py`](hooks/connector-reaper.py) (MCP processes) + [`session-reaper.py`](hooks/session-reaper.py) (servers, tabs, stacks) |
 | **Token economics** | Session hygiene beats payload trimming; subagents are context firewalls | [`read-guard.py`](hooks/read-guard.py) (reads) + [`output-trim.py`](hooks/output-trim.py) (Bash output) + [statusline](statusline.py) |
-| **Subagent model routing** | Keep synthesis in the strongest parent; send each child to the cheapest adequate model | platform adapter + judgment |
+| **Dispatch routing** | Keep judgment in the parent; require classification before worker launch where a gated adapter is installed | [dispatch contract](docs/dispatch-routing.md); native hooks remain host-dependent |
 | **Session retention** | Promote durable truth before raw transcripts expire; lifecycle hooks enqueue and background workers mine | [`session-closeout`](skills/session-closeout/SKILL.md) + [retention pattern](docs/session-retention.md) |
 | **Harness hygiene** | Know what loads, what's used, and what's backed up before it disappears | [`/doctor`](commands/doctor.md) |
 | **Canonical-pattern-first** | Read the vendor's approach before hand-rolling auth, payments, or webhooks. Custom shapes name their disqualifier | judgment |
@@ -57,23 +57,22 @@ The judgment rows are deliberate. A hook can see a tool call; it can't see inten
 
 ### Model routing is a portable policy
 
-The canonical principle separates the decision to delegate from the choice of child model. The parent decides whether a subagent is useful. A platform hook may fill missing model and effort fields after that decision.
+The parent decides whether a worker is useful. A [required dispatcher](docs/dispatch-routing.md) owns classification and model selection before launching a worker session. Native subagents have a separate integration: a platform hook may fill missing model and effort fields, following the policy below. Hook enforcement depends on the host.
 
 ```text
 parent owns synthesis
-└── child task
-    ├── explicit model or effort → unchanged
-    └── no explicit choice
-        ├── routine → fast route
-        ├── ordinary or implementation → balanced route
-        └── deep, adversarial, security, architecture → strongest route
+└── child request
+    ├── classify the bounded job
+    ├── resolve the effective model and effort
+    ├── check policy or scoped user-authorized exception
+    └── record request, then verify observed runtime
 ```
 
 Cost, Balance, and Intelligence modes can move routine and ordinary work along the cost-quality curve. Deep work remains on the strongest tier in every mode. Overrides use bounded or context-free forks, never full-history inheritance.
 
-The policy also limits telemetry to structured route metadata. Prompt text and task descriptions stay out of the log. Shadow mode records a proposed route without changing the tool call.
+The policy limits telemetry to structured route metadata. Prompt text and task descriptions stay out of the log. A required native adapter blocks classifier or receipt failures when invoked; advisory shadow mode only observes. Host delivery and trust must be tested separately. See [native hook acceptance](docs/dispatch-routing.md#native-hook-acceptance).
 
-This repo owns the harness-neutral contract in [`principles/working-style.md`](principles/working-style.md). A Codex or Claude adapter supplies its current model names and hook format; those mappings do not belong in the portable principle.
+The portable preferences snapshot is [`principles/working-style.md`](principles/working-style.md); its opening note names the live owner. This repository owns the reusable [dispatch contract](docs/dispatch-routing.md). A Codex or Claude adapter supplies current model names and hook formats; those mappings do not belong in the portable principle.
 
 ### Three of these came from measurement, not opinion
 
