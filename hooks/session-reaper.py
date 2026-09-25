@@ -25,10 +25,13 @@ catch, all of it left by sessions that had already ended:
 
 Three independent actions, each separately gated and separately dry-runnable:
 
-  1. dev servers — SIGTERM a `vite dev` / `next dev` / `astro dev` /
-     `wrangler dev` process that is BOTH orphaned by process tree AND sitting
+  1. dev servers — SIGTERM a dev-server process TREE — `vite [dev|preview]`,
+     `next dev|start`, `astro dev|preview`, `wrangler [pages] dev` and its
+     `workerd serve` runtime child, `vinext dev|start`, `python -m
+     http.server` — whose root is BOTH orphaned by process tree AND sitting
      in a linked worktree with no live session lock, older than
-     DEV_SERVER_IDLE_HOURS.
+     DEV_SERVER_IDLE_HOURS. The root is signalled first, then every
+     descendant in the snapshot (see dev_server_trees()).
   2. browser tabs — close page targets whose URL points at a local port that
      is not listening. Over CDP, one target at a time. The browser process is
      never signalled and the profile directory is never touched (that profile
@@ -184,16 +187,63 @@ STAMP_FILENAME = ".last-session-reap"
 
 ALL_ACTIONS = ("dev", "tabs", "stacks")
 
-# Substring tests against the full argv, AND-ed with an argv[0] basename test
-# below. The substring alone is not enough: a `/bin/zsh -c '... npx vite dev
-# --port 5213 ...'` wrapper carries the same text, and so does the `ps | grep`
-# that goes looking for one. A reaper that SIGTERMs a shell for mentioning a
-# dev server is a bug that shows up once, expensively.
-DEV_SERVER_PATTERNS = ("vite dev", "next dev", "astro dev", "wrangler dev")
-DEV_SERVER_ARGV0 = {
-    "node", "npm", "npx", "pnpm", "yarn", "bun",
-    "vite", "next", "astro", "wrangler",
+# What a dev server looks like in argv. Two parts, both required (dev_server_kind):
+#
+#   1. argv[0]'s basename is a JS runtime or package runner (DEV_SERVER_LAUNCHERS),
+#      a tool below run as a native binary, or a python (PYTHON_ARGV0_RE). A
+#      `/bin/zsh -c '... npx vite dev --port 5213 ...'` wrapper carries the same
+#      words, and so does the `ps | grep` that goes looking for one. A reaper
+#      that SIGTERMs a shell for mentioning a dev server is a bug that shows up
+#      once, expensively.
+#   2. Some token names a tool in DEV_SERVER_TOOLS — by basename (`vite`,
+#      `wrangler.js`, `workerd`) or by its package directory
+#      (`node_modules/wrangler/wrangler-dist/cli.js`) — and the positional
+#      tokens right after it spell one of that tool's SERVER subcommands.
+#
+# This used to be a substring list, ("vite dev", "next dev", "astro dev",
+# "wrangler dev"), AND-ed with an argv[0] set — and "wrangler dev" in that list
+# never matched anything wrangler actually runs as. Measured 2026-09-24 in
+# apps/volley-watch: pid 22907 `node .../node_modules/wrangler/bin/wrangler.js
+# pages dev ... --port 8773`, PPID 1, up 2 days 14 hours, with its workerd
+# child (pid 22916, argv0 `workerd`, outside the argv[0] set) at ~95% CPU and
+# 888 MB the whole time. `report` listed it neither to kill nor to keep: the
+# `.js` suffix broke the substring, the `pages` subcommand broke it again, and
+# the runtime child was never a candidate at all. Same defect, unmeasured until
+# then: `node .../vite/bin/vite.js dev`, and a bare `vite`, which IS the dev
+# server (fleet package.json: `"dev": "vite"`).
+DEV_SERVER_LAUNCHERS = {"node", "npm", "npx", "pnpm", "yarn", "bun"}
+PYTHON_ARGV0_RE = re.compile(r"^python(\d+(\.\d+)?)?$", re.IGNORECASE)
+
+# tool -> the positional subcommands that mean "a long-running local server".
+# "" is the bare invocation: only vite is a server with no subcommand; a bare
+# `wrangler` or `next` prints help and exits. Build and deploy subcommands are
+# deliberately absent — a stuck `vite build` is not this reaper's contract.
+#
+# Fleet survey 2026-09-24, package.json dev/preview/start scripts under
+# ~/Workspace/dev: `vite dev` 17, `vite preview` 18, `vite` 1, `next dev` 6,
+# `next start` 6, `vinext dev` 5, `vinext start` 5, `wrangler dev` 4.
+# `svelte-kit` is NOT here on purpose: SvelteKit 2's CLI is `svelte-kit sync`
+# only and its dev server is `vite dev`, so the entry could never match — the
+# exact kind of entry this table just had.
+DEV_SERVER_TOOLS: dict[str, tuple[str, ...]] = {
+    "vite": ("", "dev", "serve", "preview"),
+    "vinext": ("dev", "start"),
+    "next": ("dev", "start"),
+    "astro": ("dev", "preview"),
+    "wrangler": ("dev", "pages dev"),
+    # wrangler's runtime child. Normally it goes as part of wrangler's tree
+    # (dev_server_trees); listed so one that outlived its parent is still found.
+    "workerd": ("serve",),
 }
+# `python -m http.server <port> -d <dir>` — what ~/.local/bin/preview starts.
+# preview launches it `nohup … &` and exits, so this kind has PPID 1 from
+# birth and the orphan walk carries no information about it: the worktree
+# lock and the age gate do all the work. A session that `cd`s into ANOTHER
+# worktree to run preview there, and keeps using it past the idle gate, is
+# the one shape this cannot tell from a leftover.
+HTTP_SERVER_KIND = "http.server"
+_NODE_MODULES_PKG_RE = re.compile(r"/node_modules/([^/@.][^/]*)/")
+_SCRIPT_EXTS = (".js", ".mjs", ".cjs")
 
 # Identifies a live process as an agent client that may legitimately own a dev
 # server. Copied from connector-reaper.py's CLIENT_PATTERNS, and deliberately
@@ -540,12 +590,24 @@ def _client_text(command: str, strip_prefixes: tuple[str, ...]) -> str:
     So two kinds of token go: a path under one of `strip_prefixes`, and an
     environment assignment (`NAME=…`), which is never how a process is named.
 
-    THE FIRST TOKEN IS NEVER STRIPPED, and that is the part that keeps this
+    THE FIRST TOKEN IS NEVER DROPPED, and that is the part that keeps this
     safe rather than clever. A real agent process can live inside one of these
     directories — `/Users/nino/.codex/computer-use/Codex Computer Use.app/…` is
-    running on this machine right now — and stripping its executable would hide
+    running on this machine right now — and hiding its executable would hide
     a live client, which is the one direction that destroys work. Only what
     comes AFTER the executable is treated as noise.
+
+    One refinement to that, measured 2026-09-24: a leading token that lives
+    under a REPO path is judged by the part after the worktree, not the
+    whole. The volley-watch wrangler tree sat in `.worktrees/codex/apple-tv-
+    release-ready-20260921/`, and its workerd and esbuild children are native
+    binaries whose executable IS that path — so the branch name made both
+    read as a Codex client, and the very tree this file was fixed to find was
+    kept as `descendant_live_client`. A leaked workerd on its own would have
+    been kept the same way, through ancestor_owner() reading its own argv.
+    The executable's own name still identifies it (`node_modules/.bin/claude`
+    under a worktree is still a client); the branch it was checked out under
+    does not. Agent state directories keep the whole token, as above.
 
     Nor can this be replaced by "test argv[0] only": macOS agent paths contain
     spaces (`~/Library/Application Support/Claude/claude-code/…`), so a
@@ -556,14 +618,30 @@ def _client_text(command: str, strip_prefixes: tuple[str, ...]) -> str:
     """
     if not strip_prefixes:
         return command
+    agent_dirs = tuple(
+        p for p in strip_prefixes
+        if os.path.basename(p.rstrip(os.sep)) in AGENT_STATE_DIRS
+    )
+    repo_prefixes = sorted(
+        (p.rstrip(os.sep) for p in strip_prefixes if p not in agent_dirs),
+        key=len, reverse=True,
+    )
 
     def drop(tok: str) -> bool:
         return bool(_ENV_ASSIGNMENT_RE.match(tok)) or any(
             tok.startswith(p) for p in strip_prefixes
         )
 
+    def leading(tok: str) -> str:
+        if tok.startswith(agent_dirs):
+            return tok
+        for p in repo_prefixes:  # longest first: the worktree, not the repo
+            if tok.startswith(p + os.sep):
+                return tok[len(p) + 1:]
+        return tok
+
     return " ".join(
-        tok if i == 0 or not drop(tok) else ""
+        leading(tok) if i == 0 else ("" if drop(tok) else tok)
         for i, tok in enumerate(command.split())
     )
 
@@ -601,14 +679,130 @@ def ancestor_owner(
 
 # --- action 1: orphan dev servers --------------------------------------------
 
+def _tool_of(token: str) -> tuple[str | None, bool]:
+    """(tool, by_name) for one argv token.
+
+    by_name is True when the token's basename IS the tool (`vite`,
+    `wrangler.js`, `workerd`), False when only its package directory says so
+    (`node_modules/wrangler/wrangler-dist/cli.js` — wrangler's real entry,
+    which is what the process runs as on this machine). Only a by-name match
+    may stand for a bare invocation: every script under node_modules/vite/ is
+    not a vite dev server.
+    """
+    base = os.path.basename(token)
+    for ext in _SCRIPT_EXTS:
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+            break
+    if base in DEV_SERVER_TOOLS:
+        return base, True
+    m = _NODE_MODULES_PKG_RE.search(token)
+    if m and m.group(1) in DEV_SERVER_TOOLS:
+        return m.group(1), False
+    return None, False
+
+
+def dev_server_kind(command: str) -> str | None:
+    """"vite dev", "wrangler pages dev", "workerd serve", "http.server", ... or None.
+
+    argv[0] must be a launcher, a tool, or a python (part 1 of the comment on
+    DEV_SERVER_TOOLS). Then the FIRST tool-shaped token decides, together with
+    the positional tokens between it and the next flag: none means bare; one
+    or two spell the subcommand (`dev`, `pages dev`). Flags and their values
+    are never subcommands, so `vite --port 5000` is bare vite and `wrangler
+    pages dev ./out --port 8773` is `pages dev`. Anything not on the tool's
+    server list is None: `vite build`, `wrangler deploy`, `next build`.
+    """
+    toks = command.split()
+    if not toks:
+        return None
+    argv0 = os.path.basename(toks[0])
+    if PYTHON_ARGV0_RE.match(argv0):
+        if any(a == "-m" and b == "http.server" for a, b in zip(toks, toks[1:])):
+            return HTTP_SERVER_KIND
+        return None
+    if argv0 not in DEV_SERVER_LAUNCHERS and _tool_of(toks[0])[0] is None:
+        return None
+    for i, tok in enumerate(toks):
+        tool, by_name = _tool_of(tok)
+        if tool is None:
+            continue
+        positionals: list[str] = []
+        for nxt in toks[i + 1:i + 3]:
+            if nxt.startswith("-"):
+                break
+            positionals.append(nxt)
+        servers = DEV_SERVER_TOOLS[tool]
+        if not positionals:
+            return tool if (by_name and "" in servers) else None
+        for n in (1, 2):
+            sub = " ".join(positionals[:n])
+            if sub in servers:
+                return f"{tool} {sub}"
+        return None
+    return None
+
+
 def looks_like_dev_server(command: str) -> bool:
-    """argv[0] basename is a JS runtime/runner AND the argv names a dev server."""
-    parts = command.split()
-    if not parts:
+    return dev_server_kind(command) is not None
+
+
+def dev_server_trees(
+    candidates: dict[int, dict], procs: dict[int, dict],
+) -> dict[int, list[int]]:
+    """root pid -> its descendants (parents before children), for every
+    candidate that is not itself under another candidate.
+
+    Why the root, and not the leaf or each match on its own. The measured
+    wrangler tree (2026-09-24, apps/volley-watch) was three deep and four wide:
+    `wrangler.js pages dev` (pid 22907, PPID 1) -> `node --no-warnings
+    .../wrangler-dist/cli.js pages dev` (22910) -> `workerd serve` (22916, the
+    888 MB / 95% CPU leaf) plus a second `workerd serve` (21860). Every one of
+    the four is a candidate under dev_server_kind(). SIGTERM-ing them as four
+    independent rows races wrangler's own teardown against the reaper, and
+    SIGTERM-ing only the leaf leaves wrangler to respawn it or to sit there as
+    a two-process shell. So the ROOT carries the gates (cwd, worktree, lock,
+    ancestor walk, age) and its whole subtree goes with it: root first so its
+    handlers run, then each descendant — one that already exited counts as
+    done, and one that survives its parent (workerd holds no pipe that would
+    tell it) is signalled anyway, which is the leak this exists to close.
+
+    A candidate whose upward walk cannot be completed (a pid missing from the
+    snapshot, a cycle) is treated as its own root; plan_dev_servers then fails
+    closed on it through ancestor_owner() == "unknown".
+    """
+    kids: dict[int, list[int]] = {}
+    for pid, info in procs.items():
+        kids.setdefault(info["ppid"], []).append(pid)
+
+    def under_a_candidate(pid: int) -> bool:
+        seen = {pid}
+        cur = procs[pid]["ppid"]
+        for _ in range(64):
+            if cur in candidates:
+                return True
+            if cur in seen or cur <= 1 or cur not in procs:
+                return False
+            seen.add(cur)
+            cur = procs[cur]["ppid"]
         return False
-    if os.path.basename(parts[0]) not in DEV_SERVER_ARGV0:
-        return False
-    return any(p in command for p in DEV_SERVER_PATTERNS)
+
+    trees: dict[int, list[int]] = {}
+    for root in sorted(candidates):
+        if under_a_candidate(root):
+            continue
+        order: list[int] = []
+        seen = {root}
+        queue = list(kids.get(root, []))
+        while queue:
+            pid = queue.pop(0)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            order.append(pid)
+            queue.extend(kids.get(pid, []))
+        trees[root] = order
+    return trees
 
 
 def process_cwds(pids: list[int]) -> dict[int, str]:
@@ -655,14 +849,16 @@ def process_cwds(pids: list[int]) -> dict[int, str]:
 def plan_dev_servers(cwd: str, cd: str) -> tuple[list[dict], list[dict]]:
     """(kill, keep) rows for every dev-server process in this repo's worktrees.
 
-    A row is eligible only when ALL of these hold, and every one of them fails
-    closed:
-      - argv says dev server (looks_like_dev_server)
+    One row per dev-server TREE, keyed by its root (dev_server_trees); the
+    row's "tree" lists the descendants that go with it. A row is eligible only
+    when ALL of these hold of the root, and every one of them fails closed:
+      - argv says dev server (dev_server_kind)
       - lsof resolved its cwd
       - that cwd sits inside a LINKED worktree of this repo (never the main
         checkout, never some other repo)
       - that worktree has no live session lock, and every lock file parsed
       - its ancestor chain reaches pid 1 without passing a live agent client
+      - no descendant is a live agent client either
       - elapsed time > DEV_SERVER_IDLE_HOURS
     """
     keep: list[dict] = []
@@ -679,6 +875,7 @@ def plan_dev_servers(cwd: str, cd: str) -> tuple[list[dict], list[dict]]:
     }
     if not candidates:
         return kill, keep
+    trees = dev_server_trees(candidates, procs)
 
     entries = all_worktrees(cwd)
     if entries is None:
@@ -707,15 +904,26 @@ def plan_dev_servers(cwd: str, cd: str) -> tuple[list[dict], list[dict]]:
         return kill, keep
     me = os.path.realpath(cwd)
 
-    cwds = process_cwds(sorted(candidates))
-    for pid in sorted(candidates):
+    cwds = process_cwds(sorted(trees))
+    for pid in sorted(trees):
         info = candidates[pid]
+        subtree = trees[pid]
         row = {
             "pid": pid,
+            "kind": dev_server_kind(info["command"]),
             "age_s": info["etime"],
             "rss_kb": info["rss_kb"],
             "command": safe_cmd(info["command"]),
             "worktree": None,
+            "tree": [
+                {
+                    "pid": p,
+                    "rss_kb": procs[p]["rss_kb"],
+                    "command": safe_cmd(procs[p]["command"]),
+                }
+                for p in subtree
+            ],
+            "tree_rss_kb": sum(procs[p]["rss_kb"] for p in subtree),
         }
         proc_cwd = cwds.get(pid)
         if proc_cwd is None:
@@ -742,6 +950,13 @@ def plan_dev_servers(cwd: str, cd: str) -> tuple[list[dict], list[dict]]:
             # The load-bearing gate. A session in worktree A starting a server in
             # worktree B leaves B lockless while the process is still owned.
             row["reason"] = f"ancestor_{owner}"
+            keep.append(row)
+            continue
+        if any(_is_client(procs[p]["command"], repo_paths) for p in subtree):
+            # Not a shape any dev server produces, and that is the point: a
+            # subtree is killed on its root's evidence alone, so a client
+            # anywhere inside it must keep the whole tree.
+            row["reason"] = "descendant_live_client"
             keep.append(row)
             continue
         if info["etime"] <= DEV_SERVER_IDLE_HOURS * 3600:
@@ -1157,7 +1372,7 @@ def cmd_reap(payload: dict, now: bool = False) -> None:
         return
 
     actions = selected_actions()
-    n_dev = dev_kb = n_tabs = n_stacks = n_containers = 0
+    n_dev = n_dev_children = dev_kb = n_tabs = n_stacks = n_containers = 0
     truncated = False
 
     if "dev" in actions and not past_deadline():
@@ -1193,6 +1408,24 @@ def cmd_reap(payload: dict, now: bool = False) -> None:
                 )
             else:
                 log(f"kill_failed pid={row['pid']} cmd={row['command']}")
+            # The subtree goes with the root whether or not the root's own
+            # SIGTERM landed: a root that is already gone left these orphaned,
+            # and a root whose teardown is racing this loop makes the second
+            # signal a no-op. Root first, then parents before children.
+            for sub in row.get("tree", ()):
+                if kill_pid(sub["pid"]):
+                    n_dev_children += 1
+                    dev_kb += sub["rss_kb"]
+                    log(
+                        f"killed_dev_server_child pid={sub['pid']} "
+                        f"root={row['pid']} rss={sub['rss_kb'] // 1024}MB "
+                        f"cmd={sub['command']}"
+                    )
+                else:
+                    log(
+                        f"kill_failed pid={sub['pid']} root={row['pid']} "
+                        f"cmd={sub['command']}"
+                    )
 
     if "tabs" in actions and not past_deadline():
         try:
@@ -1249,12 +1482,27 @@ def cmd_reap(payload: dict, now: bool = False) -> None:
         touch_stamp(cd)
     log(
         f"repo={cwd} {'reap-now ' if now else ''}"
-        f"dev_servers={n_dev} dev_rss_freed={dev_kb // 1024}MB "
+        f"dev_servers={n_dev} dev_server_children={n_dev_children} "
+        f"dev_rss_freed={dev_kb // 1024}MB "
         f"tabs_closed={n_tabs} stacks_stopped={n_stacks} "
         f"containers_stopped={n_containers} "
         f"elapsed={time.time() - _STARTED_AT:.1f}s"
         + (f" TRUNCATED at {DEADLINE_SECONDS}s budget" if truncated else "")
     )
+
+
+def _print_tree(row: dict, indent: str = "      ") -> None:
+    """The descendants that go with a root, so the operator sees the whole
+    tree — the 888 MB workerd sat three levels under a 3 MB wrangler."""
+    tree = row.get("tree") or []
+    if not tree:
+        return
+    print(
+        f"{indent}tree: {len(tree)} descendant(s), "
+        f"{row.get('tree_rss_kb', 0) // 1024}MB, signalled with the root"
+    )
+    for sub in tree:
+        print(f"{indent}  pid={sub['pid']:<7} rss={sub['rss_kb'] // 1024:>5}MB  {sub['command']}")
 
 
 def cmd_report(cwd: str) -> None:
@@ -1293,6 +1541,7 @@ def cmd_report(cwd: str) -> None:
                 f"rss={row['rss_kb'] // 1024:>5}MB  {row['worktree']}"
             )
             print(f"      {row['command']}")
+            _print_tree(row)
         if not kill:
             print("  (none)")
         print(f"    keeping ({len(keep)}):")
@@ -1305,6 +1554,7 @@ def cmd_report(cwd: str) -> None:
                 f"reason={row['reason']}"
             )
             print(f"        {row['command']}")
+            _print_tree(row, indent="        ")
         print()
 
     if "tabs" in actions:

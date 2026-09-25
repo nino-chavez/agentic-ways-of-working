@@ -98,6 +98,96 @@ class DevServerMatchTests(unittest.TestCase):
     def test_a_build_is_not_a_dev_server(self) -> None:
         self.assertFalse(sr.looks_like_dev_server("node /r/node_modules/.bin/vite build"))
 
+    # Measured 2026-09-24 in apps/volley-watch: the argv wrangler ACTUALLY runs
+    # as, none of which contained the old "wrangler dev" substring.
+    WT = "/Users/nino/Workspace/dev/apps/volley-watch/.worktrees/codex/apple-tv-release-ready-20260921"
+    WRANGLER_ROOT = (
+        f"node {WT}/node_modules/wrangler/bin/wrangler.js pages dev "
+        "/private/tmp/rotation-delivery-reviewed-20260922 --port 8773 --ip 127.0.0.1 "
+        "--inspector-port 0 --binding ROTATION_DATA_EXPOSURE=controlled "
+        "--persist-to /private/tmp/rotation-delivery-state-20260922 --log-level warn"
+    )
+    WRANGLER_CLI = (
+        f"/opt/homebrew/Cellar/node/26.0.0/bin/node --no-warnings "
+        f"{WT}/node_modules/wrangler/wrangler-dist/cli.js pages dev "
+        "/private/tmp/rotation-delivery-reviewed-20260922 --port 8773 --ip 127.0.0.1"
+    )
+    WORKERD = (
+        f"{WT}/node_modules/@cloudflare/workerd-darwin-arm64/bin/workerd serve "
+        "--binary --experimental --socket-addr=entry=127.0.0.1:8773 "
+        "--external-addr=loopback=127.0.0.1:55337 --control-fd=3 -"
+    )
+
+    def test_wranglers_real_argv_matches_at_every_level_of_its_tree(self) -> None:
+        """pid 22907 -> 22910 -> 22916. The `.js` suffix broke the substring,
+        the `pages` subcommand broke it again, and workerd's argv0 was outside
+        the runtime set, so `report` listed none of the three."""
+        self.assertEqual(sr.dev_server_kind(self.WRANGLER_ROOT), "wrangler pages dev")
+        self.assertEqual(sr.dev_server_kind(self.WRANGLER_CLI), "wrangler pages dev")
+        self.assertEqual(sr.dev_server_kind(self.WORKERD), "workerd serve")
+
+    def test_a_bare_vite_is_the_dev_server_flags_or_not(self) -> None:
+        for cmd in (
+            "node /r/node_modules/.bin/vite",
+            "node /r/node_modules/.bin/vite --port 5000 --host",
+            "node /r/node_modules/vite/bin/vite.js",
+        ):
+            self.assertEqual(sr.dev_server_kind(cmd), "vite", cmd)
+
+    def test_the_tools_real_entry_script_matches_not_only_its_bin_shim(self) -> None:
+        self.assertEqual(
+            sr.dev_server_kind("node /r/node_modules/vite/bin/vite.js dev"), "vite dev"
+        )
+        self.assertEqual(
+            sr.dev_server_kind("node /r/node_modules/vinext/dist/cli.js dev"), "vinext dev"
+        )
+
+    def test_a_script_merely_inside_a_tool_package_is_not_a_bare_server(self) -> None:
+        """Package-directory identification may not stand for a bare
+        invocation, or every vite chunk and next worker would be a server."""
+        for cmd in (
+            "node /r/node_modules/vite/dist/node/chunks/worker.js",
+            "node /r/node_modules/next/dist/compiled/jest-worker/processChild.js",
+        ):
+            self.assertIsNone(sr.dev_server_kind(cmd), cmd)
+
+    def test_preview_and_production_servers_match(self) -> None:
+        for cmd, kind in (
+            ("node /r/node_modules/.bin/vite preview", "vite preview"),
+            ("node /r/node_modules/.bin/next start", "next start"),
+            ("node /r/node_modules/.bin/vinext start", "vinext start"),
+            ("npx astro preview", "astro preview"),
+            ("node /r/node_modules/.bin/wrangler dev --test-scheduled", "wrangler dev"),
+        ):
+            self.assertEqual(sr.dev_server_kind(cmd), kind, cmd)
+
+    def test_pythons_http_server_matches_and_other_modules_do_not(self) -> None:
+        """What ~/.local/bin/preview starts, with the argv0 macOS gives it."""
+        self.assertEqual(
+            sr.dev_server_kind(
+                "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/"
+                "Versions/3.14/Resources/Python.app/Contents/MacOS/Python "
+                "-m http.server 8765 -d /r/.worktrees/chooser-answers"
+            ),
+            "http.server",
+        )
+        self.assertEqual(sr.dev_server_kind("python3 -m http.server"), "http.server")
+        self.assertEqual(sr.dev_server_kind("python3.14 -m http.server 9000"), "http.server")
+        self.assertIsNone(sr.dev_server_kind("python3 -m pytest tests"))
+        self.assertIsNone(sr.dev_server_kind("python3 serve.py http.server"))
+
+    def test_deploys_builds_and_other_subcommands_are_not_dev_servers(self) -> None:
+        for cmd in (
+            "node /r/node_modules/wrangler/bin/wrangler.js pages deploy ./dist",
+            "node /r/node_modules/wrangler/bin/wrangler.js deploy",
+            "node /r/node_modules/wrangler/bin/wrangler.js",
+            "node /r/node_modules/.bin/next build",
+            "node /r/node_modules/.bin/next",
+            "node /r/node_modules/.bin/svelte-kit sync",
+            "/r/node_modules/@cloudflare/workerd-darwin-arm64/bin/workerd compile x.capnp",
+        ):
+            self.assertIsNone(sr.dev_server_kind(cmd), cmd)
+
 
 class ClientScanTests(unittest.TestCase):
     """The measured false positive: a BRANCH NAME containing "codex"."""
@@ -139,6 +229,34 @@ class ClientScanTests(unittest.TestCase):
         direction that destroys work — so token 0 is never stripped."""
         exe = "/Users/n/.codex/computer-use/Codex.app/Contents/MacOS/Codex --flag"
         self.assertTrue(sr._is_client(exe, ("/Users/n/.claude", "/Users/n/.codex")))
+
+    def test_a_native_binary_run_from_a_codex_branch_worktree_is_not_a_client(self) -> None:
+        """Measured 2026-09-24: workerd and esbuild under
+        `.worktrees/codex/apple-tv-release-ready-20260921/node_modules/`. The
+        executable IS the worktree path, so the branch name sat in token 0,
+        which is never dropped — and the tree the fix was for came back as
+        `descendant_live_client`. Judged by the remainder after the worktree
+        instead: the executable's own name, not the branch it sits under."""
+        wt = "/Users/n/dev/volley-watch/.worktrees/codex/apple-tv-release-ready-20260921"
+        prefixes = (
+            "/Users/n/dev/volley-watch", "/Users/n/dev/volley-watch/", wt, wt + "/",
+            "/Users/n/.claude", "/Users/n/.codex",
+        )
+        workerd = f"{wt}/node_modules/@cloudflare/workerd-darwin-arm64/bin/workerd serve --binary"
+        esbuild = f"{wt}/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.25.0 --ping"
+        self.assertTrue(sr._is_client(workerd))              # the bug
+        self.assertFalse(sr._is_client(workerd, prefixes))   # the fix
+        self.assertFalse(sr._is_client(esbuild, prefixes))
+        # Longest prefix first — with only the repo stripped, the remainder
+        # would still begin `.worktrees/codex/`.
+        self.assertTrue(sr._client_text(workerd, prefixes).startswith("node_modules/"))
+
+    def test_a_client_binary_inside_a_repo_worktree_is_still_a_client(self) -> None:
+        """The remainder keeps the executable's own name: a repo-local
+        `node_modules/.bin/claude` is not hidden by the rule above."""
+        wt = "/Users/n/dev/app/.worktrees/codex/x"
+        prefixes = ("/Users/n/dev/app", "/Users/n/dev/app/", wt, wt + "/")
+        self.assertTrue(sr._is_client(f"{wt}/node_modules/.bin/claude --model x", prefixes))
 
     def test_a_node_launched_claude_cli_is_still_a_client(self) -> None:
         """The shape that rules out "test the executable only" (`ps -o comm=`):
@@ -269,7 +387,7 @@ class _RepoFixture(unittest.TestCase):
 
     def add_worktree(self, name: str) -> Path:
         wt = self.root / ".worktrees" / name
-        wt.parent.mkdir(exist_ok=True)
+        wt.parent.mkdir(parents=True, exist_ok=True)
         self.git("worktree", "add", "-b", name, str(wt), "main", cwd=self.root)
         return Path(os.path.realpath(wt))
 
@@ -387,6 +505,113 @@ class DevServerPlanTests(_RepoFixture):
         kill, keep = self.plan_dev()
         self.assertEqual(kill, [])
         self.assertEqual(keep[0]["reason"], "ps_enumeration_failed")
+
+    WRANGLER_WT = "codex/apple-tv-release-ready-20260921"
+
+    def _wrangler_tree(self, wt: Path, age: float = 2 * 86400 + 14 * 3600) -> dict:
+        """The 2026-09-24 volley-watch tree: wrangler (PPID 1) -> node cli.js ->
+        two workerd runtimes (the older one at ~95% CPU and 888 MB) and an
+        esbuild service. The worktree is a `codex/…` branch, which is what
+        made the native binaries read as a client on the first dry run."""
+        procs = dict(self.ORPHAN_TREE)
+        procs[22907] = proc(
+            1,
+            f"node {wt}/node_modules/wrangler/bin/wrangler.js pages dev "
+            "/private/tmp/out --port 8773 --ip 127.0.0.1",
+            age, rss_kb=3408,
+        )
+        procs[22910] = proc(
+            22907,
+            f"/opt/homebrew/Cellar/node/26.0.0/bin/node --no-warnings "
+            f"{wt}/node_modules/wrangler/wrangler-dist/cli.js pages dev "
+            "/private/tmp/out --port 8773 --ip 127.0.0.1",
+            age, rss_kb=1472,
+        )
+        procs[22916] = proc(
+            22910,
+            f"{wt}/node_modules/@cloudflare/workerd-darwin-arm64/bin/workerd serve "
+            "--binary --experimental --socket-addr=entry=127.0.0.1:8773 --control-fd=3 -",
+            age, rss_kb=909088,
+        )
+        procs[21860] = proc(
+            22910,
+            f"{wt}/node_modules/@cloudflare/workerd-darwin-arm64/bin/workerd serve "
+            "--binary --socket-addr=entry=127.0.0.1:0",
+            86400 + 13 * 3600, rss_kb=8320,
+        )
+        procs[22911] = proc(
+            22910,
+            f"{wt}/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.25.0 --ping",
+            age, rss_kb=3072,
+        )
+        return procs
+
+    def test_an_orphaned_wrangler_tree_is_planned_as_one_root_with_its_descendants(self) -> None:
+        """The incident: PPID 1, no lock, 2.5 days old — and `report` said
+        `dev servers to SIGTERM (0)` and `keeping (0)`."""
+        wt = self.add_worktree(self.WRANGLER_WT)
+        procs = self._wrangler_tree(wt)
+        self.stub_processes(procs, {p: str(wt) for p in procs if p != 1})
+        kill, keep = self.plan_dev()
+        self.assertEqual([r["pid"] for r in kill], [22907])
+        self.assertEqual(keep, [], "descendants are part of the root's row, not rows")
+        row = kill[0]
+        self.assertEqual(row["kind"], "wrangler pages dev")
+        self.assertEqual(row["worktree"], str(wt))
+        self.assertEqual({s["pid"] for s in row["tree"]}, {22910, 22916, 21860, 22911})
+        self.assertEqual(row["tree"][0]["pid"], 22910, "parents before children")
+        self.assertEqual(row["tree_rss_kb"], 1472 + 909088 + 8320 + 3072)
+
+    def test_a_kept_root_keeps_its_descendants_with_it_and_reports_them_once(self) -> None:
+        wt = self.add_worktree(self.WRANGLER_WT)
+        procs = self._wrangler_tree(wt, age=60.0)
+        self.stub_processes(procs, {p: str(wt) for p in procs if p != 1})
+        kill, keep = self.plan_dev()
+        self.assertEqual(kill, [])
+        self.assertEqual([r["pid"] for r in keep], [22907])
+        self.assertIn("younger_than", keep[0]["reason"])
+        self.assertEqual(len(keep[0]["tree"]), 4)
+
+    def test_a_workerd_that_outlived_its_wrangler_is_its_own_root(self) -> None:
+        wt = self.add_worktree(self.WRANGLER_WT)  # a `codex/` branch, on purpose
+        procs = dict(self.ORPHAN_TREE)
+        procs[22916] = proc(
+            1,
+            f"{wt}/node_modules/@cloudflare/workerd-darwin-arm64/bin/workerd serve "
+            "--binary --socket-addr=entry=127.0.0.1:8773",
+            rss_kb=909088,
+        )
+        self.stub_processes(procs, {22916: str(wt)})
+        kill, keep = self.plan_dev()
+        self.assertEqual([r["pid"] for r in kill], [22916])
+        self.assertEqual(kill[0]["kind"], "workerd serve")
+        self.assertEqual(kill[0]["tree"], [])
+
+    def test_a_descendant_that_is_a_live_client_keeps_the_whole_tree(self) -> None:
+        """No dev server spawns an agent — which is why this must fail closed:
+        a subtree is killed on its root's evidence alone."""
+        wt = self.add_worktree("odd")
+        procs = self._orphan_server(wt)
+        procs[301] = proc(300, "/Applications/Claude.app/Contents/MacOS/Claude")
+        self.stub_processes(procs, {300: str(wt)})
+        kill, keep = self.plan_dev()
+        self.assertEqual(kill, [])
+        self.assertEqual(keep[0]["reason"], "descendant_live_client")
+
+    def test_the_preview_helpers_http_server_is_planned_for_kill(self) -> None:
+        wt = self.add_worktree("chooser-answers")
+        procs = dict(self.ORPHAN_TREE)
+        procs[73882] = proc(
+            1,
+            "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/"
+            "Versions/3.14/Resources/Python.app/Contents/MacOS/Python "
+            f"-m http.server 8765 -d {wt}",
+            5 * 3600,
+        )
+        self.stub_processes(procs, {73882: str(wt)})
+        kill, _keep = self.plan_dev()
+        self.assertEqual([r["pid"] for r in kill], [73882])
+        self.assertEqual(kill[0]["kind"], "http.server")
 
 
 class StackPlanTests(_RepoFixture):
@@ -783,6 +1008,31 @@ class CliTests(_RepoFixture):
         self.assertIn("dev servers to SIGTERM (1)", r.stdout)
         self.assertFalse(self.log.exists(), "report must not write the reap log")
 
+    def test_report_lists_a_wrangler_tree_under_its_root(self) -> None:
+        """The 2026-09-24 chain through the real CLI: wrangler.js (PPID 1) ->
+        node cli.js -> workerd, no lock on the worktree. Before the fix this
+        printed `dev servers to SIGTERM (0)` and `keeping (0)`."""
+        wt = self.add_worktree("codex/apple-tv-release-ready-20260921")
+        _write_fake(self.bin, "ps", (
+            'echo "1 0 10:00:00 5000 /sbin/launchd"\n'
+            f'echo "22907 1 62:28:25 3408 node {wt}/node_modules/wrangler/bin/wrangler.js'
+            ' pages dev /private/tmp/out --port 8773 --ip 127.0.0.1"\n'
+            f'echo "22910 22907 62:28:25 1472 /opt/homebrew/bin/node --no-warnings'
+            f' {wt}/node_modules/wrangler/wrangler-dist/cli.js pages dev /private/tmp/out --port 8773"\n'
+            f'echo "22916 22910 62:28:25 909088 {wt}/node_modules/@cloudflare/workerd-darwin-arm64/bin/workerd'
+            ' serve --binary --experimental --socket-addr=entry=127.0.0.1:8773 --control-fd=3 -"'
+        ))
+        _write_fake(self.bin, "lsof", f'echo "p22907"; echo "fcwd"; echo "n{wt}"')
+        r = self.run_cli("report", str(self.root))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("dev servers to SIGTERM (1)", r.stdout)
+        self.assertIn("pid=22907", r.stdout)
+        self.assertIn("tree: 2 descendant(s), 889MB, signalled with the root", r.stdout)
+        self.assertIn("pid=22910", r.stdout)
+        self.assertIn("pid=22916", r.stdout)
+        self.assertIn("keeping (0)", r.stdout)
+        self.assertFalse(self.log.exists(), "report must not write the reap log")
+
     def test_the_off_switch_prevents_any_pass(self) -> None:
         r = self.run_cli("reap", extra={"SESSION_REAPER_OFF": "1"})
         self.assertEqual(r.returncode, 0)
@@ -868,6 +1118,32 @@ class CliTests(_RepoFixture):
             "reason=session_started_while_planning",
             self.log.read_text(encoding="utf-8"),
         )
+
+    def test_a_reap_signals_the_root_first_then_every_descendant(self) -> None:
+        """Root first so wrangler's own teardown runs; then each descendant,
+        because workerd does not die with its parent on its own."""
+        self.isolate_in_process()
+        wt = self.add_worktree("codex/apple-tv-release-ready-20260921")
+        procs = {
+            1: proc(0, "/sbin/launchd"),
+            22907: proc(1, f"node {wt}/node_modules/wrangler/bin/wrangler.js pages dev ./out --port 8773", rss_kb=3408),
+            22910: proc(22907, f"node --no-warnings {wt}/node_modules/wrangler/wrangler-dist/cli.js pages dev ./out --port 8773", rss_kb=1472),
+            22916: proc(22910, f"{wt}/node_modules/@cloudflare/workerd-darwin-arm64/bin/workerd serve --binary", rss_kb=909088),
+        }
+        self.stub_processes(procs, {22907: str(wt)})
+        killed: list[int] = []
+        saved_kill = sr.kill_pid
+        sr.kill_pid = lambda pid: killed.append(pid) or True
+        try:
+            sr.cmd_reap({"cwd": str(self.root)})
+        finally:
+            sr.kill_pid = saved_kill
+        self.assertEqual(killed, [22907, 22910, 22916])
+        text = self.log.read_text(encoding="utf-8")
+        self.assertIn("killed_dev_server pid=22907", text)
+        self.assertIn("killed_dev_server_child pid=22910 root=22907", text)
+        self.assertIn("killed_dev_server_child pid=22916 root=22907", text)
+        self.assertIn("dev_servers=1 dev_server_children=2 dev_rss_freed=892MB", text)
 
     def test_a_failing_action_is_logged_and_never_fails_the_hook(self) -> None:
         self.isolate_in_process()
