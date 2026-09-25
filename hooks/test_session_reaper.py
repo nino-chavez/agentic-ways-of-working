@@ -61,6 +61,22 @@ def proc(ppid: int, command: str, etime: float = 7200.0, rss_kb: int = 1000) -> 
     return {"ppid": ppid, "etime": etime, "rss_kb": rss_kb, "command": command}
 
 
+def phased(before, after):
+    """A still_running stub: the first call is the pre-signal liveness read,
+    every later call is the post-signal exit check."""
+    calls = {"n": 0}
+
+    def still_running(pids):
+        calls["n"] += 1
+        return (before if calls["n"] == 1 else after)(pids)
+
+    return still_running
+
+
+def ALL_ALIVE(pids):
+    return set(pids)
+
+
 # --- pure functions ---------------------------------------------------------
 
 
@@ -279,6 +295,71 @@ class ClientScanTests(unittest.TestCase):
             "/claude.app/Contents/MacOS/claude"
         )
         self.assertTrue(sr._is_client(cmd, ("/Users/n/.claude", "/Users/n/.codex")))
+
+
+class StillRunningTests(unittest.TestCase):
+    """Against real children this test spawns and owns, never anyone else's."""
+
+    def test_a_live_child_is_running_and_a_reaped_one_is_not(self) -> None:
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.DEVNULL,
+        )
+        try:
+            self.assertEqual(sr.still_running([child.pid]), {child.pid})
+        finally:
+            child.terminate()
+            child.wait(timeout=CHILD_TIMEOUT_SECONDS)
+        self.assertEqual(sr.still_running([child.pid]), set())
+
+    def test_a_zombie_counts_as_exited(self) -> None:
+        """Exited but not yet collected by its parent: what esbuild and the
+        small workerd became under a wrangler that ignored SIGTERM."""
+        child = subprocess.Popen(
+            [sys.executable, "-c", "pass"], stdin=subprocess.DEVNULL,
+        )
+        deadline = time.time() + 10
+        while time.time() < deadline:  # exited, deliberately not wait()ed
+            r = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(child.pid)],
+                capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, timeout=CHILD_TIMEOUT_SECONDS,
+            )
+            if r.stdout.strip().upper().startswith("Z"):
+                break
+            time.sleep(0.05)
+        try:
+            self.assertEqual(sr.still_running([child.pid]), set())
+        finally:
+            child.wait(timeout=CHILD_TIMEOUT_SECONDS)
+
+    def test_no_pids_needs_no_ps(self) -> None:
+        self.assertEqual(sr.still_running([]), set())
+
+    def _with_fake_ps(self, body: str) -> set[int] | None:
+        with tempfile.TemporaryDirectory() as d:
+            _write_fake(Path(d), "ps", body)
+            saved = os.environ["PATH"]
+            os.environ["PATH"] = f"{d}:{saved}"
+            try:
+                return sr.still_running([4242, 4243])
+            finally:
+                os.environ["PATH"] = saved
+
+    def test_a_ps_that_fails_is_unverified_not_all_exited(self) -> None:
+        """The commit reviewer's catch on da0297b: a ps that errors prints
+        nothing to stdout, which parsed as "nobody running" and counted every
+        signalled process as freed."""
+        self.assertIsNone(
+            self._with_fake_ps('echo "ps: Invalid process id: 4242" >&2; exit 1')
+        )
+
+    def test_every_pid_gone_is_exit_1_with_a_silent_stderr(self) -> None:
+        """What macOS ps actually does when none of the pids exist."""
+        self.assertEqual(self._with_fake_ps("exit 1"), set())
+
+    def test_one_pid_gone_one_running(self) -> None:
+        self.assertEqual(self._with_fake_ps('echo "4243 S"'), {4243})
 
 
 class AncestorOwnerTests(unittest.TestCase):
@@ -1078,10 +1159,23 @@ class CliTests(_RepoFixture):
         machine's state for its safety is not safe.
         """
         saved_url, saved_docker = sr.CDP_URL, sr.docker
+        saved_running = sr.still_running
         self.addCleanup(lambda: setattr(sr, "CDP_URL", saved_url))
         self.addCleanup(lambda: setattr(sr, "docker", saved_docker))
+        self.addCleanup(lambda: setattr(sr, "still_running", saved_running))
         sr.CDP_URL = self.cdp.url          # the fixture server, serving no targets
         sr.docker = lambda *a, **k: None   # reads as "docker unavailable"
+        # Fixture pids (22907 …) are real pids on the machine this was written
+        # on. The exit check must never read the real process table here.
+        sr.still_running = phased(ALL_ALIVE, lambda pids: set())
+        # The hook's 15s budget is measured from module import, and under
+        # `discover` the other suites can spend longer than that before this
+        # runs — cmd_reap then skips the dev action as past its deadline and
+        # the test asserts on a pass that never happened. Measured: 2 to 6
+        # of these failed per full run, never in isolation. Restart the clock.
+        saved_started = sr._STARTED_AT
+        self.addCleanup(lambda: setattr(sr, "_STARTED_AT", saved_started))
+        sr._STARTED_AT = time.time()
 
     def test_a_session_that_starts_while_planning_saves_its_dev_server(self) -> None:
         """The plan->kill gap is the wide window, so the lock set is re-read.
@@ -1140,10 +1234,177 @@ class CliTests(_RepoFixture):
             sr.kill_pid = saved_kill
         self.assertEqual(killed, [22907, 22910, 22916])
         text = self.log.read_text(encoding="utf-8")
-        self.assertIn("killed_dev_server pid=22907", text)
-        self.assertIn("killed_dev_server_child pid=22910 root=22907", text)
-        self.assertIn("killed_dev_server_child pid=22916 root=22907", text)
-        self.assertIn("dev_servers=1 dev_server_children=2 dev_rss_freed=892MB", text)
+        self.assertIn("sigterm_dev_server pid=22907", text)
+        self.assertIn("sigterm_dev_server_child pid=22910 root=22907", text)
+        self.assertIn("sigterm_dev_server_child pid=22916 root=22907", text)
+        self.assertIn("dev_server_exited pid=22916 root=22907", text)
+        self.assertIn(
+            "dev_servers_signalled=1 dev_children_signalled=2 "
+            "dev_exited=3 dev_survived=0 dev_rss_freed=892MB",
+            text,
+        )
+
+    def _signal_wrangler_tree(self, running, before=ALL_ALIVE) -> str:
+        """Run an in-process reap over the wrangler tree with signals stubbed
+        and `still_running` answered by `running`; return the log."""
+        self.isolate_in_process()
+        wt = self.add_worktree("codex/apple-tv-release-ready-20260921")
+        procs = {
+            1: proc(0, "/sbin/launchd"),
+            22907: proc(1, f"node {wt}/node_modules/wrangler/bin/wrangler.js pages dev ./out --port 8773", rss_kb=3408),
+            22910: proc(22907, f"node --no-warnings {wt}/node_modules/wrangler/wrangler-dist/cli.js pages dev ./out --port 8773", rss_kb=1472),
+            22911: proc(22910, f"{wt}/node_modules/@esbuild/darwin-arm64/bin/esbuild --service=0.25.0", rss_kb=15360),
+            22916: proc(22910, f"{wt}/node_modules/@cloudflare/workerd-darwin-arm64/bin/workerd serve --binary", rss_kb=1203200),
+        }
+        self.stub_processes(procs, {22907: str(wt)})
+        saved = (sr.kill_pid, sr.DEV_EXIT_GRACE_SECONDS)
+        sr.kill_pid = lambda pid: True
+        sr.DEV_EXIT_GRACE_SECONDS = 0.3
+        sr.still_running = phased(before, running)
+        try:
+            sr.cmd_reap({"cwd": str(self.root)})
+        finally:
+            sr.kill_pid, sr.DEV_EXIT_GRACE_SECONDS = saved
+        return self.log.read_text(encoding="utf-8")
+
+    def test_a_process_that_ignores_sigterm_is_not_reported_as_freed(self) -> None:
+        """The 2026-09-25 reap-now: the log said `killed_dev_server` and
+        `dev_rss_freed=1204MB`; wrangler, its node child and the 1 GB workerd
+        were all still running. Only esbuild actually exited."""
+        text = self._signal_wrangler_tree(lambda pids: {22907, 22910, 22916} & set(pids))
+        self.assertNotIn("killed_dev_server", text)
+        self.assertIn("dev_server_survived_sigterm pid=22916 root=22907", text)
+        self.assertIn("dev_server_survived_sigterm pid=22907 rss=", text)
+        self.assertIn("dev_server_exited pid=22911 root=22907 rss=15MB", text)
+        self.assertIn("dev_exited=1 dev_survived=3 dev_rss_freed=15MB", text)
+
+    def test_the_exit_check_waits_out_a_slow_teardown(self) -> None:
+        """A server that needs a moment to close its sockets counts as exited
+        once it goes within the grace, not as a survivor on the first look."""
+        calls = []
+
+        def slow(pids):
+            calls.append(1)
+            return set(pids) if len(calls) < 2 else set()
+
+        text = self._signal_wrangler_tree(slow)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertIn("dev_exited=4 dev_survived=0", text)
+
+    def test_the_exit_wait_runs_after_tabs_and_stacks(self) -> None:
+        """The commit review of cd77c14: waiting right after the signals let a
+        server that ignores SIGTERM spend the budget the stack action needed,
+        which then skipped without marking the run truncated."""
+        order: list[str] = []
+        saved = (sr.plan_tabs, sr.plan_stacks, sr.confirm_exits)
+        self.addCleanup(lambda: setattr(sr, "plan_tabs", saved[0]))
+        self.addCleanup(lambda: setattr(sr, "plan_stacks", saved[1]))
+        self.addCleanup(lambda: setattr(sr, "confirm_exits", saved[2]))
+        saved_env = os.environ.pop("SESSION_REAPER_ACTIONS", None)
+        if saved_env is not None:
+            self.addCleanup(lambda: os.environ.__setitem__("SESSION_REAPER_ACTIONS", saved_env))
+        sr.plan_tabs = lambda: (order.append("tabs"), ([], []))[1]
+        sr.plan_stacks = lambda *a, **k: (order.append("stacks"), ([], []))[1]
+        sr.confirm_exits = lambda pids: (order.append("confirm"), (set(), False))[1]
+        self._signal_wrangler_tree(lambda pids: set())
+        self.assertEqual(order, ["tabs", "stacks", "confirm"])
+
+    def _truncated_reap_over_two_trees(self, running, before=None) -> Path:
+        """Signal the first of two orphaned servers, run out of budget before
+        the second, answer the exit check with `running`; return the stamp."""
+        self.isolate_in_process()
+        a, b = self.add_worktree("first"), self.add_worktree("second")
+        procs = {
+            1: proc(0, "/sbin/launchd"),
+            300: proc(1, f"node {a}/node_modules/.bin/vite dev --port 5198"),
+            302: proc(300, "<defunct>", rss_kb=0),
+            301: proc(1, f"node {b}/node_modules/.bin/vite dev --port 5199"),
+        }
+        self.stub_processes(procs, {300: str(a), 301: str(b)})
+        killed: list[int] = []
+        saved = (sr.kill_pid, sr.past_deadline, sr.budget_left, sr.still_running)
+        sr.kill_pid = lambda pid: killed.append(pid) or True
+        # Out of time after one kill, and out of budget with it: that is what
+        # truncation means, and it is what clips the exit grace to zero. The
+        # review of e21607d found the first version of this helper ran out of
+        # time with the budget still full, so the grace was never cut short.
+        sr.past_deadline = lambda: bool(killed)
+        sr.budget_left = lambda: 0.0 if killed else 3600.0
+        # 302 is a zombie child of 300 in every variant: already exited.
+        before = before or (lambda pids: set(pids) - {302})
+        sr.still_running = phased(before, running)
+        try:
+            sr.cmd_reap({"cwd": str(self.root)})
+        finally:
+            (sr.kill_pid, sr.past_deadline, sr.budget_left,
+             sr.still_running) = saved
+        text = self.log.read_text(encoding="utf-8")
+        if running([300]):
+            self.assertIn("dev_server_not_yet_exited pid=300", text)
+        self.assertEqual(killed, [300])
+        self.assertIn("TRUNCATED", self.log.read_text(encoding="utf-8"))
+        return self.locks / sr.STAMP_FILENAME
+
+    def test_a_truncated_run_whose_servers_ignored_sigterm_still_stamps(self) -> None:
+        """Otherwise every later turn re-signals the same survivors."""
+        stamp = self._truncated_reap_over_two_trees(lambda pids: set(pids))
+        self.assertTrue(stamp.exists())
+
+    def test_a_truncated_run_that_freed_a_server_leaves_the_repo_unstamped(self) -> None:
+        stamp = self._truncated_reap_over_two_trees(lambda pids: set())
+        self.assertFalse(stamp.exists())
+
+    def test_a_zombie_from_an_earlier_pass_is_not_signalled_or_counted(self) -> None:
+        """The second pass over the 2026-09-25 tree: esbuild (22911) is
+        already <defunct> under the wrangler that ignored SIGTERM. Signalling
+        it succeeds and the exit check reads it as gone, so without the
+        pre-signal read it was a fresh "exit" on every pass."""
+        survivors = lambda pids: {22907, 22910, 22916} & set(pids)
+        text = self._signal_wrangler_tree(survivors, before=survivors)
+        self.assertNotIn("sigterm_dev_server_child pid=22911", text)
+        self.assertIn("dev_server_already_exited pid=22911 root=22907", text)
+        self.assertIn("dev_exited=0 dev_survived=3 dev_rss_freed=0MB", text)
+
+    def test_a_truncated_run_over_survivors_and_zombies_still_stamps(self) -> None:
+        """Zombies must not count as progress, or the loop comes back."""
+        stamp = self._truncated_reap_over_two_trees(
+            lambda pids: {300} & set(pids), before=lambda pids: {300, 301} & set(pids),
+        )
+        self.assertTrue(stamp.exists())
+        self.assertIn("dev_server_already_exited pid=302 root=300",
+                      self.log.read_text(encoding="utf-8"))
+
+    def test_a_grace_clipped_by_the_hook_budget_is_reported_as_cut_short(self) -> None:
+        """Near the hook deadline the grace clips toward zero."""
+        saved = (sr._DEADLINE_ON, sr.budget_left, sr.still_running,
+                 sr.DEV_EXIT_GRACE_SECONDS)
+        try:
+            sr._DEADLINE_ON = True
+            sr.budget_left = lambda: 1.1        # grace 0.1s, below the default
+            sr.DEV_EXIT_GRACE_SECONDS = 3.0
+            sr.still_running = lambda pids: {22916}
+            self.assertEqual(sr.confirm_exits([22916]), ({22916}, True))
+            sr.budget_left = lambda: 3600.0     # full grace available
+            sr.DEV_EXIT_GRACE_SECONDS = 0.3
+            self.assertEqual(sr.confirm_exits([22916]), ({22916}, False))
+        finally:
+            (sr._DEADLINE_ON, sr.budget_left, sr.still_running,
+             sr.DEV_EXIT_GRACE_SECONDS) = saved
+
+    def test_a_process_left_by_a_cut_short_grace_is_not_yet_exited(self) -> None:
+        """Still in teardown is not the same as survived SIGTERM."""
+        saved = sr.confirm_exits
+        self.addCleanup(lambda: setattr(sr, "confirm_exits", saved))
+        sr.confirm_exits = lambda pids: ({22916}, True)
+        text = self._signal_wrangler_tree(lambda pids: set())
+        self.assertIn("dev_server_not_yet_exited pid=22916 root=22907", text)
+        self.assertNotIn("dev_server_survived_sigterm", text)
+        self.assertIn("dev_exited=3 dev_survived=0 dev_not_yet_exited=1", text)
+
+    def test_an_exit_check_that_cannot_read_ps_frees_nothing(self) -> None:
+        text = self._signal_wrangler_tree(lambda pids: None)
+        self.assertIn("dev_server_exit_unverified pid=22916 root=22907", text)
+        self.assertIn("dev_exited=0 dev_survived=0 dev_unverified=4 dev_rss_freed=0MB", text)
 
     def test_a_failing_action_is_logged_and_never_fails_the_hook(self) -> None:
         self.isolate_in_process()
@@ -1159,7 +1420,7 @@ class CliTests(_RepoFixture):
             sr.plan_dev_servers = saved
         text = self.log.read_text(encoding="utf-8")
         self.assertIn("dev action failed: RuntimeError: synthetic", text)
-        self.assertIn("dev_servers=0", text)  # the summary line still lands
+        self.assertIn("dev_servers_signalled=0", text)  # the summary line still lands
 
     def test_an_open_stdin_that_never_closes_does_not_hang_the_hook(self) -> None:
         """The 56087f7 hang, from the other side: the reaper reads its payload

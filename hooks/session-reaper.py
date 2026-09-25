@@ -105,6 +105,11 @@ DEV_SERVER_IDLE_HOURS = float(
     os.environ.get("SESSION_REAPER_DEV_IDLE_HOURS", "1")
 )
 STACK_IDLE_HOURS = float(os.environ.get("SESSION_REAPER_STACK_IDLE_HOURS", "24"))
+# How long to wait after SIGTERM before reading who actually exited. Clipped to
+# the remaining budget in hook mode; see confirm_exits().
+DEV_EXIT_GRACE_SECONDS = float(
+    os.environ.get("SESSION_REAPER_DEV_EXIT_GRACE", "3")
+)
 THROTTLE_HOURS = float(os.environ.get("SESSION_REAPER_THROTTLE_HOURS", "6"))
 
 # Wall-clock budget. The binding constraint is the TIGHTEST harness timeout
@@ -979,6 +984,74 @@ def kill_pid(pid: int) -> bool:
         return False
 
 
+def still_running(pids: list[int]) -> set[int] | None:
+    """The subset of pids that are still running, or None if ps failed.
+
+    A zombie (`stat` starting with Z) counts as exited: the process is gone
+    and holds no memory; only its parent has not collected the exit status.
+    Measured 2026-09-25: after SIGTERM, esbuild and the small workerd went
+    <defunct> under a wrangler that ignored the signal itself.
+
+    Exit code alone cannot separate "all gone" from "ps failed", so stderr
+    decides. Observed on this machine 2026-09-25 with `ps -o pid=,stat= -p`:
+    every pid dead -> exit 1, empty stdout, EMPTY stderr; one dead and one
+    live -> exit 0, the live one printed; a bad pid or keyword -> exit 1 with
+    a message on stderr. Reading that last case as "nothing running" would
+    count every signalled process as freed, the overclaim this exists to stop.
+    """
+    if not pids:
+        return set()
+    try:
+        r = subprocess.run(
+            ["ps", "-o", "pid=,stat=", "-p", ",".join(str(p) for p in pids)],
+            capture_output=True, text=True,
+            stdin=subprocess.DEVNULL, timeout=clipped(PS_TIMEOUT),
+        )
+    except Exception:
+        return None
+    if r.returncode != 0 and r.stderr.strip():
+        return None
+    wanted = set(pids)
+    alive: set[int] = set()
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if pid in wanted and not parts[1].upper().startswith("Z"):
+            alive.add(pid)
+    return alive
+
+
+def confirm_exits(pids: list[int]) -> tuple[set[int] | None, bool]:
+    """Poll until every pid has exited or the grace runs out.
+
+    Returns (survivors, cut_short). cut_short is True when the hook budget
+    clipped the grace below DEV_EXIT_GRACE_SECONDS: a process still running
+    then may simply be mid-teardown, so the caller labels it "not yet
+    exited" rather than "survived SIGTERM".
+
+    None means "could not tell" (ps failed), which is reported as unverified,
+    never as freed. SIGTERM delivered is not a process gone: on 2026-09-25 a
+    reap-now logged `killed_dev_server` and `dev_rss_freed=1204MB` for a
+    wrangler tree whose root, node child and 1 GB workerd all ignored the
+    signal and were still running hours later.
+    """
+    grace = DEV_EXIT_GRACE_SECONDS
+    if _DEADLINE_ON:
+        grace = max(0.0, min(grace, budget_left() - 1.0))
+    cut_short = grace < DEV_EXIT_GRACE_SECONDS
+    end = time.time() + grace
+    while True:
+        alive = still_running(pids)
+        if alive is None or not alive or time.time() >= end:
+            return alive, cut_short
+        time.sleep(0.2)
+
+
 # --- action 2: dead-host tabs in the agent browser ----------------------------
 
 def cdp_get(path: str) -> object | None:
@@ -1373,6 +1446,8 @@ def cmd_reap(payload: dict, now: bool = False) -> None:
 
     actions = selected_actions()
     n_dev = n_dev_children = dev_kb = n_tabs = n_stacks = n_containers = 0
+    n_exited = n_survived = n_unverified = n_pending = 0
+    signalled: list[dict] = []  # {pid, rss_kb, root, command}
     truncated = False
 
     if "dev" in actions and not past_deadline():
@@ -1388,6 +1463,21 @@ def cmd_reap(payload: dict, now: bool = False) -> None:
         if kill and not live_ok_now:
             log(f"repo={cwd} session locks became unreadable before killing; skipping")
             kill = []
+        # Read who is actually alive before signalling. A zombie (or a pid
+        # already gone) is still in the ps snapshot, so it is still in the
+        # planned tree, and os.kill on a zombie succeeds. Measured 2026-09-25:
+        # esbuild and a workerd sat <defunct> under a wrangler that ignored
+        # SIGTERM, and each later pass would have "exited" them again, counted
+        # that as progress, and skipped the throttle stamp (commit review of
+        # 66cf530). None (ps unreadable) signals everything, as before.
+        alive_before = still_running(
+            [r["pid"] for r in kill]
+            + [sub["pid"] for r in kill for sub in r.get("tree", ())]
+        ) if kill else set()
+
+        def already_gone(pid: int) -> bool:
+            return alive_before is not None and pid not in alive_before
+
         for row in kill:
             if past_deadline():
                 truncated = True
@@ -1398,11 +1488,14 @@ def cmd_reap(payload: dict, now: bool = False) -> None:
                     f"worktree={row['worktree']}"
                 )
                 continue
-            if kill_pid(row["pid"]):
+            if already_gone(row["pid"]):
+                log(f"dev_server_already_exited pid={row['pid']} cmd={row['command']}")
+            elif kill_pid(row["pid"]):
                 n_dev += 1
-                dev_kb += row["rss_kb"]
+                signalled.append({"pid": row["pid"], "rss_kb": row["rss_kb"],
+                                  "root": None, "command": row["command"]})
                 log(
-                    f"killed_dev_server pid={row['pid']} "
+                    f"sigterm_dev_server pid={row['pid']} "
                     f"age={fmt_hours(row['age_s'])} rss={row['rss_kb'] // 1024}MB "
                     f"worktree={row['worktree']} cmd={row['command']}"
                 )
@@ -1413,11 +1506,17 @@ def cmd_reap(payload: dict, now: bool = False) -> None:
             # and a root whose teardown is racing this loop makes the second
             # signal a no-op. Root first, then parents before children.
             for sub in row.get("tree", ()):
-                if kill_pid(sub["pid"]):
-                    n_dev_children += 1
-                    dev_kb += sub["rss_kb"]
+                if already_gone(sub["pid"]):
                     log(
-                        f"killed_dev_server_child pid={sub['pid']} "
+                        f"dev_server_already_exited pid={sub['pid']} "
+                        f"root={row['pid']} cmd={sub['command']}"
+                    )
+                elif kill_pid(sub["pid"]):
+                    n_dev_children += 1
+                    signalled.append({"pid": sub["pid"], "rss_kb": sub["rss_kb"],
+                                      "root": row["pid"], "command": sub["command"]})
+                    log(
+                        f"sigterm_dev_server_child pid={sub['pid']} "
                         f"root={row['pid']} rss={sub['rss_kb'] // 1024}MB "
                         f"cmd={sub['command']}"
                     )
@@ -1473,17 +1572,60 @@ def cmd_reap(payload: dict, now: bool = False) -> None:
             else:
                 log(f"stop_stack_failed project={row['project']}")
 
+    # Only a process that is gone counts as freed. The reaper never
+    # escalates past SIGTERM, so a survivor is named for the operator.
+    # This runs LAST, after tabs and stacks, so its wait spends only budget
+    # they left: placed right after the signals, a server ignoring SIGTERM
+    # held the full grace and could push the stack action past its
+    # deadline, where it is skipped without marking the run truncated and
+    # the repo is stamped for THROTTLE_HOURS (commit review of cd77c14).
+    # Signalled servers also get the tabs and stacks time to exit.
+    if signalled:
+        survivors, cut_short = confirm_exits([s["pid"] for s in signalled])
+        for s in signalled:
+            root = f" root={s['root']}" if s["root"] is not None else ""
+            rss = f"rss={s['rss_kb'] // 1024}MB"
+            if survivors is None:
+                n_unverified += 1
+                log(f"dev_server_exit_unverified pid={s['pid']}{root} {rss}")
+            elif s["pid"] in survivors and cut_short:
+                n_pending += 1
+                log(
+                    f"dev_server_not_yet_exited pid={s['pid']}{root} {rss} "
+                    f"(grace cut short by the hook budget)"
+                )
+            elif s["pid"] in survivors:
+                n_survived += 1
+                log(
+                    f"dev_server_survived_sigterm pid={s['pid']}{root} {rss} "
+                    f"cmd={s['command']}"
+                )
+            else:
+                n_exited += 1
+                dev_kb += s["rss_kb"]
+                log(f"dev_server_exited pid={s['pid']}{root} {rss}")
+
     # Stamp unless a retry could genuinely do better. worktree-reaper.py's rule:
     # the test is PROGRESS, not truncation — a truncated run that freed nothing
     # would recompute the same thing next turn and, under Codex's per-turn Stop,
     # forever.
-    progressed = n_dev or n_tabs or n_stacks
+    # Confirmed exits, not signals: a server that ignores SIGTERM is not
+    # progress, and counting it skipped the stamp on a truncated run, so
+    # every later Codex turn re-signalled the same survivors on its whole
+    # budget (commit review of f2db075). n_pending is excluded too: a
+    # truncated run has no budget left, so its grace is always cut short
+    # and every survivor lands there (review of e21607d). A slow teardown
+    # that does finish is picked up by the next pass after the throttle.
+    progressed = n_exited or n_tabs or n_stacks
     if not (truncated and progressed):
         touch_stamp(cd)
     log(
         f"repo={cwd} {'reap-now ' if now else ''}"
-        f"dev_servers={n_dev} dev_server_children={n_dev_children} "
-        f"dev_rss_freed={dev_kb // 1024}MB "
+        f"dev_servers_signalled={n_dev} dev_children_signalled={n_dev_children} "
+        f"dev_exited={n_exited} dev_survived={n_survived} "
+        + (f"dev_unverified={n_unverified} " if n_unverified else "")
+        + (f"dev_not_yet_exited={n_pending} " if n_pending else "")
+        + f"dev_rss_freed={dev_kb // 1024}MB "
         f"tabs_closed={n_tabs} stacks_stopped={n_stacks} "
         f"containers_stopped={n_containers} "
         f"elapsed={time.time() - _STARTED_AT:.1f}s"
