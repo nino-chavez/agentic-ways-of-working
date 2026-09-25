@@ -1892,7 +1892,7 @@ def cmd_report(cwd: str) -> None:
         stop, keep = plan_stacks(cwd, cd)
         sweep_stop, _sweep_keep = plan_stacks(cwd, cd, sweep=True)
         extra = [r for r in sweep_stop if r["project"] not in {s["project"] for s in stop}]
-        print(f"[3] supabase stacks to `docker stop` ({len(stop)}):")
+        print(f"[3] supabase stacks to stop, database last by its own signal ({len(stop)}):")
         for row in stop:
             print(
                 f"  {row['project']}  up {fmt_hours(row['uptime_s'])}, "
