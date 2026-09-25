@@ -837,15 +837,205 @@ class StackPlanTests(_RepoFixture):
         self.assertCountEqual(by_project["rally-hq"], self._stack("rally-hq"))
         self.assertCountEqual(by_project["hq"], self._stack("hq"))
 
-    def test_stop_uses_docker_stop_with_a_short_grace_and_never_rm(self) -> None:
-        record: list = []
-        self.stub_docker([], {}, record=record)
-        self.assertTrue(sr.stop_stack(["supabase_db_x", "supabase_kong_x"]))
-        self.assertEqual(record[0][0], "stop")
-        self.assertIn("-t", record[0])
-        self.assertNotIn("rm", record[0])
-        self.assertNotIn("-v", record[0])
-        self.assertIn("supabase_kong_x", record[0])
+
+
+class FakeDocker:
+    """A docker_status stand-in holding real container state.
+
+    db_polls_to_exit: how many state reads after its stop signal before the
+    database reads as exited (None = it never exits). stop_times_out: the
+    `docker stop` call times out (the daemon stalled) but, as on 2026-09-25,
+    the services it named did stop. inspect_fails: every state read times out.
+    """
+
+    def __init__(self, names, db_polls_to_exit=0, stop_times_out=False,
+                 inspect_fails=False, stop_signal="SIGINT"):
+        self.running = {n: True for n in names}
+        self.calls: list[list[str]] = []
+        self.db_polls_to_exit = db_polls_to_exit
+        self.db_signalled = False
+        self.stop_times_out = stop_times_out
+        self.inspect_fails = inspect_fails
+        self.stop_signal = stop_signal
+
+    def __call__(self, args, timeout, clip=True):
+        self.calls.append(list(args))
+        if args[0] == "stop":
+            for n in args[3:]:
+                self.running[n] = False
+            return ("timeout", "") if self.stop_times_out else ("ok", "\n".join(args[3:]))
+        if args[0] == "kill":
+            self.db_signalled = True
+            return "ok", args[-1]
+        if args[0] == "inspect":
+            if self.inspect_fails:
+                return "timeout", ""
+            if self.db_signalled and self.db_polls_to_exit is not None:
+                if self.db_polls_to_exit <= 0:
+                    for n in self.running:
+                        if n.startswith(sr.DB_CONTAINER_PREFIX):
+                            self.running[n] = False
+                self.db_polls_to_exit -= 1
+            out = []
+            for n in args[3:]:
+                if n in self.running:
+                    sig = self.stop_signal if n.startswith(sr.DB_CONTAINER_PREFIX) else ""
+                    out.append(f"/{n}|{str(self.running[n]).lower()}|{sig}")
+            return "ok", "\n".join(out)
+        return "error", ""
+
+
+class StackStopTests(unittest.TestCase):
+    STACK = ["supabase_db_x", "supabase_kong_x", "supabase_analytics_x"]
+
+    def setUp(self) -> None:
+        saved = (sr.docker_status, sr.DB_STOP_WAIT_SECONDS, sr._DEADLINE_ON)
+        self.addCleanup(lambda: setattr(sr, "docker_status", saved[0]))
+        self.addCleanup(lambda: setattr(sr, "DB_STOP_WAIT_SECONDS", saved[1]))
+        self.addCleanup(lambda: setattr(sr, "_DEADLINE_ON", saved[2]))
+        sr.DB_STOP_WAIT_SECONDS = 2.0
+        sr._DEADLINE_ON = False
+
+    def stop(self, fake: FakeDocker) -> dict:
+        sr.docker_status = fake
+        return sr.stop_stack(list(self.STACK))
+
+    def test_the_database_is_never_in_docker_stop_and_never_force_killed(self) -> None:
+        """2026-09-25: `docker stop -t 3` force-killed Postgres and stalled
+        Docker Desktop for two minutes."""
+        fake = FakeDocker(self.STACK)
+        res = self.stop(fake)
+        stops = [c for c in fake.calls if c[0] == "stop"]
+        kills = [c for c in fake.calls if c[0] == "kill"]
+        self.assertEqual(len(stops), 1)
+        self.assertNotIn("supabase_db_x", stops[0])
+        self.assertEqual(kills, [["kill", "--signal", "SIGINT", "supabase_db_x"]])
+        self.assertFalse(any("SIGKILL" in c or "KILL" in c for c in fake.calls))
+        self.assertFalse(any(c[0] in ("rm", "volume") or "-v" in c for c in fake.calls))
+        self.assertEqual(res["running"], [])
+        self.assertCountEqual(res["stopped"], self.STACK)
+
+    def test_the_database_goes_last_after_its_clients(self) -> None:
+        fake = FakeDocker(self.STACK)
+        self.stop(fake)
+        verbs = [c[0] for c in fake.calls]
+        self.assertLess(verbs.index("stop"), verbs.index("kill"))
+
+    def test_the_databases_own_stop_signal_is_used(self) -> None:
+        fake = FakeDocker(self.STACK, stop_signal="SIGQUIT")
+        self.stop(fake)
+        self.assertIn(["kill", "--signal", "SIGQUIT", "supabase_db_x"], fake.calls)
+
+    def test_a_slow_database_shutdown_is_waited_for(self) -> None:
+        res = self.stop(FakeDocker(self.STACK, db_polls_to_exit=2))
+        self.assertEqual(res["running"], [])
+
+    def test_a_database_that_does_not_exit_is_reported_not_escalated(self) -> None:
+        sr.DB_STOP_WAIT_SECONDS = 0.6
+        fake = FakeDocker(self.STACK, db_polls_to_exit=None)
+        res = self.stop(fake)
+        self.assertEqual(res["running"], ["supabase_db_x"])
+        self.assertCountEqual(res["stopped"], ["supabase_kong_x", "supabase_analytics_x"])
+        self.assertEqual(sum(1 for c in fake.calls if c[0] == "kill"), 1)
+        self.assertFalse(any(c[0] == "stop" and "supabase_db_x" in c for c in fake.calls))
+
+    def test_a_timed_out_stop_marks_docker_stalled_and_leaves_the_database_alone(self) -> None:
+        fake = FakeDocker(self.STACK, stop_times_out=True)
+        res = self.stop(fake)
+        self.assertTrue(res["stalled"])
+        self.assertTrue(res["unverified"])
+        self.assertFalse(any(c[0] == "kill" for c in fake.calls))
+
+    def test_unreadable_state_claims_only_what_the_stop_call_confirmed(self) -> None:
+        """The services' `docker stop` exited 0, which confirms them; the
+        database's state could not be read, so it is not claimed."""
+        res = self.stop(FakeDocker(self.STACK, inspect_fails=True))
+        self.assertTrue(res["unverified"])
+        self.assertCountEqual(res["stopped"], ["supabase_kong_x", "supabase_analytics_x"])
+        self.assertEqual(res["running"], ["supabase_db_x"])
+
+    def test_a_state_read_that_times_out_after_the_signal_is_a_stall(self) -> None:
+        """Review of b9e9aaf: services stop, the database is signalled, then
+        the daemon stalls in cleanup and the next inspect times out."""
+        fake = FakeDocker(self.STACK)
+
+        def stall_after_kill(args, timeout, clip=True):
+            if args[0] == "inspect" and fake.db_signalled:
+                return "timeout", ""
+            return fake(args, timeout, clip)
+
+        sr.docker_status = stall_after_kill
+        res = sr.stop_stack(list(self.STACK))
+        self.assertTrue(res["stalled"])
+        self.assertTrue(res["unverified"])
+
+    def test_a_timeout_on_a_budget_shrunk_window_is_budget_not_a_stall(self) -> None:
+        """Review of b9e9aaf: a 1s inspect was being logged as docker
+        unresponsive. Only a call that had its full window can say that."""
+        sr._DEADLINE_ON = True
+        saved = sr.budget_left
+        self.addCleanup(lambda: setattr(sr, "budget_left", saved))
+        sr.budget_left = lambda: 4.0          # inspect window 4s, cap 10s
+        fake = FakeDocker(self.STACK)
+
+        def slow_inspect(args, timeout, clip=True):
+            if args[0] == "inspect":
+                return "timeout", ""
+            return fake(args, timeout, clip)
+
+        sr.docker_status = slow_inspect
+        res = sr.stop_stack(list(self.STACK))
+        self.assertFalse(res["stalled"])
+        self.assertTrue(res["budget"])
+        self.assertFalse(any(c[0] == "kill" for c in fake.calls))
+
+    def test_services_stopped_before_the_budget_ran_out_still_count(self) -> None:
+        """Review of d362a9e: the services' stop succeeded, then the budget
+        ran out before the database; that progress must survive the return."""
+        fake = FakeDocker(self.STACK)
+        sr.docker_status = fake
+        saved = sr.docker_bounded
+        self.addCleanup(lambda: setattr(sr, "docker_bounded", saved))
+        sr.docker_bounded = lambda args, cap: ("budget", "")
+        res = sr.stop_stack(list(self.STACK))
+        self.assertTrue(res["budget"])
+        self.assertCountEqual(res["stopped"], ["supabase_kong_x", "supabase_analytics_x"])
+        self.assertEqual(res["running"], ["supabase_db_x"])
+
+    def test_a_database_still_shutting_down_at_the_budget_is_incomplete(self) -> None:
+        """Review of d48558c: with a budget that really shrinks, the last
+        state read must still fit, so a slow database reads as still
+        running rather than as the budget running out."""
+        sr._DEADLINE_ON = True
+        saved = sr.budget_left
+        self.addCleanup(lambda: setattr(sr, "budget_left", saved))
+        deadline = time.time() + 3.6            # wait clipped to about 1.6s
+        sr.budget_left = lambda: deadline - time.time()
+        res = self.stop(FakeDocker(self.STACK, db_polls_to_exit=None))
+        self.assertFalse(res["budget"])
+        self.assertFalse(res["unverified"])
+        self.assertEqual(res["running"], ["supabase_db_x"])
+
+    def test_too_little_budget_is_not_even_attempted(self) -> None:
+        sr._DEADLINE_ON = True
+        saved = sr.budget_left
+        self.addCleanup(lambda: setattr(sr, "budget_left", saved))
+        sr.budget_left = lambda: 1.0
+        fake = FakeDocker(self.STACK)
+        res = self.stop(fake)
+        self.assertTrue(res["budget"])
+        self.assertFalse(any(c[0] in ("inspect", "kill") for c in fake.calls))
+
+    def test_the_hook_budget_clips_the_database_wait(self) -> None:
+        sr._DEADLINE_ON = True
+        sr.DB_STOP_WAIT_SECONDS = 30.0
+        saved = sr.budget_left
+        self.addCleanup(lambda: setattr(sr, "budget_left", saved))
+        sr.budget_left = lambda: 3.0          # wait clipped to 1s
+        started = time.time()
+        res = self.stop(FakeDocker(self.STACK, db_polls_to_exit=None))
+        self.assertLess(time.time() - started, 5.0)
+        self.assertEqual(res["running"], ["supabase_db_x"])
 
 
 # --- CDP tabs ----------------------------------------------------------------
@@ -1176,6 +1366,11 @@ class CliTests(_RepoFixture):
         saved_started = sr._STARTED_AT
         self.addCleanup(lambda: setattr(sr, "_STARTED_AT", saved_started))
         sr._STARTED_AT = time.time()
+        # cmd_reap(now=True) switches the budget off module-wide and nothing
+        # switches it back; left alone it leaks into every later test.
+        saved_deadline_on = sr._DEADLINE_ON
+        self.addCleanup(lambda: setattr(sr, "_DEADLINE_ON", saved_deadline_on))
+        sr._DEADLINE_ON = True
 
     def test_a_session_that_starts_while_planning_saves_its_dev_server(self) -> None:
         """The plan->kill gap is the wide window, so the lock set is re-read.
@@ -1373,6 +1568,89 @@ class CliTests(_RepoFixture):
         self.assertTrue(stamp.exists())
         self.assertIn("dev_server_already_exited pid=302 root=300",
                       self.log.read_text(encoding="utf-8"))
+
+    def _reap_stacks(self, fakes_by_project: dict, hook_mode: bool = False) -> str:
+        """In-process reap over planned stacks, docker faked per project."""
+        self.isolate_in_process()
+        rows = [
+            {"project": p, "containers": list(f.running), "uptime_s": 40 * 3600.0}
+            for p, f in fakes_by_project.items()
+        ]
+        saved = (sr.plan_stacks, sr.docker_status, sr.DB_STOP_WAIT_SECONDS)
+        self.addCleanup(lambda: setattr(sr, "plan_stacks", saved[0]))
+        self.addCleanup(lambda: setattr(sr, "docker_status", saved[1]))
+        self.addCleanup(lambda: setattr(sr, "DB_STOP_WAIT_SECONDS", saved[2]))
+        sr.plan_stacks = lambda *a, **k: (rows, [])
+        sr.DB_STOP_WAIT_SECONDS = 0.6
+
+        def route(args, timeout, clip=True):
+            for f in fakes_by_project.values():
+                if any(a in f.running for a in args):
+                    return f(args, timeout, clip)
+            return "error", ""
+
+        sr.docker_status = route
+        # Stacks only. Leaving every action on ran the real dev-server scan
+        # (ps + lsof over this machine), which under load spent the whole hook
+        # budget and skipped the stack action this helper exists to test.
+        saved_env = os.environ.get("SESSION_REAPER_ACTIONS")
+        self.addCleanup(
+            lambda: os.environ.pop("SESSION_REAPER_ACTIONS", None) if saved_env is None
+            else os.environ.__setitem__("SESSION_REAPER_ACTIONS", saved_env)
+        )
+        os.environ["SESSION_REAPER_ACTIONS"] = "stacks"
+        sr.cmd_reap({"cwd": str(self.root)}, now=not hook_mode)
+        return self.log.read_text(encoding="utf-8")
+
+    def _reap_stacks_hook_mode(self, fakes_by_project: dict) -> str:
+        return self._reap_stacks(fakes_by_project, hook_mode=True)
+
+    def test_a_stack_that_stops_is_logged_stopped(self) -> None:
+        text = self._reap_stacks({"a": FakeDocker(["supabase_db_a", "supabase_kong_a"])})
+        self.assertIn("stopped_stack project=a containers=2", text)
+        self.assertIn("stacks_stopped=1 containers_stopped=2", text)
+
+    def test_a_database_still_shutting_down_is_incomplete_not_failed(self) -> None:
+        text = self._reap_stacks(
+            {"a": FakeDocker(["supabase_db_a", "supabase_kong_a"], db_polls_to_exit=None)}
+        )
+        self.assertIn("stop_stack_incomplete project=a stopped=1 still_running=supabase_db_a", text)
+        self.assertIn("stacks_stopped=0 containers_stopped=1", text)
+        self.assertNotIn("stop_stack_failed", text)
+
+    def test_running_out_of_budget_is_logged_as_that_not_as_docker(self) -> None:
+        first = FakeDocker(["supabase_db_a", "supabase_kong_a"])
+        second = FakeDocker(["supabase_db_b", "supabase_kong_b"])
+        saved = sr.docker_bounded
+        self.addCleanup(lambda: setattr(sr, "docker_bounded", saved))
+        sr.docker_bounded = lambda args, cap: ("budget", "")
+        text = self._reap_stacks({"a": first, "b": second})
+        self.assertIn("stop_stack_unfinished project=a (hook budget ran out", text)
+        self.assertNotIn("docker_unresponsive", text)
+        self.assertEqual(second.calls, [])
+
+    def test_a_budget_cut_pass_that_stopped_services_is_not_stamped(self) -> None:
+        """So the next hook turn finishes the database, not one 6h later."""
+        saved = sr.docker_bounded
+        self.addCleanup(lambda: setattr(sr, "docker_bounded", saved))
+        sr.docker_bounded = lambda args, cap: ("budget", "")
+        text = self._reap_stacks_hook_mode(
+            {"a": FakeDocker(["supabase_db_a", "supabase_kong_a", "supabase_rest_a"])}
+        )
+        self.assertIn("stop_stack_unfinished project=a", text)
+        self.assertIn("containers_stopped=2", text)
+        self.assertIn("TRUNCATED", text)
+        self.assertFalse((self.locks / sr.STAMP_FILENAME).exists())
+
+    def test_a_stalled_daemon_skips_the_remaining_stacks(self) -> None:
+        """The second project's stop never reached the daemon on 2026-09-25;
+        queueing behind a stall only adds a timeout per stack."""
+        first = FakeDocker(["supabase_db_a", "supabase_kong_a"], stop_times_out=True)
+        second = FakeDocker(["supabase_db_b", "supabase_kong_b"])
+        text = self._reap_stacks({"a": first, "b": second})
+        self.assertIn("stop_stack_unverified project=a", text)
+        self.assertIn("docker_unresponsive project=a; skipping the remaining stacks", text)
+        self.assertEqual(second.calls, [])
 
     def test_a_grace_clipped_by_the_hook_budget_is_reported_as_cut_short(self) -> None:
         """Near the hook deadline the grace clips toward zero."""

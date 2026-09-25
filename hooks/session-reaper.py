@@ -36,8 +36,10 @@ Three independent actions, each separately gated and separately dry-runnable:
      is not listening. Over CDP, one target at a time. The browser process is
      never signalled and the profile directory is never touched (that profile
      holds Nino's logins, and browse-profile-guard.py protects it).
-  3. supabase stacks — `docker stop` every container of a local stack whose
-     project id no live session claims, running longer than STACK_IDLE_HOURS.
+  3. supabase stacks — stop every container of a local stack whose project
+     id no live session claims, running longer than STACK_IDLE_HOURS. The
+     database last, by its own stop signal and never force-killed; success
+     read from container state, not from docker's exit (see stop_stack()).
      Never `docker rm`, never a volume, never `supabase stop --no-backup`.
 
 WHY BOTH LIVENESS GATES ON ACTION 1, which is a correction to the brief this
@@ -136,6 +138,10 @@ LSOF_TIMEOUT = 10
 DOCKER_TIMEOUT = 10
 DOCKER_STOP_TIMEOUT = 10
 DOCKER_STOP_GRACE = int(os.environ.get("SESSION_REAPER_DOCKER_STOP_GRACE", "3"))
+# How long to wait for a stack's database to exit on its own stop signal.
+# Never followed by a forced kill; clipped to the budget in hook mode, where
+# a database still shutting down is reported and verified on a later pass.
+DB_STOP_WAIT_SECONDS = float(os.environ.get("SESSION_REAPER_DB_STOP_WAIT", "30"))
 CDP_TIMEOUT = float(os.environ.get("SESSION_REAPER_CDP_TIMEOUT", "3"))
 PORT_PROBE_TIMEOUT = float(os.environ.get("SESSION_REAPER_PORT_TIMEOUT", "0.4"))
 # The stdin payload is the one blocking read clipped() does not cover, because
@@ -1186,7 +1192,10 @@ def close_tab(target_id: str) -> bool:
 
 # --- action 3: idle local supabase stacks -------------------------------------
 
-def docker(args: list[str], timeout: float, clip: bool = True) -> str | None:
+def docker_status(args: list[str], timeout: float, clip: bool = True) -> tuple[str, str]:
+    """("ok" | "error" | "timeout", stdout). A timeout is kept apart from an
+    error because it means the daemon did not answer, which is a reason to
+    stop asking it things this pass (see stop_stack())."""
     try:
         r = subprocess.run(
             ["docker", *args],
@@ -1194,9 +1203,16 @@ def docker(args: list[str], timeout: float, clip: bool = True) -> str | None:
             stdin=subprocess.DEVNULL,
             timeout=clipped(timeout) if clip else timeout,
         )
+    except subprocess.TimeoutExpired:
+        return "timeout", ""
     except Exception:
-        return None
-    return r.stdout if r.returncode == 0 else None
+        return "error", ""
+    return ("ok" if r.returncode == 0 else "error"), r.stdout
+
+
+def docker(args: list[str], timeout: float, clip: bool = True) -> str | None:
+    status, out = docker_status(args, timeout, clip)
+    return out if status == "ok" else None
 
 
 def project_id_of(worktree: str) -> str | None:
@@ -1373,20 +1389,145 @@ def plan_stacks(cwd: str, cd: str, sweep: bool = False) -> tuple[list[dict], lis
     return stop, keep
 
 
-def stop_stack(containers: list[str]) -> bool:
-    """`docker stop` every container of one project in ONE call.
+# Below this much time left, a docker call is not attempted: its answer could
+# not be told apart from the daemon being slow.
+MIN_DOCKER_WINDOW = 2.0
 
-    Never `docker rm`, never a volume, never `supabase stop`. Volumes and their
-    data survive; `supabase start` brings the stack back with its database
-    intact. `-t` because the default SIGTERM grace is 10s per container and a
-    supabase project has about nine of them, which alone would outlive the hook
-    budget. Not clipped — the caller gates on having the whole cap.
+
+def docker_bounded(args: list[str], cap: float) -> tuple[str, str]:
+    """docker_status() that keeps the reaper's own budget out of its verdicts.
+
+    "ok" | "error" | "timeout" | "budget". "timeout" means the call had its
+    FULL cap and docker still did not answer: the daemon is stalled. A call
+    whose window the hook budget had already shrunk, and that then timed out,
+    is "budget" — the reaper ran short, not docker (commit review of b9e9aaf:
+    a 1s inspect on a loaded Docker Desktop was being logged as a stall).
     """
-    out = docker(
-        ["stop", "-t", str(DOCKER_STOP_GRACE), *containers],
-        DOCKER_STOP_TIMEOUT, clip=False,
+    window = cap if not _DEADLINE_ON else min(cap, budget_left())
+    if window < MIN_DOCKER_WINDOW:
+        return "budget", ""
+    status, out = docker_status(args, window, clip=False)
+    if status == "timeout" and window < cap:
+        return "budget", ""
+    return status, out
+
+
+def container_states(names: list[str]) -> tuple[str, dict[str, tuple[bool, str]] | None]:
+    """(status, name -> (running, configured stop signal)).
+
+    status is docker_bounded()'s; the mapping is None unless it is "ok" or an
+    "error" that still printed something. A name docker reports as missing no
+    longer exists, so it reads as not running.
+    """
+    status, out = docker_bounded(
+        ["inspect", "-f", "{{.Name}}|{{.State.Running}}|{{.Config.StopSignal}}", *names],
+        DOCKER_TIMEOUT,
     )
-    return out is not None
+    if status in ("timeout", "budget") or (status == "error" and not out.strip()):
+        return status, None
+    states: dict[str, tuple[bool, str]] = {}
+    for line in out.splitlines():
+        parts = line.strip().lstrip("/").split("|")
+        if len(parts) >= 2:
+            states[parts[0]] = (parts[1] == "true", parts[2] if len(parts) > 2 else "")
+    return "ok", {n: states.get(n, (False, "")) for n in names}
+
+
+def stop_stack(containers: list[str]) -> dict:
+    """Stop one project's containers; report what is ACTUALLY stopped.
+
+    Returns {"stopped": [...], "running": [...], "unverified": bool,
+    "stalled": bool, "budget": bool}. Never `docker rm`, never a volume, never
+    `supabase stop`; volumes and data survive and `supabase start` brings it
+    back.
+
+    Why the database is handled apart, measured 2026-09-25 (reap-now from
+    volley-watch, Docker Desktop's own logs): all of rally-bloom-journey went
+    in one `docker stop -t 3`. Five services exited in about a second; Postgres
+    did not finish its SIGINT shutdown in 3s and was force-killed. containerd
+    then failed to clean up after it ("failed to clean up after shim
+    disconnected: signal: killed"), and the daemon stalled for about two
+    minutes — health checks timing out, internal calls missing deadlines,
+    none of it in the 15 minutes before or after. The call outlived its 10s
+    cap, so a stack that HAD stopped was logged `stop_stack_failed`, and the
+    next project's stop (rally-hq) never reached the daemon at all.
+
+    So:
+      1. Every non-database service in one `docker stop -t DOCKER_STOP_GRACE`,
+         first, so the database's clients are gone before it shuts down.
+      2. The database gets its OWN configured stop signal via `docker kill -s`
+         — what `docker stop` sends first — and is left to exit. It is never
+         force-killed. Checked on this machine: a container signalled with its
+         stop signal under `--restart unless-stopped` stays exited.
+      3. Success is read back from container state. The exit code of a call
+         that timed out says nothing about what the daemon did.
+      4. Any call that times out with its full window marks the daemon
+         "stalled" — the stop, the kill, or a later state read — and the
+         caller stops asking it for this pass. A call cut short by the hook
+         budget marks "budget" instead (docker_bounded()).
+    """
+    db = [c for c in containers if c.startswith(DB_CONTAINER_PREFIX)]
+    rest = [c for c in containers if c not in db]
+
+    # What is already known stopped survives an early return. A `docker stop`
+    # that exits 0 stopped every container it named; dropping that on a later
+    # budget or stall return made a pass that stopped every service count as
+    # no progress, stamp the repo, and leave the database running alone for
+    # THROTTLE_HOURS (commit review of d362a9e).
+    known_stopped: list[str] = []
+
+    def unfinished(status: str) -> dict:
+        return {"stopped": list(known_stopped),
+                "running": [c for c in containers if c not in known_stopped],
+                "unverified": True,
+                "stalled": status == "timeout", "budget": status == "budget"}
+
+    if rest:
+        # Full cap, not clipped: the caller gates on having it in hand.
+        status, _ = docker_status(
+            ["stop", "-t", str(DOCKER_STOP_GRACE), *rest],
+            DOCKER_STOP_TIMEOUT, clip=False,
+        )
+        if status == "timeout":
+            return unfinished("timeout")
+        if status == "ok":
+            known_stopped = list(rest)
+    signalled_db = False
+    if db:
+        status, states = container_states(db)
+        if states is None:
+            if status in ("timeout", "budget"):
+                return unfinished(status)
+        else:
+            for name in db:
+                running, stop_signal = states[name]
+                if not running:
+                    continue
+                status, _ = docker_bounded(
+                    ["kill", "--signal", stop_signal or "SIGTERM", name], DOCKER_TIMEOUT,
+                )
+                if status in ("timeout", "budget"):
+                    return unfinished(status)
+                signalled_db = True
+    wait = DB_STOP_WAIT_SECONDS if signalled_db else 0.0
+    if _DEADLINE_ON:
+        wait = max(0.0, min(wait, budget_left() - MIN_DOCKER_WINDOW))
+    end = time.time() + wait
+    poll = 0.5
+    while True:
+        status, states = container_states(containers)
+        if states is None:
+            return unfinished(status)
+        running = [n for n in containers if states[n][0]]
+        # Decide BEFORE sleeping. Checking after the sleep put the last read
+        # past `end`, inside the window reserved for it, where docker_bounded()
+        # refuses it as "budget" — so a database still shutting down was
+        # logged as the budget running out (commit review of d48558c).
+        if not running or time.time() + poll >= end:
+            return {"stopped": [n for n in containers if n not in running],
+                    "running": running, "unverified": False,
+                    "stalled": False, "budget": False}
+        time.sleep(poll)
 
 
 # --- modes -------------------------------------------------------------------
@@ -1560,9 +1701,22 @@ def cmd_reap(payload: dict, now: bool = False) -> None:
             if budget_left() < DOCKER_STOP_TIMEOUT:
                 truncated = True
                 break
-            if stop_stack(row["containers"]):
+            res = stop_stack(row["containers"])
+            n_containers += len(res["stopped"])
+            if res["budget"]:
+                log(
+                    f"stop_stack_unfinished project={row['project']} "
+                    f"(hook budget ran out; the next pass continues)"
+                )
+                truncated = True
+                break
+            if res["unverified"]:
+                log(
+                    f"stop_stack_unverified project={row['project']} "
+                    f"(docker did not answer; state unknown)"
+                )
+            elif not res["running"]:
                 n_stacks += 1
-                n_containers += len(row["containers"])
                 log(
                     f"stopped_stack project={row['project']} "
                     f"containers={len(row['containers'])} "
@@ -1570,7 +1724,18 @@ def cmd_reap(payload: dict, now: bool = False) -> None:
                     f"names={','.join(row['containers'])}"
                 )
             else:
-                log(f"stop_stack_failed project={row['project']}")
+                log(
+                    f"stop_stack_incomplete project={row['project']} "
+                    f"stopped={len(res['stopped'])} "
+                    f"still_running={','.join(res['running'])}"
+                )
+            if res["stalled"]:
+                log(
+                    f"docker_unresponsive project={row['project']}; "
+                    f"skipping the remaining stacks this pass"
+                )
+                truncated = True
+                break
 
     # Only a process that is gone counts as freed. The reaper never
     # escalates past SIGTERM, so a survivor is named for the operator.
@@ -1616,7 +1781,9 @@ def cmd_reap(payload: dict, now: bool = False) -> None:
     # truncated run has no budget left, so its grace is always cut short
     # and every survivor lands there (review of e21607d). A slow teardown
     # that does finish is picked up by the next pass after the throttle.
-    progressed = n_exited or n_tabs or n_stacks
+    # Containers count once each: a stopped one leaves `docker ps`, so the
+    # next plan never lists it again.
+    progressed = n_exited or n_tabs or n_stacks or n_containers
     if not (truncated and progressed):
         touch_stamp(cd)
     log(
