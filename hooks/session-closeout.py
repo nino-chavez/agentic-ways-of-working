@@ -29,9 +29,11 @@ from pathlib import Path
 
 
 CLOSEOUT = re.compile(
-    r"(?:\bclose[ -]?out\b|\bwrap (?:this )?(?:up|task up|session up)\b|"
+    r"(?:\b(?:close[ -]?out|wrap up|wrap this up)(?=\s*[.!?]?\s*$)|"
+    r"\b(?:close[ -]?out|wrap up|end) (?:this )?(?:task|session)\b|"
+    r"\bwrap (?:this )?(?:task|session) up\b|"
     r"\b(?:prepare|make) (?:this )?(?:task|session) (?:for archive|archive[- ]ready)\b|"
-    r"\bend (?:this )?(?:task|session)\b|\barchive[- ]ready\b)",
+    r"\barchive[- ]ready(?: this)?(?=\s*[.!?]?\s*$))",
     re.IGNORECASE,
 )
 

@@ -64,6 +64,20 @@ class NonClosoutPromptTests(_Fixture):
         out = self.run_hook("what does this function do?", self.root)
         self.assertEqual(out, {}, "a non-closeout prompt must print nothing at all")
 
+    def test_article_wrap_up_paragraph_is_not_task_closeout(self) -> None:
+        for prompt in (
+            "Add a wrap up paragraph to the blog post.",
+            "No, I meant the wrap up paragraph in the article.",
+            "Close out the article with a short paragraph.",
+            "Wrap this up section of the post.",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(self.run_hook(prompt, self.root), {})
+
+    def test_explicit_end_session_is_closeout(self) -> None:
+        out = self.run_hook("End session.", self.root)
+        self.assertIn("session-closeout skill", out["hookSpecificOutput"]["additionalContext"])
+
 
 class NoPatternAdoptedTests(_Fixture):
     def test_no_blueprint_yml_no_advisory(self) -> None:
