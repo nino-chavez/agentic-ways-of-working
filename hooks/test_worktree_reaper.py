@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -59,6 +60,8 @@ class _RepoFixture(unittest.TestCase):
             check=True,
             capture_output=True,
             text=True,
+            input="",
+            timeout=CHILD_TIMEOUT_SECONDS,
         ).stdout.strip()
 
     def add_worktree(self, name: str) -> Path:
@@ -114,6 +117,26 @@ class _RepoFixture(unittest.TestCase):
 
 
 class WorktreeCloseoutTests(_RepoFixture):
+    def test_short_host_budget_preserves_merged_worktree_for_later_cleanup(self) -> None:
+        worktree = self.add_worktree("short-budget")
+        environment = os.environ.copy()
+        environment["WORKTREE_CLOSEOUT_LOG"] = str(self.log)
+        environment["WORKTREE_REAPER_DEADLINE_SECONDS"] = "2"
+        started = time.monotonic()
+        subprocess.run(
+            [sys.executable, str(SCRIPT), "closeout"],
+            cwd=self.root,
+            input=json.dumps({"cwd": str(worktree)}),
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=3,
+        )
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertTrue(worktree.exists())
+        self.assertIn("reason=insufficient_removal_budget", self.log.read_text())
+
     def test_main_checkout_is_never_removed(self) -> None:
         self.closeout(self.root)
 
@@ -359,6 +382,27 @@ class RecentlyTouchedPruneTests(unittest.TestCase):
         self.assertTrue(
             self.reaper.recently_touched(str(self.root), 48, prune=(".artifacts/derived-data",))
         )
+
+
+class DeadlineTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("reaper_deadline", SCRIPT)
+        cls.reaper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.reaper)
+
+    def test_subsecond_budget_is_not_rounded_up(self) -> None:
+        with mock.patch.object(self.reaper, "budget_left", return_value=0.25):
+            self.assertLessEqual(self.reaper.clipped(10), 0.25)
+
+    def test_expired_budget_starts_no_git_process(self) -> None:
+        with mock.patch.object(self.reaper, "budget_left", return_value=0), \
+             mock.patch.object(self.reaper.subprocess, "run") as run:
+            self.assertIsNone(self.reaper.git(["status"], "/unused"))
+            self.assertFalse(self.reaper.git_ok(["status"], "/unused"))
+            run.assert_not_called()
 
 
 class StdinPayloadTests(unittest.TestCase):
