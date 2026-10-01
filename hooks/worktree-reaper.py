@@ -41,7 +41,7 @@ Safety gates, all fail-open EXCEPT the idleness check, which fails closed:
     remove` already refuses a locked tree, which covered removal but left the
     PRIMARY path (rmtree of its build dirs) unguarded.
   - Honors the same `.guard-off` per-repo escape hatch, plus WORKTREE_REAPER_OFF=1.
-  - Throttled per-repo via a stamp file: Codex's only hook event is `Stop`, which
+  - Throttled per-repo via a stamp file: periodic reaping uses Codex `Stop`, which
     fires PER TURN, so an unthrottled reaper would run constantly. The stamp is
     skipped only when a retry could do better — i.e. the run was cut short AND
     freed something. Both neighbouring rules were wrong in opposite directions:
@@ -67,8 +67,9 @@ Modes (argv[1]):
              and each hook pass that plans past the budget deletes nothing and
              stamps the repo for six hours. Optional argv[2] names the repo.
   report  — dry run: prints what it WOULD do, with sizes. Never deletes.
-  closeout — SessionEnd mode: remove this linked worktree immediately when it is
-             clean and merged; otherwise record the handoff state. It never
+  closeout — SessionEnd mode: remove this linked worktree when it is clean,
+             merged, and the full removal allowance fits the remaining budget;
+             otherwise record the handoff state. It never
              removes a branch or a dirty, detached, locked, or main checkout.
 
 Wiring (this repo installs only the Claude half):
@@ -81,10 +82,13 @@ Wiring (this repo installs only the Claude half):
                 user-level file, not composable the way install.sh's ensure()
                 is, so this repo does not write it. Adopting this hook under
                 Codex means adding that entry there.
-                Its timeout is 20s: the TIGHTEST budget this hook runs under,
-                and therefore the one DEADLINE_SECONDS is derived from. Raising
+                Its timeout is 20s: the periodic reaper's tightest budget,
+                and therefore the default DEADLINE_SECONDS is derived from it. Raising
                 the Claude side without reading this one is how the deadline
                 came to be set at double the harness limit on the per-turn path.
+                SessionEnd uses closeout with a 2s internal budget under the
+                host's 3s cap. It preserves checkouts for later cleanup when
+                removal cannot fit; the periodic Stop reaper remains separate.
 
 Pure stdlib. Log: ~/.claude/logs/worktree-reaper.log
 """
@@ -108,8 +112,11 @@ THROTTLE_HOURS = int(os.environ.get("WORKTREE_REAPER_THROTTLE_HOURS", "6"))
 # Wall-clock budget, and the per-subprocess caps inside it.
 #
 # The binding constraint is the TIGHTEST harness timeout this hook runs under,
-# which is Codex's `Stop` at 20s (files/home/.codex/hooks.json in the consuming
-# dotfiles repo) — not Claude's SessionEnd at 60s (install.sh). An earlier
+# which for periodic reaping is Codex's `Stop` at 20s (files/home/.codex/hooks.json
+# in the consuming dotfiles repo), not Claude's SessionEnd at 60s (install.sh).
+# Codex SessionEnd is a separate closeout path capped by the host at 3s; its
+# wiring sets WORKTREE_REAPER_DEADLINE_SECONDS=2. It records state but preserves
+# a checkout when the full removal allowance cannot fit. An earlier
 # version set the deadline to 40 and claimed the limits sat under the harness;
 # under Codex they sat at double it, so the guarantee was backwards on the very
 # path the per-turn throttle exists for.
@@ -300,6 +307,8 @@ def read_payload(note=None, timeout: float = STDIN_PAYLOAD_TIMEOUT) -> dict:
 # remembering — a bound that depends on discipline at a dozen call sites is not a
 # bound. Pass clip=False only where being cut short is worse than overrunning.
 def git(args: list[str], cwd: str, timeout: int = 10, clip: bool = True) -> str | None:
+    if clip and past_deadline():
+        return None
     try:
         r = subprocess.run(
             ["git", "-C", cwd, *args],
@@ -311,6 +320,8 @@ def git(args: list[str], cwd: str, timeout: int = 10, clip: bool = True) -> str 
 
 
 def git_ok(args: list[str], cwd: str, timeout: int = 10, clip: bool = True) -> bool:
+    if clip and past_deadline():
+        return False
     try:
         r = subprocess.run(
             ["git", "-C", cwd, *args],
@@ -450,7 +461,7 @@ def past_deadline() -> bool:
     return budget_left() <= 0
 
 
-def clipped(cap: int) -> int:
+def clipped(cap: float) -> float:
     """A subprocess timeout that cannot outlive the run's remaining budget.
 
     Clipping is safe for every caller here because each fails toward doing
@@ -462,7 +473,7 @@ def clipped(cap: int) -> int:
     """
     if not _DEADLINE_ON:
         return cap
-    return max(1, min(cap, int(budget_left())))
+    return max(0.001, min(cap, budget_left()))
 
 
 def recently_touched(path: str, hours: float, prune: tuple[str, ...] = ()) -> bool:
@@ -693,6 +704,15 @@ def cmd_closeout(payload: dict) -> None:
     primary = os.path.abspath(str(entries[0].get("path", "")))
     if not primary or not os.path.isdir(primary):
         log_closeout(f"repo={root} branch={branch} state=merged-clean action=keep reason=primary_missing")
+        return
+    # Removal is deliberately not interrupted by our deadline. A short host
+    # callback must leave the checkout for later cleanup rather than start a
+    # deletion that the host can kill halfway through.
+    if budget_left() < REMOVE_TIMEOUT:
+        log_closeout(
+            f"repo={root} branch={branch} state=merged-clean action=keep "
+            "reason=insufficient_removal_budget"
+        )
         return
     if git_ok(["worktree", "remove", root], primary, timeout=REMOVE_TIMEOUT, clip=False):
         log_closeout(f"repo={root} branch={branch} state=merged-clean action=removed")
