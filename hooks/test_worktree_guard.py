@@ -44,8 +44,11 @@ class _TwoSessionRepo(unittest.TestCase):
         self.locks = self.root / ".git" / ".claude-sessions"
 
     def git(self, *args: str, cwd: Path | None = None) -> str:
+        # input= and timeout= on every subprocess: a child that inherits the
+        # runner's stdin can hang the suite forever (56087f7).
         return subprocess.run(
-            ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+            ["git", *args], cwd=cwd, check=True, capture_output=True, text=True,
+            input="", timeout=30,
         ).stdout.strip()
 
     # -- driving the hook ---------------------------------------------------
@@ -55,6 +58,7 @@ class _TwoSessionRepo(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, str(SCRIPT), "check"],
             input=json.dumps(payload), check=True, capture_output=True, text=True,
+            timeout=30,
         )
         out = result.stdout.strip()
         if not out:
@@ -282,6 +286,79 @@ class FailOpenTests(_TwoSessionRepo):
         outside = Path(self.temporary.name) / "plain"
         outside.mkdir()
         self.assertEqual(self.bash("A", outside, "git commit -m x")[0], "allow")
+
+    # -- wrong-shaped payloads --------------------------------------------
+    # Valid JSON of the wrong shape used to exit 1 with a traceback instead of
+    # allowing. The tool_input cases run with A and B both in main, so "allow"
+    # proves the hook failed open rather than finding no contention.
+
+    def raw(self, mode: str, stdin: str) -> subprocess.CompletedProcess:
+        """Run one hook mode on raw stdin, from a dir that is not a repo.
+
+        An empty payload falls back to os.getcwd() and session "unknown", so
+        running from the test's own checkout would write (register) or delete
+        (unregister) a lock in the real repo.
+        """
+        outside = Path(self.temporary.name) / "not-a-repo"
+        outside.mkdir(exist_ok=True)
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), mode], cwd=outside,
+            input=stdin, capture_output=True, text=True, timeout=30,
+        )
+
+    def test_non_object_payloads_fail_open_in_every_mode(self) -> None:
+        for stdin in ("null", "[]", '"s"', "123", "true"):
+            for mode in ("check", "register", "unregister"):
+                with self.subTest(stdin=stdin, mode=mode):
+                    result = self.raw(mode, stdin)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), "")
+
+    def test_wrong_typed_cwd_fails_open_in_every_mode(self) -> None:
+        # An int cwd already failed open (os.stat reads it as an fd); a list or
+        # dict made os.path.isdir raise TypeError.
+        for cwd in (["x"], {"a": 1}):
+            for mode in ("check", "register", "unregister"):
+                with self.subTest(cwd=cwd, mode=mode):
+                    result = self.raw(mode, json.dumps({
+                        "tool_name": "Bash", "session_id": "Z", "cwd": cwd,
+                        "tool_input": {"command": "git commit -m x"},
+                    }))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), "")
+
+    def test_wrong_typed_tool_input_fails_open(self) -> None:
+        self.arrive("A", self.root)
+        self.arrive("B", self.root)
+        for tool in ("Bash", "Edit"):
+            for tool_input in ("git commit -m x", ["git", "commit"], 1, True):
+                with self.subTest(tool=tool, tool_input=tool_input):
+                    decision, _ = self._run({
+                        "tool_name": tool, "session_id": "A", "cwd": str(self.root),
+                        "tool_input": tool_input,
+                    })
+                    self.assertEqual(decision, "allow")
+
+    def test_wrong_typed_command_fails_open(self) -> None:
+        self.arrive("A", self.root)
+        self.arrive("B", self.root)
+        # A list must not be joined into "git commit" — that would be denied.
+        for command in (["git", "commit", "-m", "x"], 5, {"git": "commit"}):
+            with self.subTest(command=command):
+                decision, _ = self._run({
+                    "tool_name": "Bash", "session_id": "A", "cwd": str(self.root),
+                    "tool_input": {"command": command},
+                })
+                self.assertEqual(decision, "allow")
+
+    def test_wrong_typed_tool_name_fails_open(self) -> None:
+        self.arrive("A", self.root)
+        self.arrive("B", self.root)
+        decision, _ = self._run({
+            "tool_name": ["Bash"], "session_id": "A", "cwd": str(self.root),
+            "tool_input": {"command": "git commit -m x"},
+        })
+        self.assertEqual(decision, "allow")
 
     def test_readonly_sessions_never_contend(self) -> None:
         self.arrive("A", self.root)

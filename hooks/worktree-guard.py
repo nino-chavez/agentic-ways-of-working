@@ -114,9 +114,28 @@ _IN_PROGRESS_MARKERS = [
 
 def read_payload() -> dict:
     try:
-        return json.load(sys.stdin)
+        payload = json.load(sys.stdin)
     except Exception:
         return {}
+    # Valid JSON that isn't an object (null, [], "str", 123) parses fine and
+    # then blows up on .get() — fail open on shape too, not just on syntax.
+    return payload if isinstance(payload, dict) else {}
+
+
+def _cwd(payload: dict) -> str:
+    """The payload's cwd, or the process cwd when it is missing or not a str.
+
+    A truthy list or dict slips past `or os.getcwd()` and makes os.path.isdir
+    raise TypeError, which it does not swallow.
+    """
+    cwd = payload.get("cwd")
+    return cwd if isinstance(cwd, str) and cwd else os.getcwd()
+
+
+def _tool_input(payload: dict) -> dict:
+    """The payload's tool_input, or {} when it is missing or not an object."""
+    ti = payload.get("tool_input")
+    return ti if isinstance(ti, dict) else {}  # `or {}` lets a truthy non-dict through
 
 
 def git(args: list[str], cwd: str) -> str | None:
@@ -448,7 +467,7 @@ def is_contended(command: str) -> bool:
 
 def _edit_target_path(payload: dict) -> str | None:
     """The file an Edit/Write/MultiEdit call targets (its `file_path`), or None."""
-    p = (payload.get("tool_input") or {}).get("file_path")
+    p = _tool_input(payload).get("file_path")
     return p if isinstance(p, str) and p else None
 
 
@@ -643,7 +662,7 @@ def ask(reason: str) -> None:
 # --- subcommands -------------------------------------------------------------
 
 def cmd_register(payload: dict) -> None:
-    cwd = payload.get("cwd") or os.getcwd()
+    cwd = _cwd(payload)
     session_id = payload.get("session_id") or "unknown"
     ctx = repo_context(cwd)
     if ctx is None:
@@ -662,7 +681,7 @@ def cmd_register(payload: dict) -> None:
 
 
 def cmd_unregister(payload: dict) -> None:
-    cwd = payload.get("cwd") or os.getcwd()
+    cwd = _cwd(payload)
     ctx = repo_context(cwd)
     if ctx is None:
         allow()
@@ -672,9 +691,9 @@ def cmd_unregister(payload: dict) -> None:
 
 def cmd_check(payload: dict) -> None:
     tool = payload.get("tool_name")
-    if tool not in EDIT_TOOLS and tool != "Bash":
+    if not isinstance(tool, str) or (tool not in EDIT_TOOLS and tool != "Bash"):
         allow()
-    cwd = payload.get("cwd") or os.getcwd()
+    cwd = _cwd(payload)
     session_id = payload.get("session_id") or "unknown"
 
     # Heartbeat: refresh this session's lock in its OWN repo on every guarded
@@ -706,7 +725,9 @@ def cmd_check(payload: dict) -> None:
             deny(deny_reason_edit(main_others, target_dir, tld, path, tctx))
         allow()
 
-    command = (payload.get("tool_input") or {}).get("command", "")
+    command = _tool_input(payload).get("command", "")
+    if not isinstance(command, str):
+        allow()  # shlex.split needs a str; anything else => fail open
 
     # Resolve the effective repo of each git op (honoring cd / git -C), then run
     # the two checks of the contention model on it. First hit wins; deny
