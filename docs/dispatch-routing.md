@@ -20,17 +20,19 @@ brief + isolated workspace
   -> worker launch
 ```
 
-The caller must not be able to bypass the dispatcher through another exposed
-creation tool. Disable those tools in the host configuration. Verify the tool
-catalog after reload; changing a configuration file does not change every
-already-loaded task. A hook that can be skipped, time out, or fail open is a
-best-effort guard and must not be described as required enforcement.
+Do not use another creation tool as a fallback when bounded worker dispatch
+fails. Keep explicit requests for a separate sidebar chat distinct: those use
+the host's create/fork tools and must not be blocked by a blanket tool deny-list.
+The dispatcher's launch guarantee covers its own worker path, not every sidebar
+chat. Verify tool availability after a catalog reload; already-loaded tasks may
+retain their previous tools. A hook that can be skipped, time out, or fail open
+is a best-effort guard and must not be described as required enforcement.
 
 ## Operator implementation
 
 The companion Operator repository owns `adapters/dispatch.py` and its route
 policy, tests, and receipt format. Dotfiles installs the `operator-dispatch`
-launcher and the Codex app-tools deny-list. Use its `docs/dispatch.md` for current
+launcher and the Codex app-tools configuration. Use its `docs/dispatch.md` for current
 flags and limitations; this repository does not duplicate the runtime.
 
 ```sh
@@ -52,7 +54,7 @@ invocation. Both must produce zero starts. Test the successful path against the
 actual runtime: the requested model and effort must match the child metadata.
 A receipt written before launch proves a decision, not that the worker ran.
 
-Carry the launcher, tool deny-list, policy owner, and tests through their tracked
+Carry the launcher, tool configuration, policy owner, and tests through their tracked
 repositories. Report source edits, publication, installation on each machine,
 and catalog reload as separate states. Do not claim enforcement on a second
 machine merely because one machine passed.
