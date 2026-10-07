@@ -51,7 +51,7 @@ So there's exactly one canonical doc — [`principles/working-style.md`](princip
 | **Canonical-pattern-first** | Read the vendor's approach before hand-rolling auth, payments, or webhooks. Custom shapes name their disqualifier | judgment |
 | **Calibrate rigor to stakes** | The bar comes from who depends on the work, not from where the file sits | judgment |
 | **Prose voice, no fabrication** | Human-facing prose loads the voice guide first, and never invents an interior state the author didn't have | judgment |
-| **Secret handling** | Secrets live in a manager; check for an existing entry before inventing a name | judgment |
+| **Secret handling** | Secrets live in a manager; check for an existing entry before inventing a name. Never print another process's argv into a transcript | judgment + [`process-argv-guard.py`](hooks/process-argv-guard.py) (argv) |
 
 The judgment rows are deliberate. A hook can see a tool call; it can't see intent, so those rules live in prose where the model applies them.
 
@@ -91,7 +91,8 @@ skills/                       The methodology suite (see below)
 commands/campsite.md          /campsite — toggle the north-star working stance
 commands/doctor.md            /doctor — health-check and clean up your own harness
 hooks/                        anti-hesitation, campsite, blueprint-session-start, worktree-guard, read-guard,
-                              output-trim, worktree-reaper, connector-reaper, session-reaper
+                              output-trim, worktree-reaper, connector-reaper, session-reaper,
+                              process-argv-guard
                               (each docstring carries its measurements)
 git-hooks/                    Local post-commit Claude review on commits worth reviewing
 tools/token-audit.py          Measure where your sessions actually spend tokens
