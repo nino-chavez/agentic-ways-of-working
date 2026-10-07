@@ -16,8 +16,11 @@ import unittest
 from pathlib import Path
 
 HOOK = Path(__file__).with_name("process-argv-guard.py")
-REDACTOR = (r"sed -E 's/(--binding [A-Z_]+=)[^ ]+/\1REDACTED/g; "
-            r"s/(KEY|TOKEN|SECRET)=[^ ]+/\1=REDACTED/g'")
+REDACTOR = r"sed -E 's/([A-Za-z0-9_.-]+=)[^[:space:]]+/\1REDACTED/g'"
+# The narrower redactor first proposed; it leaks R2_ACCESS_KEY_ID= and
+# DATABASE_URL=, so it must not unlock a pipeline.
+NARROW_REDACTOR = (r"sed -E 's/(--binding [A-Z_]+=)[^ ]+/\1REDACTED/g; "
+                   r"s/(KEY|TOKEN|SECRET)=[^ ]+/\1=REDACTED/g'")
 
 DENY = [
     # the spec's forms
@@ -48,10 +51,18 @@ DENY = [
     "ps axo pid,args",
     "ps -O ppid -p 123",
     "ps -c -E -p 123",
+    # format sets that append COMMAND to an -o list (commit review of c7dc75f)
+    "ps -j -o pid -p 123",
+    "ps -l -o pid -p 123",
+    "ps -v -o pid -p 123",
+    "ps -f -o pid -p 123",
+    "ps uo pid",
     # pipelines that still print argv
     "ps aux | grep wrangler",
     "ps aux | grep wrangler | head -5",
     "ps aux | sed 's/foo/bar/'",
+    "ps aux | sed 's/x/REDACTED/'",
+    f"ps aux | {NARROW_REDACTOR}",
     "pgrep -f wrangler | xargs ps -o args= -p",
     "pgrep -f wrangler | xargs ps -p",
     # wrappers, separators, nesting
@@ -68,6 +79,10 @@ DENY = [
     "echo \"$(ps aux)\"",
     "x=$(ps aux | grep node); echo $x",
     "echo `ps aux`",
+    # a heredoc fed to a shell is the command, not prose
+    "bash <<'EOF'\nps aux\nEOF",
+    "cat <<'EOF' | sh\npgrep -fl wrangler\nEOF",
+    "sudo zsh -s <<EOF\necho hi\nps -ef\nEOF",
     "/bin/ps aux",
     "if pgrep -fl wrangler; then echo up; fi",
     "pstree -p 123",
@@ -107,6 +122,9 @@ ALLOW = [
     "grep -n 'ps aux' notes.md",
     "rg 'pgrep -fl' ~/.claude",
     "# ps aux would leak\nls",
+    "bash <<'EOF'\npgrep -f wrangler | wc -l\nEOF",
+    "cat <<'EOF' > script.sh\nps aux\nEOF",
+    "python3 - <<'EOF'\nprint('ps aux')\nEOF",
     # names that merely start with ps
     "psql -c 'select 1'",
     "pstree -p 123 | wc -l",

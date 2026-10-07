@@ -26,14 +26,15 @@ What is denied, per pipeline:
   /proc/<pid>/cmdline or /environ read by any command or redirection.
   pstree and procs, which print full command lines by default (neither is
          installed here as of 2026-10-07; one brew install would open the hole).
-A later stage in the same pipeline that is the redactor (`sed` with
-REDACTED), `wc`, or `grep -c`/`-q` makes the pipeline safe.
+A later stage in the same pipeline that is the canonical redactor (REDACTOR
+below), `wc`, or `grep -c`/`-q` makes the pipeline safe.
 
 Parsing, not substring matching: commands are split with shlex after heredoc
 bodies are dropped, so a commit message, an echo, or a heredoc documenting the
 rule passes (browse-profile-guard learned this on 2026-08-27). Wrappers are
 stripped (sudo, env, xargs, timeout, watch, VAR=...), and `sh|bash|zsh -c`,
-`eval`, `$(...)` and backticks are analysed as commands of their own. Codex's
+`eval`, `$(...)`, backticks and a heredoc fed to a shell (`bash <<EOF`) are
+analysed as commands of their own. Codex's
 code-mode `exec` tool (`tools.exec_command({cmd: ...})`) is read too; the
 Codex adapter runs this file with `check`.
 
@@ -59,12 +60,17 @@ from pathlib import Path
 
 OVERRIDE_FILE = Path.home() / ".claude" / "cache" / "process-argv-guard" / ".guard-off"
 
-REDACTOR = (r"sed -E 's/(--binding [A-Z_]+=)[^ ]+/\1REDACTED/g; "
-            r"s/(KEY|TOKEN|SECRET)=[^ ]+/\1=REDACTED/g'")
+# Blank the value of every NAME=value. The narrower redactor first proposed
+# (--binding [A-Z_]+= and *KEY|TOKEN|SECRET=) left R2_ACCESS_KEY_ID=,
+# DATABASE_URL=postgres://u:pw@... and PASSWORD= in clear text, verified on
+# fake input 2026-10-07 (commit review of c7dc75f). No space inside the
+# expression, so it survives the crude fallback's whitespace split.
+REDACTOR_CORE = r"s/([A-Za-z0-9_.-]+=)[^[:space:]]+/\1REDACTED/g"
+REDACTOR = f"sed -E '{REDACTOR_CORE}'"
 
 MAX_DEPTH = 4
 OPS = ";&|()<>\n"
-HEREDOC = re.compile(r"(<<-?\s*['\"]?(\w+)['\"]?)[^\n]*\n.*?\n\s*\2\b", re.S)
+HEREDOC = re.compile(r"(<<-?\s*['\"]?(\w+)['\"]?)([^\n]*)\n(.*?)\n\s*\2\b", re.S)
 SUBST = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
 SINGLE_QUOTED = re.compile(r"'[^']*'")
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -209,7 +215,7 @@ def split_cols(spec: str) -> list[str]:
 
 def ps_leak(args: list[str]) -> str | None:
     cols: list[str] = []
-    env = names_only = has_o = False
+    env = names_only = has_o = adds_default = False
     i = 0
     while i < len(args):
         a = args[i]
@@ -228,6 +234,8 @@ def ps_leak(args: list[str]) -> str | None:
                     env = True
                 elif ch == "c":
                     names_only = True
+                elif ch in "jlvfF":  # format sets appended to -o, each with COMMAND
+                    adds_default = True
                 elif ch in PS_VALUE_OPTS:
                     val = cluster[j + 1:]
                     if not val:
@@ -235,8 +243,7 @@ def ps_leak(args: list[str]) -> str | None:
                     if ch in "oO":
                         cols += split_cols(val)
                         has_o = has_o or ch == "o"
-                        if ch == "O":
-                            cols.append("<default>")
+                        adds_default = adds_default or ch == "O"
                     break
         elif re.fullmatch(r"[A-Za-z]+", a):  # BSD-style cluster: aux, eww, axo
             for j, ch in enumerate(a):
@@ -244,14 +251,15 @@ def ps_leak(args: list[str]) -> str | None:
                     env = True
                 elif ch == "c":
                     names_only = True
+                elif ch in "jluv":
+                    adds_default = True
                 elif ch in "oO":
                     val = a[j + 1:]
                     if not val:
                         val, i = nxt, i + 1
                     cols += split_cols(val)
                     has_o = has_o or ch == "o"
-                    if ch == "O":
-                        cols.append("<default>")
+                    adds_default = adds_default or ch == "O"
                     break
         i += 1
     if env:
@@ -260,7 +268,9 @@ def ps_leak(args: list[str]) -> str | None:
         return "ps printing the args/command column"
     if names_only:
         return None
-    if has_o and "<default>" not in cols:
+    # -j/-l/-v/-f/u/-O append a COMMAND column to any -o list on macOS
+    # (verified on header rows 2026-10-07, commit review of c7dc75f).
+    if has_o and not adds_default:
         return None
     return "ps printing full command lines"
 
@@ -291,8 +301,8 @@ def sanitizes(words: list[str]) -> bool:
     name = base(words[0])
     if name == "wc":
         return True
-    if name == "sed":
-        return any("REDACTED" in w for w in words[1:])
+    if name == "sed":  # only the canonical redactor; a sed that merely says REDACTED is not one
+        return any(REDACTOR_CORE in w for w in words[1:])
     if name in ("grep", "egrep", "rg"):
         for w in words[1:]:
             if w in ("--count", "--quiet", "--silent"):
@@ -328,11 +338,33 @@ def stage_leak(words: list[str], depth: int) -> str | None:
     return None
 
 
+def heredoc_to_shell(command: str, m: re.Match) -> bool:
+    """True when the heredoc's operator line feeds a shell (`bash <<EOF`,
+    `cat <<EOF | sh`): then the body is the command being run, not prose."""
+    line = command[command.rfind("\n", 0, m.start()) + 1:m.start()] + " " + m.group(3)
+    try:
+        parsed = pipelines(line)
+    except ValueError:
+        parsed = crude_pipelines(line)
+    for stages in parsed:
+        for words in stages:
+            words = unwrap(words)
+            if words and base(words[0]) in SHELLS and not any(
+                    w.startswith("-") and not w.startswith("--") and "c" in w for w in words[1:]):
+                return True
+    return False
+
+
 def analyze(command: str, depth: int = 0) -> str | None:
     if depth > MAX_DEPTH or not command.strip():
         return None
     command = re.sub(r"\\\r?\n", " ", command)
-    command = HEREDOC.sub(r"\1", command)
+    for m in HEREDOC.finditer(command):
+        if heredoc_to_shell(command, m):
+            hit = analyze(m.group(4), depth + 1)
+            if hit:
+                return hit
+    command = HEREDOC.sub(r"\1\3", command)
 
     # Command substitutions run even inside double quotes; single quotes are data.
     for m in SUBST.finditer(SINGLE_QUOTED.sub("''", command)):
@@ -394,7 +426,8 @@ def deny(headline: str) -> None:
         "If the arguments really must be seen, pipe them through the redactor as a",
         "later stage of the same pipeline:",
         f"  ... | {REDACTOR}",
-        "It covers --binding and *KEY/TOKEN/SECRET= forms only; check what remains.",
+        "It blanks every NAME=value. A secret passed as a separate argument",
+        "(--token abc) is not covered.",
         "",
         f"Override once confirmed safe: touch {OVERRIDE_FILE}",
     ]
