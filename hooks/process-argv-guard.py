@@ -413,6 +413,8 @@ def check(payload: dict) -> None:
         return
     tool = payload.get("tool_name")
     tool_input = payload.get("tool_input")
+    if tool == "exec" and isinstance(tool_input, str):
+        tool_input = {"code": tool_input}  # Codex freeform `exec` may send its source bare
     if not isinstance(tool_input, dict):
         return
     if tool == "Bash":

@@ -166,6 +166,9 @@ class ProcessArgvGuard(unittest.TestCase):
         safe = "await tools.exec_command({'cmd': 'pgrep -f wrangler | wc -l'})"
         self.assertEqual(self.decide({"tool_name": "exec", "tool_input": {"code": leak}})[0], "deny")
         self.assertEqual(self.decide({"tool_name": "exec", "tool_input": {"code": safe}})[0], "allow")
+        # A freeform `exec` may send its source bare.
+        self.assertEqual(self.decide({"tool_name": "exec", "tool_input": leak})[0], "deny")
+        self.assertEqual(self.decide({"tool_name": "exec", "tool_input": safe})[0], "allow")
 
     def test_other_tools_ignored(self):
         payload = {"tool_name": "Read", "tool_input": {"file_path": "/proc/1/cmdline"}}
