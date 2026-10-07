@@ -113,6 +113,7 @@ Verified evidence: parser fixtures and database integrity check passed
 Still unproven: old transcripts may contain project details not promoted elsewhere
 Next action: review the archive after the grace window
 Recall recipe: session-retention-v1
+Workspace: none
 Archive-safe: no
 ```
 
@@ -134,6 +135,12 @@ A worktree artifact reaper needs stronger gates than “the directory name is us
 - ship report-only mode first and keep destructive mode explicitly enabled.
 
 An ignored directory is not automatically disposable. A successful deletion is not proof that the safety model is complete.
+
+### Closeout decides; the reaper reclaims
+
+The reaper can reclaim build output, but it cannot decide whether a task's work landed. Only the task knows that. Closeout therefore gives every worktree, branch, and process the task created one recorded disposition (step 3 of the skill), and the reaper keeps the destructive, gate-heavy work.
+
+Measured 2026-10-06, a workspace-wide inventory found 361 linked worktrees: 193 with uncommitted changes, 106 clean and fully merged, 54 clean with commits outside the base branch, and 8 in use. More than half had been idle over a week. Snapshots of 128 dirty ones held real work (source edits and new evidence files), never only rewritten lockfiles. The reaper had removed 21 worktrees in 95 runs since 2026-08-02, because it runs only when a session ends in that repository and only removes branches merged by ancestry, which a squash merge never is. One release dependency, a pinned source checkout, had lived inside a research worktree and had to be moved out by hand before that worktree could go.
 
 ## A practical default policy
 
