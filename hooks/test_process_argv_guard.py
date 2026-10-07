@@ -132,6 +132,10 @@ ALLOW = [
     "bash <<'EOF'\npgrep -f wrangler | wc -l\nEOF",
     "cat <<'EOF' > script.sh\nps aux\nEOF",
     "python3 - <<'EOF'\nprint('ps aux')\nEOF",
+    # escaped substitutions are literal text
+    'git commit -m "docs: \\`ps aux | grep x\\` is denied"',
+    'echo \\`ps aux\\`',
+    'echo "\\$(ps aux) is literal"',
     "cat <<'EOF'\n$(ps aux) is documented here\nEOF",
     "bash <<< 'pgrep -f wrangler | wc -l'",
     "ps aux | sed -E -e 's/([A-Za-z0-9_.-]+=)[^[:space:]]+/\\1REDACTED/g'",
