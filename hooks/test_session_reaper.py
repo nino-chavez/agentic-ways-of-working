@@ -1284,6 +1284,25 @@ class TabUrlRedactionTests(unittest.TestCase):
         self.assertNotIn("fakepat8", out)
         self.assertTrue(out.startswith("http://localhost:3000/hook/"))
 
+    def test_a_token_shaped_path_segment_is_blanked(self) -> None:
+        """Reset, invite and magic-link flows put the secret in the path."""
+        cases = {
+            "https://app.example.com/reset/MQ/c3k2ab-fakereset1-9f8e7d6c/":
+                "https://app.example.com/reset/MQ/REDACTED/",
+            "http://localhost:5173/invite/0f8b1c2a-3d4e-4f50-9a6b-7c8d9e0f1a2b":
+                "http://localhost:5173/invite/REDACTED",
+            "http://localhost:5173/magic/eyJhbGciOiJIUzI1NiJ9.fakejwt2.sig":
+                "http://localhost:5173/magic/REDACTED",
+        }
+        for url, want in cases.items():
+            self.assertEqual(sr.redact_url(url), want)
+
+    def test_ordinary_route_segments_stay_readable(self) -> None:
+        for url in ("http://localhost:5173/auth/callback",
+                    "http://localhost:5173/admin/tournaments/2026-10-07/brackets",
+                    "devtools://devtools/bundled/inspector.html"):
+            self.assertEqual(sr.redact_url(url), url)
+
     def test_browser_internal_pages_stay_readable(self) -> None:
         self.assertEqual(sr.redact_url("about:blank"), "about:blank")
         self.assertEqual(sr.redact_url("chrome://newtab/"), "chrome://newtab/")

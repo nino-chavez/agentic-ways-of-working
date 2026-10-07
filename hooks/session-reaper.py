@@ -36,8 +36,9 @@ Three independent actions, each separately gated and separately dry-runnable:
      is not listening. Over CDP, one target at a time. The browser process is
      never signalled and the profile directory is never touched (that profile
      holds Nino's logins, and browse-profile-guard.py protects it).
-     Tab URLs print through redact_url(): query values, fragment and
-     userinfo never reach `report` output or the reap log.
+     Tab URLs print through redact_url(): query values, token-shaped path
+     segments, fragment and userinfo are blanked before `report` output or
+     the reap log (a path token under 16 characters is not caught).
   3. supabase stacks — stop every container of a local stack whose project
      id no live session claims, running longer than STACK_IDLE_HOURS. The
      database last, by its own stop signal and never force-killed; success
@@ -378,16 +379,28 @@ _QUERY_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.\-\[\]]{0,31}")
 _PAYLOAD_SCHEMES = {"data", "javascript"}
 
 
+def _path_segment(seg: str) -> str:
+    """Reset, invite and magic-link flows carry the secret as a path segment
+    (`/reset/<uid>/<token>/`, `/invite/<uuid>`, `/magic/<jwt>`), which no
+    argv rule sees. Treat a segment as a token when it is 16+ characters with
+    a digit, or 32+ characters at all. Route names, dates and file names stay
+    readable; a short invite code (under 16) is the named residual."""
+    if len(seg) >= 32 or (len(seg) >= 16 and any(c.isdigit() for c in seg)):
+        return "REDACTED"
+    return redact(seg)
+
+
 def redact_url(url: str) -> str:
     """A tab URL as it may appear in `report` output and the reap log.
 
     Separate from redact(), which is argv-shaped and must stay identical to
     connector-reaper.py's copy. Page URLs carry credentials argv rules do not
     see: an OAuth callback's code= and state=, an implicit grant's
-    #access_token=, a magic link's bare ?<token>. So scheme, host, port and
-    path stay readable — enough to see which dead server a tab pointed at —
-    and every query value, any non-identifier query key, the fragment and the
-    userinfo are blanked. Fails closed: a URL that will not parse prints as
+    #access_token=, a magic link's bare ?<token> or /magic/<token>. So scheme,
+    host, port and route-shaped path segments stay readable — enough to see
+    which dead server a tab pointed at — and every query value, any
+    non-identifier query key, any token-shaped path segment (_path_segment),
+    the fragment and the userinfo are blanked. Fails closed: a URL that will not parse prints as
     REDACTED-URL rather than raw.
     """
     if not url:
@@ -407,7 +420,7 @@ def redact_url(url: str) -> str:
         # `file:///x` has an empty netloc but keeps its `//`; `about:blank` has neither.
         slashes = "//" if parts.netloc or url[len(parts.scheme) + 1:].startswith("//") else ""
         out = f"{parts.scheme}:{slashes}{netloc}" if parts.scheme else netloc
-        out += redact(parts.path)
+        out += "/".join(_path_segment(seg) for seg in parts.path.split("/"))
         if parts.query:
             segs = []
             for seg in parts.query.split("&"):
