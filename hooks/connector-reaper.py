@@ -81,8 +81,8 @@ key>`, readable by any process on the machine via `ps`. Every command line
 this tool prints or logs is passed through redact() first. It blanks to
 REDACTED the value of any flag whose name says it carries a credential
 (--key, --api-key, --client-secret, --auth-token, ...), every NAME=value
-(the same rule as process-argv-guard.py's REDACTOR_CORE), and the userinfo
-of any URL (postgres://u:pw@h). Known provider token shapes (sk-ant-,
+(the same rule as process-argv-guard.py's REDACTOR_CORE), the userinfo
+of any URL (postgres://u:pw@h), and the credential after Bearer/Basic. Known provider token shapes (sk-ant-,
 sk-proj-, ctx7sk-, ghp_, xox*) are masked to their first 6 characters +
 "***" wherever they appear, flag or no flag. There are tests asserting a
 fabricated key is never emitted, in either the report/dry-run stdout path or
@@ -168,15 +168,16 @@ CLIENT_PATTERNS = (
 # Redaction rules. session-reaper.py carries a copy of these and of
 # redact(); test_session_reaper.RedactionParityTests holds the two together.
 #
-# A flag is matched by what its NAME says, not by a list of exact flags: the
-# exact list (--api-key|--token|--secret|--password|--bearer) let --key and
-# --client-secret through. Over-matching (--keyframes, --author) only blanks
+# A long flag is matched by what its NAME says, not by a list of exact flags:
+# the exact list (--api-key|--token|--secret|--password|--bearer) let --key and
+# --client-secret through. Short flags (-p) are not matched: -p is a port as
+# often as a password, and the other passes catch most short-flag secrets. Over-matching (--keyframes, --author) only blanks
 # a value in a report line; nothing decides anything from redacted text.
 # Add a provider prefix to _CREDENTIAL_PREFIX_RE when a new one is observed —
 # this is the part of redaction that rots (mirrors the secret-scan pre-commit
 # hook's own note about its provider-prefix list).
 _CREDENTIAL_FLAG_RE = re.compile(
-    r"(?<!\S)(--[\w-]*(?:token|key|secret|password|passwd|bearer|auth|credential)[\w-]*)"
+    r"(?<!\S)(--[\w-]*(?:token|key|secret|pass|pw|bearer|auth|credential)[\w-]*)"
     r"(=|\s+)(\S+)",
     re.IGNORECASE,
 )
@@ -186,9 +187,15 @@ _CREDENTIAL_FLAG_RE = re.compile(
 # `export NAME=...`. A quoted value with a space in it leaks past the space,
 # the same limit the sed rule has.
 _NAME_VALUE_RE = re.compile(r"([A-Za-z0-9_.-]+=)\S+")
-# user:password@ in any URL, which a positional connection string carries
-# with no NAME= in front of it.
-_URL_USERINFO_RE = re.compile(r"://[^\s/@:]+:[^\s/@]+@")
+# Any userinfo in a URL, which a positional connection string carries with no
+# NAME= in front of it: user:pw@, an empty user (redis://:pw@h), a bare token
+# (https://<pat>@github.com), and an unescaped @ inside the password (greedy
+# up to the last @ before the first /). A / inside the password is invalid
+# URL syntax and is not handled.
+_URL_USERINFO_RE = re.compile(r"://[^\s/]+@")
+# An HTTP auth scheme followed by its credential. `-H "Authorization: Bearer x"`
+# reaches ps unquoted, so neither the flag nor a NAME= marks the token.
+_AUTH_SCHEME_RE = re.compile(r"\b(bearer|basic)\s+\S+", re.IGNORECASE)
 _CREDENTIAL_PREFIX_RE = re.compile(
     r"(sk-ant-|sk-proj-|ctx7sk-|ghp_|xox[a-z]-)[A-Za-z0-9_-]*",
 )
@@ -204,9 +211,10 @@ def _mask(value: str) -> str:
 def redact(command: str) -> str:
     """Never let a credential reach stdout or the log file.
 
-    Four passes. Credential-named flags first, so `--token=x` and
+    Five passes. Credential-named flags first, so `--token=x` and
     `--token x` both come out as the flag name plus REDACTED. Then every
-    NAME=value, then URL userinfo, then provider token shapes anywhere else
+    NAME=value, URL userinfo, an auth scheme's credential (Bearer/Basic),
+    and last, provider token shapes anywhere else
     (the prefix pass cannot re-touch REDACTED: its character class needs the
     prefix itself). A provider token keeps its first 6 characters because
     those name the provider; any other value is blanked whole, since 6
@@ -215,6 +223,7 @@ def redact(command: str) -> str:
     out = _CREDENTIAL_FLAG_RE.sub(r"\g<1>\g<2>REDACTED", command)
     out = _NAME_VALUE_RE.sub(r"\g<1>REDACTED", out)
     out = _URL_USERINFO_RE.sub("://REDACTED@", out)
+    out = _AUTH_SCHEME_RE.sub(r"\g<1> REDACTED", out)
     out = _CREDENTIAL_PREFIX_RE.sub(lambda m: _mask(m.group(0)), out)
     return out
 

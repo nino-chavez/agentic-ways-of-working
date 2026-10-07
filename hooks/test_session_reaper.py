@@ -455,6 +455,12 @@ class RedactionParityTests(unittest.TestCase):
         "workerd serve --socket-addr=entry=127.0.0.1:8773 --control-fd=3 -",
         "mcp-remote https://example.com/sse?token=fakeval-six",
         "node --author someone --keyframes 3 server.js",
+        "redis-server --redis-url redis://:fakepw-a@h:6379",
+        "git clone https://fakepat-b@gitlab.com/x.git",
+        "psql postgres://u:fake@pw-c@db.local/x",
+        "tool --pass fakepw-d --pw fakepw-e",
+        "mcp-remote https://h/sse -H Authorization: Bearer fakeval-f",
+        "open https://example.com/a@b",
         "plain command with no secrets at all",
     )
 

@@ -297,12 +297,13 @@ CONTAINER_PREFIX = "supabase_"
 # `wrangler pages dev --binding ANTHROPIC_API_KEY=...` put live keys in argv,
 # and the old flag-only rule printed them in `report` output.
 _CREDENTIAL_FLAG_RE = re.compile(
-    r"(?<!\S)(--[\w-]*(?:token|key|secret|password|passwd|bearer|auth|credential)[\w-]*)"
+    r"(?<!\S)(--[\w-]*(?:token|key|secret|pass|pw|bearer|auth|credential)[\w-]*)"
     r"(=|\s+)(\S+)",
     re.IGNORECASE,
 )
 _NAME_VALUE_RE = re.compile(r"([A-Za-z0-9_.-]+=)\S+")
-_URL_USERINFO_RE = re.compile(r"://[^\s/@:]+:[^\s/@]+@")
+_URL_USERINFO_RE = re.compile(r"://[^\s/]+@")
+_AUTH_SCHEME_RE = re.compile(r"\b(bearer|basic)\s+\S+", re.IGNORECASE)
 _CREDENTIAL_PREFIX_RE = re.compile(
     r"(sk-ant-|sk-proj-|ctx7sk-|ghp_|xox[a-z]-)[A-Za-z0-9_-]*"
 )
@@ -355,6 +356,7 @@ def redact(command: str) -> str:
     out = _CREDENTIAL_FLAG_RE.sub(r"\g<1>\g<2>REDACTED", command)
     out = _NAME_VALUE_RE.sub(r"\g<1>REDACTED", out)
     out = _URL_USERINFO_RE.sub("://REDACTED@", out)
+    out = _AUTH_SCHEME_RE.sub(r"\g<1> REDACTED", out)
     return _CREDENTIAL_PREFIX_RE.sub(lambda m: f"{m.group(0)[:6]}***", out)
 
 

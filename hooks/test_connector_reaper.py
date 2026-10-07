@@ -118,6 +118,31 @@ class RedactionTests(unittest.TestCase):
         self.assertIn("--key REDACTED", out)
         self.assertIn("postgres://REDACTED@db.local/x", out)
 
+    def test_userinfo_shapes_short_password_flags_and_bearer_headers(self) -> None:
+        """The commit review of 59beff5: an empty username, token-only
+        userinfo, an @ inside the password, --pass/--pw, and a -H header
+        that ps shows unquoted as `Authorization: Bearer <tok>`."""
+        cases = {
+            "redis-server --redis-url redis://:fakepw-a@h:6379": ("fakepw-a",),
+            "git clone https://fakepat-b@gitlab.com/x.git": ("fakepat-b",),
+            "psql postgres://u:fake@pw-c@db.local/x": ("fake", "pw-c"),
+            "tool --pass fakepw-d --pw fakepw-e": ("fakepw-d", "fakepw-e"),
+            "mcp-remote https://h/sse -H Authorization: Bearer fakeval-f": ("fakeval-f",),
+            "curl -H Authorization: basic fakeval-g": ("fakeval-g",),
+        }
+        for cmd, fakes in cases.items():
+            with self.subTest(cmd=cmd):
+                out = cr.redact(cmd)
+                for fake in fakes:
+                    self.assertNotIn(fake, out)
+        self.assertEqual(
+            cr.redact("psql postgres://u:fake@pw-c@db.local/x"),
+            "psql postgres://REDACTED@db.local/x",
+            "the host and path stay readable",
+        )
+        self.assertEqual(cr.redact("open https://example.com/a@b"), "open https://example.com/a@b",
+                         "an @ in a path is not userinfo")
+
     def test_report_never_prints_a_name_value_binding(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             fake_ps = _write_fake_ps(
