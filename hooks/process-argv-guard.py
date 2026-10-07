@@ -382,12 +382,15 @@ def analyze(command: str, depth: int = 0) -> str | None:
     command = HEREDOC.sub(r"\1\3", command)
 
     # Command substitutions run even inside double quotes; single quotes are data.
-    for m in SUBST.finditer(SINGLE_QUOTED.sub("''", command)):
+    # An escaped backtick or \$( is literal text, not a substitution: a commit
+    # message quoting `ps aux | grep` in double quotes was denied (2026-10-07).
+    scan = re.sub(r"\\[`$]", "", SINGLE_QUOTED.sub("''", command))
+    for m in SUBST.finditer(scan):
         hit = analyze(m.group(1) or m.group(2) or "", depth + 1)
         if hit:
             return hit
 
-    flat = command.replace("`", " ; ")
+    flat = re.sub(r"(?<!\\)`", " ; ", command)
     try:
         parsed = pipelines(flat)
     except ValueError:
