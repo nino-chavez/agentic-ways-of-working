@@ -1297,6 +1297,14 @@ class TabUrlRedactionTests(unittest.TestCase):
         for url, want in cases.items():
             self.assertEqual(sr.redact_url(url), want)
 
+    def test_userinfo_nested_in_the_path_is_blanked(self) -> None:
+        """Splitting the path into segments must not break the userinfo rule:
+        `://` and `user:pass@` land in different segments."""
+        for url in ("http://localhost:3000/proxy/http://bob:fakepw-3@db/x",
+                    "http://localhost:3000/connect/bob:fakepw-4@db/x",
+                    "http://localhost:3000/p/postgres://admin:fakepw-5@h"):
+            self.assertNotIn("fakepw-", sr.redact_url(url), url)
+
     def test_ordinary_route_segments_stay_readable(self) -> None:
         for url in ("http://localhost:5173/auth/callback",
                     "http://localhost:5173/admin/tournaments/2026-10-07/brackets",

@@ -384,10 +384,16 @@ def _path_segment(seg: str) -> str:
     (`/reset/<uid>/<token>/`, `/invite/<uuid>`, `/magic/<jwt>`), which no
     argv rule sees. Treat a segment as a token when it is 16+ characters with
     a digit, or 32+ characters at all. Route names, dates and file names stay
-    readable; a short invite code (under 16) is the named residual."""
+    readable; a short invite code (under 16) is the named residual.
+
+    A `user:pass@host` segment is blanked here too, because the split puts
+    it in a different segment from any `://` before it, so redact()'s
+    userinfo rule — run again over the rebuilt path — cannot see it."""
     if len(seg) >= 32 or (len(seg) >= 16 and any(c.isdigit() for c in seg)):
         return "REDACTED"
-    return redact(seg)
+    if "@" in seg and ":" in seg.split("@", 1)[0]:
+        return "REDACTED"
+    return seg
 
 
 def redact_url(url: str) -> str:
@@ -420,7 +426,7 @@ def redact_url(url: str) -> str:
         # `file:///x` has an empty netloc but keeps its `//`; `about:blank` has neither.
         slashes = "//" if parts.netloc or url[len(parts.scheme) + 1:].startswith("//") else ""
         out = f"{parts.scheme}:{slashes}{netloc}" if parts.scheme else netloc
-        out += "/".join(_path_segment(seg) for seg in parts.path.split("/"))
+        out += redact("/".join(_path_segment(seg) for seg in parts.path.split("/")))
         if parts.query:
             segs = []
             for seg in parts.query.split("&"):
