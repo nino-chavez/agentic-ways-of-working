@@ -93,11 +93,12 @@ class _RepoFixture(unittest.TestCase):
         self.git("add", ".gitignore", cwd=self.root)
         self.git("commit", "-m", f"ignore {pattern}", cwd=self.root)
 
-    def reap(self, mode: str = "reap", idle_hours: str = "0") -> str:
+    def reap(self, mode: str = "reap", idle_hours: str = "0", extra_env: dict | None = None) -> str:
         """Run `reap` (or `reap-now`) against the fixture repo; return the log."""
         environment = os.environ.copy()
         environment["WORKTREE_REAPER_LOG"] = str(self.log)
         environment["WORKTREE_REAPER_ARTIFACT_IDLE_HOURS"] = idle_hours
+        environment.update(extra_env or {})
         subprocess.run(
             [sys.executable, str(SCRIPT), mode, str(self.root)],
             cwd=self.root,
@@ -179,6 +180,84 @@ class WorktreeCloseoutTests(_RepoFixture):
             "branch=unmerged-task default=main state=unmerged-clean action=open-pr-or-hold",
             self.log.read_text(encoding="utf-8"),
         )
+
+
+
+class LandedBranchTests(_RepoFixture):
+    """A branch counts as landed when the base branch already holds its work,
+    not only when its commits are ancestors of local main. Measured 2026-10-06
+    over the closeout log: 872 holds as `unmerged-clean`; of the 139 held
+    branches that still existed, 58 were merged on the remote but missing from
+    a stale local main and 7 had landed in origin/main or by squash or
+    cherry-pick. The branch itself is never deleted either way."""
+
+    def task_with_two_commits(self, name: str) -> Path:
+        worktree = self.add_worktree(name)
+        (worktree / "task.txt").write_text("one\n", encoding="utf-8")
+        self.git("add", "task.txt", cwd=worktree)
+        self.git("commit", "-m", "task one", cwd=worktree)
+        (worktree / "task.txt").write_text("one\ntwo\n", encoding="utf-8")
+        self.git("commit", "-am", "task two", cwd=worktree)
+        return worktree
+
+    def squash_into_main(self, branch: str) -> None:
+        self.git("merge", "--squash", branch, cwd=self.root)
+        self.git("commit", "-m", f"squash {branch}", cwd=self.root)
+
+    def test_squash_merged_worktree_is_removed_at_closeout(self) -> None:
+        worktree = self.task_with_two_commits("squashed")
+        self.squash_into_main("squashed")
+        head = self.git("rev-parse", "squashed", cwd=self.root)
+
+        self.closeout(worktree)
+
+        self.assertFalse(worktree.exists())
+        self.assertEqual(self.git("rev-parse", "--verify", "squashed", cwd=self.root), head)
+        self.assertIn("state=merged-clean action=removed landed=content", self.log.read_text(encoding="utf-8"))
+
+    def test_branch_merged_only_in_origin_main_is_removed_at_closeout(self) -> None:
+        worktree = self.task_with_two_commits("remote-merged")
+        # The remote merged the branch; local main was never pulled.
+        self.git("checkout", "-q", "-b", "remote-view", "main", cwd=self.root)
+        self.git("merge", "--no-ff", "remote-merged", "-m", "merge on remote", cwd=self.root)
+        self.git("update-ref", "refs/remotes/origin/main", "remote-view", cwd=self.root)
+        self.git("checkout", "-q", "main", cwd=self.root)
+        self.git("branch", "-D", "remote-view", cwd=self.root)
+
+        self.closeout(worktree)
+
+        self.assertFalse(worktree.exists())
+        self.assertIn("state=merged-clean action=removed landed=origin", self.log.read_text(encoding="utf-8"))
+
+    def test_squash_merge_later_reverted_is_kept(self) -> None:
+        worktree = self.task_with_two_commits("reverted")
+        self.squash_into_main("reverted")
+        self.git("revert", "--no-edit", "HEAD", cwd=self.root)
+
+        self.closeout(worktree)
+
+        self.assertTrue(worktree.exists())
+        self.assertIn("branch=reverted default=main state=unmerged-clean", self.log.read_text(encoding="utf-8"))
+
+    def test_reap_now_removes_an_idle_squash_merged_worktree(self) -> None:
+        worktree = self.task_with_two_commits("idle-squashed")
+        self.squash_into_main("idle-squashed")
+        backdate(worktree)
+        head = self.git("rev-parse", "idle-squashed", cwd=self.root)
+
+        line = self.reap(mode="reap-now", extra_env={"WORKTREE_REAPER_REMOVE_IDLE_DAYS": "1"})
+
+        self.assertFalse(worktree.exists())
+        self.assertEqual(self.git("rev-parse", "--verify", "idle-squashed", cwd=self.root), head)
+        self.assertIn("worktrees_removed=1", line)
+
+    def test_reap_now_keeps_an_idle_unmerged_worktree(self) -> None:
+        worktree = self.task_with_two_commits("idle-unmerged")
+        backdate(worktree)
+
+        self.reap(mode="reap-now", extra_env={"WORKTREE_REAPER_REMOVE_IDLE_DAYS": "1"})
+
+        self.assertTrue(worktree.exists())
 
 
 
