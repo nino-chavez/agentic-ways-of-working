@@ -36,6 +36,9 @@ Three independent actions, each separately gated and separately dry-runnable:
      is not listening. Over CDP, one target at a time. The browser process is
      never signalled and the profile directory is never touched (that profile
      holds Nino's logins, and browse-profile-guard.py protects it).
+     Tab URLs print through redact_url(): query values, token-shaped path
+     segments, fragment and userinfo are blanked before `report` output or
+     the reap log (a path token under 16 characters is not caught).
   3. supabase stacks — stop every container of a local stack whose project
      id no live session claims, running longer than STACK_IDLE_HOURS. The
      database last, by its own stop signal and never force-killed; success
@@ -367,6 +370,78 @@ def truncate(s: str, n: int = 120) -> str:
 def safe_cmd(command: str) -> str:
     """What goes in a log line: redacted, then capped."""
     return truncate(redact(command))
+
+
+# A query key worth keeping on screen: short and identifier-shaped. Anything
+# else in key position — a long token, a bare `?<magic-token>` — is a value.
+_QUERY_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.\-\[\]]{0,31}")
+# Schemes whose "path" is content rather than a location.
+_PAYLOAD_SCHEMES = {"data", "javascript"}
+
+
+def _path_segment(seg: str) -> str:
+    """Reset, invite and magic-link flows carry the secret as a path segment
+    (`/reset/<uid>/<token>/`, `/invite/<uuid>`, `/magic/<jwt>`), which no
+    argv rule sees. Treat a segment as a token when it is 16+ characters with
+    a digit, or 32+ characters at all. Route names, dates and file names stay
+    readable; a short invite code (under 16) is the named residual.
+
+    A `user:pass@host` segment is blanked here too, because the split puts
+    it in a different segment from any `://` before it, so redact()'s
+    userinfo rule — run again over the rebuilt path — cannot see it."""
+    if len(seg) >= 32 or (len(seg) >= 16 and any(c.isdigit() for c in seg)):
+        return "REDACTED"
+    if "@" in seg and ":" in seg.split("@", 1)[0]:
+        return "REDACTED"
+    return seg
+
+
+def redact_url(url: str) -> str:
+    """A tab URL as it may appear in `report` output and the reap log.
+
+    Separate from redact(), which is argv-shaped and must stay identical to
+    connector-reaper.py's copy. Page URLs carry credentials argv rules do not
+    see: an OAuth callback's code= and state=, an implicit grant's
+    #access_token=, a magic link's bare ?<token> or /magic/<token>. So scheme,
+    host, port and route-shaped path segments stay readable — enough to see
+    which dead server a tab pointed at — and every query value, any
+    non-identifier query key, any token-shaped path segment (_path_segment),
+    the fragment and the userinfo are blanked. Fails closed: a URL that will not parse prints as
+    REDACTED-URL rather than raw.
+    """
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+        scheme = parts.scheme.lower()
+        if scheme in _PAYLOAD_SCHEMES:
+            return f"{scheme}:REDACTED"
+        netloc = ""
+        if parts.netloc:
+            host = parts.hostname or ""
+            if ":" in host:
+                host = f"[{host}]"
+            port = parts.port  # raises ValueError on a malformed port
+            netloc = host if port is None else f"{host}:{port}"
+        # `file:///x` has an empty netloc but keeps its `//`; `about:blank` has neither.
+        slashes = "//" if parts.netloc or url[len(parts.scheme) + 1:].startswith("//") else ""
+        out = f"{parts.scheme}:{slashes}{netloc}" if parts.scheme else netloc
+        out += redact("/".join(_path_segment(seg) for seg in parts.path.split("/")))
+        if parts.query:
+            segs = []
+            for seg in parts.query.split("&"):
+                key, eq, _value = seg.partition("=")
+                if (eq and _QUERY_KEY_RE.fullmatch(key)
+                        and not _CREDENTIAL_PREFIX_RE.search(key)):
+                    segs.append(f"{key}=REDACTED")
+                else:
+                    segs.append("REDACTED")
+            out += "?" + "&".join(segs)
+        if parts.fragment:
+            out += "#REDACTED"
+        return out
+    except Exception:
+        return "REDACTED-URL"
 
 
 def fmt_hours(seconds: float) -> str:
@@ -1164,7 +1239,9 @@ def plan_tabs() -> tuple[list[dict], list[dict]]:
     for t in pages:
         url = str(t.get("url", ""))
         tid = t.get("id")
-        row = {"id": tid, "url": truncate(url, 100), "port": None}
+        # Display only: redact before the cap so a cut can never land inside
+        # a value. Every decision below still reads the raw `url`.
+        row = {"id": tid, "url": truncate(redact_url(url), 100), "port": None}
         if not tid:
             row["reason"] = "no_target_id"
             keep.append(row)

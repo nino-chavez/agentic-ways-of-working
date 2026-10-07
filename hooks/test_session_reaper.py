@@ -62,6 +62,15 @@ SECRET_ARGV = (
 )
 SECRET_FAKES = ("fakeval-one", "fakepw-two", "fakeval-three", "fakeval-four")
 
+# Tab URLs carry credentials too: an OAuth callback's code= and state=, an
+# implicit-grant #access_token=, a magic link's bare ?token. All fabricated, and
+# every one stays under plan_tabs()'s 100-character cap so truncation cannot
+# hide a value and pass a test against code that does not redact.
+TAB_CALLBACK = "/cb?code=fakecode-1&state=fakestate-2#access_token=faketok-3"
+TAB_MAGIC_BARE = "/verify?fakebare-5"
+TAB_EXTERNAL = "https://accounts.example.com/magic?token=fakemagic-4&next=%2Fhome"
+TAB_FAKES = ("fakecode-1", "fakestate-2", "faketok-3", "fakemagic-4", "fakebare-5")
+
 MODULE_TIMEOUT_SECONDS = 180
 CHILD_TIMEOUT_SECONDS = 60
 
@@ -1243,6 +1252,99 @@ class TabPlanTests(unittest.TestCase):
         self.assertEqual(keep[0]["reason"], "cdp_not_answering")
 
 
+class TabUrlRedactionTests(unittest.TestCase):
+    """redact_url() keeps a tab URL readable enough to act on — scheme, host,
+    port, path — and blanks everything that can carry a credential."""
+
+    def test_query_values_and_the_fragment_are_blanked(self) -> None:
+        self.assertEqual(
+            sr.redact_url(f"http://127.0.0.1:5230{TAB_CALLBACK}"),
+            "http://127.0.0.1:5230/cb?code=REDACTED&state=REDACTED#REDACTED",
+        )
+
+    def test_a_bare_query_segment_is_a_value_not_a_key(self) -> None:
+        self.assertEqual(
+            sr.redact_url(f"http://localhost:5173{TAB_MAGIC_BARE}"),
+            "http://localhost:5173/verify?REDACTED",
+        )
+
+    def test_a_credential_shaped_key_is_blanked_too(self) -> None:
+        out = sr.redact_url("http://localhost:5173/x?sk-ant-fakekey-6=1&a=2")  # pragma: allowlist secret (fabricated)
+        self.assertNotIn("fakekey-6", out)
+        self.assertIn("a=REDACTED", out)
+
+    def test_userinfo_is_dropped_and_ipv6_brackets_survive(self) -> None:
+        self.assertEqual(
+            sr.redact_url("http://u:fakepw-7@[::1]:8080/app"),
+            "http://[::1]:8080/app",
+        )
+
+    def test_a_credential_in_the_path_is_redacted(self) -> None:
+        out = sr.redact_url("http://localhost:3000/hook/ghp_fakepat8/x")  # pragma: allowlist secret (fabricated)
+        self.assertNotIn("fakepat8", out)
+        self.assertTrue(out.startswith("http://localhost:3000/hook/"))
+
+    def test_a_token_shaped_path_segment_is_blanked(self) -> None:
+        """Reset, invite and magic-link flows put the secret in the path."""
+        cases = {
+            "https://app.example.com/reset/MQ/c3k2ab-fakereset1-9f8e7d6c/":
+                "https://app.example.com/reset/MQ/REDACTED/",
+            "http://localhost:5173/invite/0f8b1c2a-3d4e-4f50-9a6b-7c8d9e0f1a2b":
+                "http://localhost:5173/invite/REDACTED",
+            "http://localhost:5173/magic/eyJhbGciOiJIUzI1NiJ9.fakejwt2.sig":
+                "http://localhost:5173/magic/REDACTED",
+        }
+        for url, want in cases.items():
+            self.assertEqual(sr.redact_url(url), want)
+
+    def test_userinfo_nested_in_the_path_is_blanked(self) -> None:
+        """Splitting the path into segments must not break the userinfo rule:
+        `://` and `user:pass@` land in different segments."""
+        for url in ("http://localhost:3000/proxy/http://bob:fakepw-3@db/x",
+                    "http://localhost:3000/connect/bob:fakepw-4@db/x",
+                    "http://localhost:3000/p/postgres://admin:fakepw-5@h"):
+            self.assertNotIn("fakepw-", sr.redact_url(url), url)
+
+    def test_ordinary_route_segments_stay_readable(self) -> None:
+        for url in ("http://localhost:5173/auth/callback",
+                    "http://localhost:5173/admin/tournaments/2026-10-07/brackets",
+                    "devtools://devtools/bundled/inspector.html"):
+            self.assertEqual(sr.redact_url(url), url)
+
+    def test_browser_internal_pages_stay_readable(self) -> None:
+        self.assertEqual(sr.redact_url("about:blank"), "about:blank")
+        self.assertEqual(sr.redact_url("chrome://newtab/"), "chrome://newtab/")
+
+    def test_data_and_javascript_payloads_are_blanked(self) -> None:
+        self.assertEqual(sr.redact_url("data:text/html,<b>fakedata-9</b>"), "data:REDACTED")
+        self.assertEqual(sr.redact_url("javascript:alert('fakejs-0')"), "javascript:REDACTED")
+
+    def test_a_url_that_will_not_parse_fails_closed(self) -> None:
+        out = sr.redact_url("http://127.0.0.1:99999999/x?y=fakeport-1")
+        self.assertNotIn("fakeport-1", out)
+        self.assertEqual(out, "REDACTED-URL")
+
+    def test_plan_rows_carry_only_redacted_urls(self) -> None:
+        dead = TabPlanTests._dead_port()
+        cdp = _FakeCDP([
+            {"id": "A", "type": "page", "url": f"http://127.0.0.1:{dead}{TAB_CALLBACK}"},
+            {"id": "B", "type": "page", "url": f"http://localhost:{dead}{TAB_MAGIC_BARE}"},
+            {"id": "C", "type": "page", "url": TAB_EXTERNAL},
+        ])
+        self.addCleanup(cdp.stop)
+        saved = sr.CDP_URL
+        self.addCleanup(lambda: setattr(sr, "CDP_URL", saved))
+        sr.CDP_URL = cdp.url
+        close, keep = sr.plan_tabs()
+        # Decisions still read the raw URL: both dead tabs close, the external
+        # one is kept as not local.
+        self.assertCountEqual([r["id"] for r in close], ["A", "B"])
+        self.assertEqual([r["reason"] for r in keep], ["not_a_local_url"])
+        rendered = json.dumps(close + keep)
+        for fake in TAB_FAKES:
+            self.assertNotIn(fake, rendered)
+
+
 class SharedBrowserPortTests(unittest.TestCase):
     """The browser's port is read from browse-tool's state files, never recalled.
 
@@ -1815,6 +1917,43 @@ class CliTests(_RepoFixture):
         finally:
             os.close(read_fd)
             os.close(write_fd)
+
+    def _serve_secret_tabs(self) -> int:
+        """Two tabs on one dead port plus one external tab. Two dead tabs, not
+        one: with the external page present neither is the last page, so both
+        close and both reach the reap log."""
+        dead = TabPlanTests._dead_port()
+        self.cdp.targets = [
+            {"id": "A", "type": "page", "url": f"http://127.0.0.1:{dead}{TAB_CALLBACK}"},
+            {"id": "B", "type": "page", "url": f"http://localhost:{dead}{TAB_MAGIC_BARE}"},
+            {"id": "C", "type": "page", "url": TAB_EXTERNAL},
+        ]
+        return dead
+
+    def test_report_never_prints_tab_url_secrets(self) -> None:
+        dead = self._serve_secret_tabs()
+        r = self.run_cli("report", str(self.root), extra={"SESSION_REAPER_ACTIONS": "tabs"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # The rows must print for the absence checks to mean anything.
+        self.assertIn("browser tabs to close (2)", r.stdout)
+        self.assertIn(f"http://127.0.0.1:{dead}/cb?", r.stdout)
+        self.assertIn("https://accounts.example.com/magic?", r.stdout)
+        for fake in TAB_FAKES:
+            self.assertNotIn(fake, r.stdout)
+            self.assertNotIn(fake, r.stderr)
+        self.assertEqual(self.cdp.closed, [], "report must never close a tab")
+
+    def test_the_reap_log_never_records_tab_url_secrets(self) -> None:
+        self._serve_secret_tabs()
+        r = self.run_cli("reap", extra={"SESSION_REAPER_ACTIONS": "tabs"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertCountEqual(self.cdp.closed, ["A", "B"])
+        text = self.log.read_text(encoding="utf-8")
+        self.assertEqual(text.count("closed_tab "), 2, text)
+        for fake in TAB_FAKES:
+            self.assertNotIn(fake, text)
+            self.assertNotIn(fake, r.stdout)
+            self.assertNotIn(fake, r.stderr)
 
 
 if __name__ == "__main__":
