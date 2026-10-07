@@ -285,12 +285,24 @@ _UNROUTABLE = {
 DB_CONTAINER_PREFIX = "supabase_db_"
 CONTAINER_PREFIX = "supabase_"
 
-# Credential redaction, copied from connector-reaper.py. Dev-server argv is not
-# the credential-carrying surface MCP argv is, but this file logs command lines
-# and a `zsh -c` wrapper in the observed tree carried environment exports.
+# Credential redaction: a copy of connector-reaper.py's rules and redact(),
+# which own the reasoning for each pattern. Two copies rather than a shared
+# module because every hook here is installed as its own file symlink into
+# ~/.claude/hooks and ~/.codex/hooks and none imports a sibling; a shared
+# module would need its own install step on every machine, and a missing one
+# would crash this SessionEnd hook. test_session_reaper.RedactionParityTests
+# fails if the two copies ever disagree.
+#
+# Dev-server argv IS a credential-carrying surface. Measured 2026-10-07:
+# `wrangler pages dev --binding ANTHROPIC_API_KEY=...` put live keys in argv,
+# and the old flag-only rule printed them in `report` output.
 _CREDENTIAL_FLAG_RE = re.compile(
-    r"(--api-key|--token|--secret|--password|--bearer)(=|\s+)(\S+)", re.IGNORECASE
+    r"(?<!\S)(--[\w-]*(?:token|key|secret|password|passwd|bearer|auth|credential)[\w-]*)"
+    r"(=|\s+)(\S+)",
+    re.IGNORECASE,
 )
+_NAME_VALUE_RE = re.compile(r"([A-Za-z0-9_.-]+=)\S+")
+_URL_USERINFO_RE = re.compile(r"://[^\s/@:]+:[^\s/@]+@")
 _CREDENTIAL_PREFIX_RE = re.compile(
     r"(sk-ant-|sk-proj-|ctx7sk-|ghp_|xox[a-z]-)[A-Za-z0-9_-]*"
 )
@@ -339,11 +351,10 @@ def clipped(cap: float) -> float:
 
 
 def redact(command: str) -> str:
-    """Never let a full credential reach stdout or the log. From connector-reaper."""
-    def _flag_sub(m: re.Match) -> str:
-        return f"{m.group(1)}{m.group(2)}{m.group(3)[:6]}***"
-
-    out = _CREDENTIAL_FLAG_RE.sub(_flag_sub, command)
+    """Never let a credential reach stdout or the log. Copy of connector-reaper's."""
+    out = _CREDENTIAL_FLAG_RE.sub(r"\g<1>\g<2>REDACTED", command)
+    out = _NAME_VALUE_RE.sub(r"\g<1>REDACTED", out)
+    out = _URL_USERINFO_RE.sub("://REDACTED@", out)
     return _CREDENTIAL_PREFIX_RE.sub(lambda m: f"{m.group(0)[:6]}***", out)
 
 

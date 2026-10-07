@@ -45,6 +45,23 @@ _spec = importlib.util.spec_from_file_location("session_reaper", SCRIPT)
 sr = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sr)  # type: ignore[union-attr]
 
+# The connector reaper's redact() is the other copy of the same rule; see
+# RedactionParityTests for why there are two and how they are held together.
+_cr_spec = importlib.util.spec_from_file_location(
+    "connector_reaper_for_parity", SCRIPT.with_name("connector-reaper.py")
+)
+cr = importlib.util.module_from_spec(_cr_spec)
+_cr_spec.loader.exec_module(cr)  # type: ignore[union-attr]
+
+# The 2026-10-07 shape: dev-server argv carrying live secrets as NAME=value
+# bindings, a bare --key, a --client-secret=, and URL userinfo. No $, backticks
+# or double quotes, because the fake `ps` echoes these through sh.
+SECRET_ARGV = (
+    "--binding A_KEY=fakeval-one DATABASE_URL=postgres://u:fakepw-two@h "
+    "--key fakeval-three --client-secret=fakeval-four"
+)
+SECRET_FAKES = ("fakeval-one", "fakepw-two", "fakeval-three", "fakeval-four")
+
 MODULE_TIMEOUT_SECONDS = 180
 CHILD_TIMEOUT_SECONDS = 60
 
@@ -413,6 +430,39 @@ class ParsingTests(unittest.TestCase):
         out = sr.safe_cmd(f"node server.js --token {secret}")
         self.assertNotIn(secret, out)
 
+    def test_name_value_bindings_flags_and_url_userinfo_are_blanked(self) -> None:
+        out = sr.redact(f"npx wrangler pages dev {SECRET_ARGV} --db postgres://admin:fakepw-five@db/x")
+        for fake in (*SECRET_FAKES, "fakepw-five"):
+            self.assertNotIn(fake, out)
+        self.assertIn("A_KEY=REDACTED", out)
+        self.assertIn("--key REDACTED", out)
+        self.assertIn("postgres://REDACTED@db/x", out)
+
+
+class RedactionParityTests(unittest.TestCase):
+    """Two copies, one rule. The hooks are installed as individual file
+    symlinks into ~/.claude/hooks and ~/.codex/hooks and none imports a
+    sibling, so a shared module would need its own install step on every
+    machine, and a missing one would crash a SessionEnd hook. This test is what
+    keeps the copies from drifting instead."""
+
+    CORPUS = (
+        f"npx wrangler pages dev {SECRET_ARGV}",
+        "node context7-mcp --api-key ctx7sk-0000dead-beef",  # pragma: allowlist secret (fabricated)
+        "server --token fakeval-seven --password=fakeval-eight",
+        "psql postgres://admin:fakepw-five@db.local:5432/app",
+        "zsh -c export CODEX_TRANSCRIPT=/x/y.jsonl FOO=bar; vite dev",
+        "workerd serve --socket-addr=entry=127.0.0.1:8773 --control-fd=3 -",
+        "mcp-remote https://example.com/sse?token=fakeval-six",
+        "node --author someone --keyframes 3 server.js",
+        "plain command with no secrets at all",
+    )
+
+    def test_both_reapers_redact_identically(self) -> None:
+        for cmd in self.CORPUS:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(sr.redact(cmd), cr.redact(cmd))
+
 
 class PortProbeTests(unittest.TestCase):
     def test_a_listening_port_reads_listening(self) -> None:
@@ -505,6 +555,21 @@ class DevServerPlanTests(_RepoFixture):
         procs = dict(self.ORPHAN_TREE)
         procs[300] = proc(1, f"node {wt}/node_modules/.bin/vite dev --port 5198", age)
         return procs
+
+    def test_plan_rows_carry_redacted_commands_for_root_and_descendants(self) -> None:
+        """Every reap log line and report line reads row["command"] or a tree
+        entry's "command", so redaction here covers both outputs."""
+        wt = self.add_worktree("stale")
+        procs = dict(self.ORPHAN_TREE)
+        procs[300] = proc(1, f"node {SECRET_ARGV} {wt}/node_modules/.bin/vite dev --port 5198")
+        procs[301] = proc(300, f"node {SECRET_ARGV} {wt}/node_modules/esbuild/bin/esbuild --service")
+        self.stub_processes(procs, {300: str(wt), 301: str(wt)})
+        kill, _keep = self.plan_dev()
+        self.assertEqual([r["pid"] for r in kill], [300])
+        self.assertEqual([t["pid"] for t in kill[0]["tree"]], [301])
+        for text in (kill[0]["command"], kill[0]["tree"][0]["command"]):
+            for fake in SECRET_FAKES:
+                self.assertNotIn(fake, text)
 
     def test_orphaned_lockless_worktree_server_is_planned_for_kill(self) -> None:
         wt = self.add_worktree("stale")
@@ -1278,6 +1343,28 @@ class CliTests(_RepoFixture):
         self.assertIn("pid=300", r.stdout)
         self.assertIn("dev servers to SIGTERM (1)", r.stdout)
         self.assertFalse(self.log.exists(), "report must not write the reap log")
+
+    def test_report_never_prints_argv_secrets_for_a_root_or_its_tree(self) -> None:
+        """The secrets sit BEFORE the worktree path on purpose: safe_cmd caps a
+        line at 120 characters and the temp-dir worktree path is long, so a
+        secret placed after it would be cut off and this test would pass
+        against code that does not redact at all."""
+        _write_fake(self.bin, "ps", (
+            'echo "1 0 10:00:00 5000 /sbin/launchd"\n'
+            f'echo "300 1 20:00:00 70000 node {SECRET_ARGV} {self.wt}/node_modules/.bin/vite dev"\n'
+            f'echo "301 300 20:00:00 9000 node {SECRET_ARGV} {self.wt}/node_modules/esbuild/bin/esbuild"'
+        ))
+        _write_fake(self.bin, "lsof", (
+            f'echo "p300"; echo "fcwd"; echo "n{self.wt}"; '
+            f'echo "p301"; echo "fcwd"; echo "n{self.wt}"'
+        ))
+        r = self.run_cli("report", str(self.root))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("pid=300", r.stdout, "the row must print for this to test anything")
+        self.assertIn("pid=301", r.stdout, "the tree line must print for this to test anything")
+        for fake in SECRET_FAKES:
+            self.assertNotIn(fake, r.stdout)
+            self.assertNotIn(fake, r.stderr)
 
     def test_report_lists_a_wrangler_tree_under_its_root(self) -> None:
         """The 2026-09-24 chain through the real CLI: wrangler.js (PPID 1) ->
