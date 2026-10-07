@@ -83,6 +83,13 @@ DENY = [
     "bash <<'EOF'\nps aux\nEOF",
     "cat <<'EOF' | sh\npgrep -fl wrangler\nEOF",
     "sudo zsh -s <<EOF\necho hi\nps -ef\nEOF",
+    # commit review of 95d64a3
+    "cat <<EOF\n$(ps aux)\nEOF",
+    "cat <<EOF\n`pgrep -fl wrangler`\nEOF",
+    "bash <<< 'ps aux'",
+    "sh <<< \"pgrep -fl wrangler\"",
+    "ps aux | sed -E -e p -e 's/([A-Za-z0-9_.-]+=)[^[:space:]]+/\\1REDACTED/g'",
+    "ps aux | sed -n -E 's/([A-Za-z0-9_.-]+=)[^[:space:]]+/\\1REDACTED/gp'",
     "/bin/ps aux",
     "if pgrep -fl wrangler; then echo up; fi",
     "pstree -p 123",
@@ -125,6 +132,9 @@ ALLOW = [
     "bash <<'EOF'\npgrep -f wrangler | wc -l\nEOF",
     "cat <<'EOF' > script.sh\nps aux\nEOF",
     "python3 - <<'EOF'\nprint('ps aux')\nEOF",
+    "cat <<'EOF'\n$(ps aux) is documented here\nEOF",
+    "bash <<< 'pgrep -f wrangler | wc -l'",
+    "ps aux | sed -E -e 's/([A-Za-z0-9_.-]+=)[^[:space:]]+/\\1REDACTED/g'",
     # names that merely start with ps
     "psql -c 'select 1'",
     "pstree -p 123 | wc -l",

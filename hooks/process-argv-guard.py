@@ -141,7 +141,9 @@ def pipelines(command: str) -> list[list[list[str]]]:
             continue
         if "<" in t or ">" in t:
             target = toks[i + 1] if i + 1 < len(toks) else ""
-            if "<" in t and target:
+            if t == "<<<" and target:
+                cur.append("<<<" + target)  # a here-string is read as input
+            elif "<" in t and target:
                 cur.append("<" + target)
             i += 2
             continue
@@ -301,8 +303,12 @@ def sanitizes(words: list[str]) -> bool:
     name = base(words[0])
     if name == "wc":
         return True
-    if name == "sed":  # only the canonical redactor; a sed that merely says REDACTED is not one
-        return any(REDACTOR_CORE in w for w in words[1:])
+    if name == "sed":
+        # Only the canonical redactor, alone: a sed that merely says REDACTED is
+        # not one, and `-e p` / `-n` before it would print lines unredacted.
+        args = words[1:]
+        return (any(REDACTOR_CORE in w for w in args)
+                and all(w in ("-E", "-r", "-e") or REDACTOR_CORE in w for w in args))
     if name in ("grep", "egrep", "rg"):
         for w in words[1:]:
             if w in ("--count", "--quiet", "--silent"):
@@ -327,6 +333,9 @@ def stage_leak(words: list[str], depth: int) -> str | None:
     if name in ("pstree", "procs"):  # both print full command lines by default
         return f"{name} printing full command lines"
     if name in SHELLS:
+        for a in args:
+            if a.startswith("<<<"):  # bash <<< 'ps aux'
+                return analyze(a[3:], depth + 1)
         for k, a in enumerate(args):
             if a.startswith("-") and not a.startswith("--") and "c" in a[1:]:
                 if k + 1 < len(args):
@@ -360,6 +369,12 @@ def analyze(command: str, depth: int = 0) -> str | None:
         return None
     command = re.sub(r"\\\r?\n", " ", command)
     for m in HEREDOC.finditer(command):
+        if not re.search(r"['\"]", m.group(1)):
+            # An unquoted delimiter still runs $(...) and backticks in the body.
+            for sub in SUBST.finditer(m.group(4)):
+                hit = analyze(sub.group(1) or sub.group(2) or "", depth + 1)
+                if hit:
+                    return hit
         if heredoc_to_shell(command, m):
             hit = analyze(m.group(4), depth + 1)
             if hit:
