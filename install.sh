@@ -112,6 +112,11 @@ if ensure("SessionEnd",       f"python3 {claude_dir}/hooks/session-reaper.py rea
 # redundant re-reads of unchanged files. Image branch needs macOS sips;
 # fails open elsewhere.
 if ensure("PreToolUse",       f"python3 {claude_dir}/hooks/read-guard.py", 15, matcher="Read"):                   added.append("PreToolUse[Read]:read-guard")
+# Process-argv guard: deny commands that print other processes' argv
+# (pgrep -fl, ps aux, /proc/*/cmdline). Dev servers pass secrets as argv, and
+# the output lands in a persisted transcript (measured: ~7 credentials leaked
+# twice in one day). Safe forms and a redactor stage pass. Fails open.
+if ensure("PreToolUse",       f"python3 {claude_dir}/hooks/process-argv-guard.py", 5, matcher="Bash"):           added.append("PreToolUse[Bash]:process-argv-guard")
 # Output trim: read-guard's counterpart on the Bash side. Rewrites oversized
 # Bash stdout (head + tail + rescued error lines, original spilled to disk)
 # before the model sees it. Bash only; never Read/Edit/Agent. Fails open.
