@@ -82,18 +82,89 @@ class RedactionTests(unittest.TestCase):
         cmd = f"node context7-mcp --api-key {self.LIVE_KEY}"
         out = cr.redact(cmd)
         self.assertNotIn(self.LIVE_KEY, out)
-        self.assertIn("ctx7sk***", out)
+        self.assertIn("--api-key REDACTED", out)
 
     def test_prefix_shaped_token_is_masked_even_without_a_flag(self) -> None:
         cmd = f"mcp-remote@1.0 --url https://example.com/{self.LIVE_KEY}"
         out = cr.redact(cmd)
         self.assertNotIn(self.LIVE_KEY, out)
 
-    def test_generic_flag_value_is_capped_at_six_chars(self) -> None:
+    def test_generic_flag_value_is_blanked_whole(self) -> None:
+        """Six characters of an arbitrary password are six characters of the
+        password. Only provider-prefix tokens keep a prefix, and that prefix
+        is the provider's name, not the secret."""
         cmd = "server --token mySuperSecretValue123"
         out = cr.redact(cmd)
-        self.assertNotIn("mySuperSecretValue123", out)
-        self.assertIn("mySupe***", out)
+        self.assertNotIn("mySupe", out)
+        self.assertIn("--token REDACTED", out)
+
+    # The 2026-10-07 shape: dev-server argv carrying live secrets as NAME=value
+    # bindings, a bare --key, a --client-secret=, and URL userinfo. The
+    # fixtures avoid $, backticks and double quotes because the fake `ps`
+    # echoes them through sh.
+    DEV_ARGV = (
+        "npx wrangler pages dev --binding A_KEY=fakeval-one "
+        "DATABASE_URL=postgres://u:fakepw-two@h --key fakeval-three "
+        "--client-secret=fakeval-four --db postgres://admin:fakepw-five@db.local/x"
+    )
+    DEV_FAKES = ("fakeval-one", "fakepw-two", "fakeval-three", "fakeval-four", "fakepw-five")
+
+    def test_name_value_bindings_flags_and_url_userinfo_are_blanked(self) -> None:
+        out = cr.redact(self.DEV_ARGV)
+        for fake in self.DEV_FAKES:
+            self.assertNotIn(fake, out)
+        self.assertIn("A_KEY=REDACTED", out)
+        self.assertIn("DATABASE_URL=REDACTED", out)
+        self.assertIn("--key REDACTED", out)
+        self.assertIn("postgres://REDACTED@db.local/x", out)
+
+    def test_userinfo_shapes_short_password_flags_and_bearer_headers(self) -> None:
+        """The commit review of 59beff5: an empty username, token-only
+        userinfo, an @ inside the password, --pass/--pw, and a -H header
+        that ps shows unquoted as `Authorization: Bearer <tok>`."""
+        cases = {
+            "redis-server --redis-url redis://:fakepw-a@h:6379": ("fakepw-a",),
+            "git clone https://fakepat-b@gitlab.com/x.git": ("fakepat-b",),
+            "psql postgres://u:fake@pw-c@db.local/x": ("fake", "pw-c"),
+            "tool --pass fakepw-d --pw fakepw-e": ("fakepw-d", "fakepw-e"),
+            "mcp-remote https://h/sse -H Authorization: Bearer fakeval-f": ("fakeval-f",),
+            "curl -H Authorization: basic fakeval-g": ("fakeval-g",),
+        }
+        for cmd, fakes in cases.items():
+            with self.subTest(cmd=cmd):
+                out = cr.redact(cmd)
+                for fake in fakes:
+                    self.assertNotIn(fake, out)
+        self.assertEqual(
+            cr.redact("psql postgres://u:fake@pw-c@db.local/x"),
+            "psql postgres://REDACTED@db.local/x",
+            "the host and path stay readable",
+        )
+        self.assertEqual(cr.redact("open https://example.com/a@b"), "open https://example.com/a@b",
+                         "an @ in a path is not userinfo")
+
+    def test_report_never_prints_a_name_value_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            fake_ps = _write_fake_ps(
+                Path(td),
+                [
+                    (1, 0, "S", "01:00:00", 5000, "??", "/sbin/launchd"),
+                    (
+                        3325, 1, "S", "00:10:00", 28000, "??",
+                        "npm exec @upstash/context7-mcp --binding A_KEY=fakeval-one "
+                        "DATABASE_URL=postgres://u:fakepw-two@h --key fakeval-three",
+                    ),
+                ],
+            )
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "report"],
+                capture_output=True, text=True, env=_base_env(td, fake_ps),
+                stdin=subprocess.DEVNULL, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("pid=3325", result.stdout, "the row must print for this to test anything")
+            for fake in ("fakeval-one", "fakepw-two", "fakeval-three"):
+                self.assertNotIn(fake, result.stdout)
 
     def test_report_and_log_output_never_contain_the_live_key(self) -> None:
         """End-to-end: a connector process carrying a live key in argv must

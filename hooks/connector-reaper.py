@@ -78,12 +78,15 @@ Deviations from worktree-reaper.py, the structural model for this file:
 Secret-safety: connector command lines carry credentials in argv — the real
 observed case was `npm exec @upstash/context7-mcp --api-key ctx7sk-<live
 key>`, readable by any process on the machine via `ps`. Every command line
-this tool prints or logs is passed through redact() first: known credential
-flags (--api-key/--token/--secret/--password/--bearer) and known provider
-token shapes (sk-ant-, sk-proj-, ctx7sk-, ghp_, xox*) are masked to at most
-their first 6 characters + "***", regardless of whether a flag preceded
-them. There is a test asserting a real key is never emitted, in either the
-report/dry-run stdout path or the log file.
+this tool prints or logs is passed through redact() first. It blanks to
+REDACTED the value of any flag whose name says it carries a credential
+(--key, --api-key, --client-secret, --auth-token, ...), every NAME=value
+(the same rule as process-argv-guard.py's REDACTOR_CORE), the userinfo
+of any URL (postgres://u:pw@h), and the credential after Bearer/Basic. Known provider token shapes (sk-ant-,
+sk-proj-, ctx7sk-, ghp_, xox*) are masked to their first 6 characters +
+"***" wherever they appear, flag or no flag. There are tests asserting a
+fabricated key is never emitted, in either the report/dry-run stdout path or
+the log file.
 
 Off switch: CONNECTOR_REAPER_OFF=1, or touch the .guard-off file this module
 reports the path to. Throttle: per-repo precedent from worktree-reaper.py,
@@ -162,15 +165,37 @@ CLIENT_PATTERNS = (
     "node_repl",
 )
 
-# Known flags that carry a credential as their next token, and known
-# provider token-shape prefixes that get masked wherever they appear, flag
-# or no flag. Add a provider prefix here when a new one is observed — this
-# is the part of redaction that rots (mirrors the secret-scan pre-commit
+# Redaction rules. session-reaper.py carries a copy of these and of
+# redact(); test_session_reaper.RedactionParityTests holds the two together.
+#
+# A long flag is matched by what its NAME says, not by a list of exact flags:
+# the exact list (--api-key|--token|--secret|--password|--bearer) let --key and
+# --client-secret through. Short flags (-p) are not matched: -p is a port as
+# often as a password, and the other passes catch most short-flag secrets. Over-matching (--keyframes, --author) only blanks
+# a value in a report line; nothing decides anything from redacted text.
+# Add a provider prefix to _CREDENTIAL_PREFIX_RE when a new one is observed —
+# this is the part of redaction that rots (mirrors the secret-scan pre-commit
 # hook's own note about its provider-prefix list).
 _CREDENTIAL_FLAG_RE = re.compile(
-    r"(--api-key|--token|--secret|--password|--bearer)(=|\s+)(\S+)",
+    r"(?<!\S)(--[\w-]*(?:token|key|secret|pass|pw|bearer|auth|credential)[\w-]*)"
+    r"(=|\s+)(\S+)",
     re.IGNORECASE,
 )
+# Every NAME=value: process-argv-guard.py's REDACTOR_CORE, translated from
+# POSIX ERE ([^[:space:]] is \S here). Measured 2026-10-07: dev servers
+# carry live keys as `--binding ANTHROPIC_API_KEY=...`, and shell wrappers as
+# `export NAME=...`. A quoted value with a space in it leaks past the space,
+# the same limit the sed rule has.
+_NAME_VALUE_RE = re.compile(r"([A-Za-z0-9_.-]+=)\S+")
+# Any userinfo in a URL, which a positional connection string carries with no
+# NAME= in front of it: user:pw@, an empty user (redis://:pw@h), a bare token
+# (https://<pat>@github.com), and an unescaped @ inside the password (greedy
+# up to the last @ before the first /). A / inside the password is invalid
+# URL syntax and is not handled.
+_URL_USERINFO_RE = re.compile(r"://[^\s/]+@")
+# An HTTP auth scheme followed by its credential. `-H "Authorization: Bearer x"`
+# reaches ps unquoted, so neither the flag nor a NAME= marks the token.
+_AUTH_SCHEME_RE = re.compile(r"\b(bearer|basic)\s+\S+", re.IGNORECASE)
 _CREDENTIAL_PREFIX_RE = re.compile(
     r"(sk-ant-|sk-proj-|ctx7sk-|ghp_|xox[a-z]-)[A-Za-z0-9_-]*",
 )
@@ -184,21 +209,21 @@ def _mask(value: str) -> str:
 
 
 def redact(command: str) -> str:
-    """Never let a full credential reach stdout or the log file.
+    """Never let a credential reach stdout or the log file.
 
-    Two independent passes: known flags (--api-key ...) catch credentials by
-    position, known token-shape prefixes (ctx7sk-, sk-ant-, ...) catch them
-    by shape regardless of what flag — if any — preceded them. Order doesn't
-    matter for correctness (the flag pass already masks to <=6 chars, and
-    the prefix regex's char class doesn't match '*' so it will not re-touch
-    an already-masked value), but running the flag pass first keeps the
-    common case's masked output anchored to the flag name.
+    Five passes. Credential-named flags first, so `--token=x` and
+    `--token x` both come out as the flag name plus REDACTED. Then every
+    NAME=value, URL userinfo, an auth scheme's credential (Bearer/Basic),
+    and last, provider token shapes anywhere else
+    (the prefix pass cannot re-touch REDACTED: its character class needs the
+    prefix itself). A provider token keeps its first 6 characters because
+    those name the provider; any other value is blanked whole, since 6
+    characters of an arbitrary password are part of the password.
     """
-    def _flag_sub(m: re.Match) -> str:
-        flag, sep, value = m.group(1), m.group(2), m.group(3)
-        return f"{flag}{sep}{_mask(value)}"
-
-    out = _CREDENTIAL_FLAG_RE.sub(_flag_sub, command)
+    out = _CREDENTIAL_FLAG_RE.sub(r"\g<1>\g<2>REDACTED", command)
+    out = _NAME_VALUE_RE.sub(r"\g<1>REDACTED", out)
+    out = _URL_USERINFO_RE.sub("://REDACTED@", out)
+    out = _AUTH_SCHEME_RE.sub(r"\g<1> REDACTED", out)
     out = _CREDENTIAL_PREFIX_RE.sub(lambda m: _mask(m.group(0)), out)
     return out
 
