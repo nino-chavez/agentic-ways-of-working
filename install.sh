@@ -100,7 +100,7 @@ if ensure("SessionEnd",       f"python3 {claude_dir}/hooks/worktree-guard.py unr
 # Worktree reaper: the cleanup-side counterpart. `.worktrees/` is machine-ignored,
 # so stale worktrees never show in `git status` and their build artifacts pile up
 # invisibly (measured: 52 worktrees / 74 GB, 68 GB of it Rust target/, none merged).
-# Reclaims build dirs from idle worktrees; removes merged+clean ones. Throttled.
+# Reclaims build dirs from idle worktrees; removes landed+clean ones. Throttled.
 if ensure("SessionEnd",       f"python3 {claude_dir}/hooks/worktree-reaper.py reap", 60):                          added.append("SessionEnd:worktree-reaper")
 # Session reaper: what an ended session leaves RUNNING, where worktree-reaper
 # covers what it leaves on disk. Orphaned dev servers, browser tabs pointed at

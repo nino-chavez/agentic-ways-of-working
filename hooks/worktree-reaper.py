@@ -19,8 +19,10 @@ Two independent actions, different gates:
      modified for ARTIFACT_IDLE_HOURS. Safe on dirty worktrees: build output is
      gitignored, so source edits are untouched (verified empirically —
      uncommitted .rs edits survived exactly this).
-  2. remove worktree — `git worktree remove` when the branch is merged into the
-     default branch AND the tree is clean AND nothing under it has been modified
+  2. remove worktree — `git worktree remove` when the branch has landed in the
+     default branch (see landed(): ancestry of local or last-fetched origin, or
+     content already present, as a squash merge leaves it) AND the tree is
+     clean AND nothing under it has been modified
      for REMOVE_IDLE_DAYS. The branch itself is always preserved; only the
      checkout goes.
 
@@ -349,6 +351,37 @@ def default_branch(cwd: str) -> str | None:
     for cand in ("main", "master"):
         if git_ok(["rev-parse", "--verify", "--quiet", cand], cwd):
             return cand
+    return None
+
+
+def landed(branch: str, dflt: str, cwd: str) -> str | None:
+    """How the branch's work reached the default branch, or None if it has not.
+
+      local   — its tip is an ancestor of the local default branch;
+      origin  — its tip is an ancestor of the last-fetched origin/<default>: the
+                remote merged it and nobody has pulled since;
+      content — merging it into either would change nothing, which is what a
+                squash, cherry-pick or rebase merge leaves behind.
+
+    Ancestry against local main alone held 872 clean worktrees in the closeout
+    log through 2026-10-06; of the 139 held branches that still existed, 65 had
+    landed by one of the other two routes. No fetch happens here — a hook has
+    seconds, and any session that pulls advances origin/<default>. A git call
+    that fails or runs out of budget returns None, so uncertainty keeps the
+    worktree. The branch itself is never deleted by any caller of this.
+    """
+    targets = [(dflt, "local")]
+    remote = f"refs/remotes/origin/{dflt}"
+    if git_ok(["rev-parse", "--verify", "--quiet", remote], cwd):
+        targets.append((remote, "origin"))
+    for ref, how in targets:
+        if git_ok(["merge-base", "--is-ancestor", branch, ref], cwd):
+            return how
+    for ref, _ in targets:
+        merged = git(["merge-tree", "--write-tree", ref, branch], cwd)
+        tree = git(["rev-parse", f"{ref}^{{tree}}"], cwd)
+        if merged and tree and merged.splitlines()[0] == tree:
+            return "content"
     return None
 
 
@@ -694,7 +727,8 @@ def cmd_closeout(payload: dict) -> None:
     if not dflt:
         log_closeout(f"repo={root} branch={branch} state=clean action=keep reason=default_unknown")
         return
-    if not git_ok(["merge-base", "--is-ancestor", branch, dflt], root, timeout=10):
+    how = landed(branch, dflt, root)
+    if how is None:
         log_closeout(
             f"repo={root} branch={branch} default={dflt} state=unmerged-clean "
             "action=open-pr-or-hold"
@@ -703,7 +737,9 @@ def cmd_closeout(payload: dict) -> None:
 
     primary = os.path.abspath(str(entries[0].get("path", "")))
     if not primary or not os.path.isdir(primary):
-        log_closeout(f"repo={root} branch={branch} state=merged-clean action=keep reason=primary_missing")
+        log_closeout(
+            f"repo={root} branch={branch} state=merged-clean action=keep reason=primary_missing landed={how}"
+        )
         return
     # Removal is deliberately not interrupted by our deadline. A short host
     # callback must leave the checkout for later cleanup rather than start a
@@ -711,13 +747,15 @@ def cmd_closeout(payload: dict) -> None:
     if budget_left() < REMOVE_TIMEOUT:
         log_closeout(
             f"repo={root} branch={branch} state=merged-clean action=keep "
-            "reason=insufficient_removal_budget"
+            f"reason=insufficient_removal_budget landed={how}"
         )
         return
     if git_ok(["worktree", "remove", root], primary, timeout=REMOVE_TIMEOUT, clip=False):
-        log_closeout(f"repo={root} branch={branch} state=merged-clean action=removed")
+        log_closeout(f"repo={root} branch={branch} state=merged-clean action=removed landed={how}")
         return
-    log_closeout(f"repo={root} branch={branch} state=merged-clean action=keep reason=remove_failed")
+    log_closeout(
+        f"repo={root} branch={branch} state=merged-clean action=keep reason=remove_failed landed={how}"
+    )
 
 
 def plan(
@@ -787,12 +825,13 @@ def plan(
             break
 
         # Cheap gates BEFORE the deep scan. `and` short-circuits left to right,
-        # and recently_touched() is a full-tree find while merge-base is a
-        # sub-millisecond rev-walk that rejects almost everything: zero of the 52
-        # worktrees that motivated this tool were merged. Ordered the other way,
-        # every worktree paid a complete deep walk only to fail the next gate.
-        # (Measured on 40 worktrees: the deep finds cost 0.14s total, merge-base
-        # 0.61s — so this ordering is discipline, not a measured speedup.)
+        # and recently_touched() is a full-tree find while landed() is a
+        # rev-walk plus, only when ancestry fails, an in-memory merge-tree — both
+        # object-database work that never walks the checkout. Ordered the other
+        # way, every worktree paid a complete deep walk only to fail the next
+        # gate. (Measured on 40 worktrees: the deep finds cost 0.14s total,
+        # merge-base 0.61s — so this ordering is discipline, not a measured
+        # speedup.)
         #
         # `git status` returning None means the command FAILED, and `None or ""`
         # made that read as "clean" — inverting this file's own rule that
@@ -803,7 +842,7 @@ def plan(
         if past_deadline():
             truncated = True
             break
-        if not git_ok(["merge-base", "--is-ancestor", branch, dflt], cwd, timeout=10):
+        if landed(branch, dflt, cwd) is None:
             continue
         if past_deadline():
             truncated = True
@@ -1029,7 +1068,7 @@ def cmd_report(payload: dict) -> None:
     print(f"repo: {cwd}")
     print(
         f"gates: artifacts idle>{ARTIFACT_IDLE_HOURS}h, "
-        f"remove merged+clean idle>{REMOVE_IDLE_DAYS}d, throttle {THROTTLE_HOURS}h"
+        f"remove landed+clean idle>{REMOVE_IDLE_DAYS}d, throttle {THROTTLE_HOURS}h"
     )
     print(f"linked worktrees: {len(wts)}")
     if throttled(cd):
@@ -1044,7 +1083,7 @@ def cmd_report(payload: dict) -> None:
         print(f"  {kb // 1024:>6} MB  {os.path.relpath(target, os.path.dirname(wtp))}")
     print(f"  --> {total // 1024} MB ({total / 1024 / 1024:.1f} GB) reclaimable")
     print()
-    print(f"worktrees to remove (merged+clean+idle) ({len(removable)}):")
+    print(f"worktrees to remove (landed+clean+idle) ({len(removable)}):")
     for path, branch in removable:
         print(f"  {os.path.basename(path)}  [{branch}]")
     if not removable:
