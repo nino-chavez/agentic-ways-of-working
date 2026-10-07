@@ -21,7 +21,8 @@ Keep what should survive the task without treating the full transcript as perman
    - uncommitted changes: commit them to the task's branch, or state why they are discarded. Never leave them undecided;
    - evidence in an ignored folder that is still needed (`.artifacts/`, receipts, a backup app): move it to the repository-level `.artifacts/` or a canonical document before removing the worktree, and name what was kept;
    - a process the task started: stop it.
-   Touch only what this task created. Leave a worktree held by a live session, one a build or release depends on, and the worktree this session is running in (its host removes that one). Report anything you could not decide. Reclaiming build output in idle worktrees is the reaper's job, not this step's.
+   - a worktree or ignored folder that a build or release depends on: lock it with `git worktree lock --reason "<what depends on it>"`, or move the dependency to the repository-level `.artifacts/`. A note in memory protects nothing; the reaper and fleet sweeps skip locked worktrees.
+   Touch only what this task created. Leave a worktree held by a live session, a locked one, and the worktree this session is running in (its host removes that one). Report anything you could not decide. Reclaiming build output in idle worktrees is the reaper's job, not this step's.
 4. Prefer an existing source of truth over a new recap file. Update it only when the task already authorized the underlying change. Never manufacture human approval, readiness, or evidence.
 5. Save a reusable recipe only when another task is likely to benefit. Use the project's documented memory command or knowledge store. Keep the entry short, sourced, and free of raw private text. If no durable recipe exists, save none.
 6. Confirm the transcript has been queued or ingested by the configured lifecycle hook. Do not perform mining inside the hook; the hook should enqueue identity and return quickly.
