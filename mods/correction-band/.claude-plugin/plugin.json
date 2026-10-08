@@ -1,0 +1,7 @@
+{
+  "name": "correction-band",
+  "version": "0.1.0",
+  "description": "Draws Log it / Not a correction buttons above the prompt when a submitted prompt looks like a correction, and a Review button when recall memory candidates are pending",
+  "author": { "name": "Nino Chavez" },
+  "types": "./types/index.d.ts"
+}
