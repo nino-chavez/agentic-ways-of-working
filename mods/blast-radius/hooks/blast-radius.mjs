@@ -65,10 +65,15 @@ export function register(on) {
     // risk written on the line itself wins, as before.
     if (risk !== null && risk.kind === "scripts") {
       let found = null;
+      const skipped = [];
       for (let i = 0; i < risk.list.length && found === null; i += 1) {
-        found = await scriptRisk($, risk.list[i]);
-        if (found !== null) {
-          found.alsoRuns = risk.list.slice(i + 1).map((m) => m.path); // not read: the hold is on this one
+        const read = await scriptRisk($, risk.list[i]);
+        if (read?.skipped === true) {
+          skipped.push(risk.list[i].path);
+        } else if (read !== null) {
+          found = read;
+          // not read: those skipped before this one, and every one after it
+          found.alsoRuns = [...new Set([...skipped, ...risk.list.slice(i + 1).map((m) => m.path)])];
         }
       }
       risk = found;
@@ -734,9 +739,12 @@ function unexpandedWhy(targets, notes) {
 
 /**
  * Reads the script `marker` names and returns a risk of kind "script" with its
- * risky lines, or null when there is nothing to hold. The file is read only when
- * it is a regular file, under SCRIPT_BYTES_MAX, and lands (every link followed)
- * inside the session folder, the home folder or Claude Code's temp folder. A
+ * risky lines, null when it was read and there is nothing to hold, or
+ * `{ skipped: true }` when it was not read, so a later hold can name it. A bare
+ * path read and found not to be a shell script was read, so it returns null.
+ * The file is read only when it is a regular file, under SCRIPT_BYTES_MAX, and
+ * lands (every link followed) inside the session folder, the home folder or
+ * Claude Code's temp folder. A
  * skip is logged with its reason, since no hold means no summary to say it in:
  * to the transcript for a shell invocation or a path with a shell name, to the
  * debug sink for any other bare path, which is usually a program (`/usr/bin/git`,
@@ -747,9 +755,9 @@ function unexpandedWhy(targets, notes) {
 async function scriptRisk($, marker) {
   const invoked = marker.via === "path" ? marker.path : `${marker.via} ${marker.path}`;
   const loud = marker.via !== "path" || SHELL_NAME.test(marker.path);
-  const skip = (why, to = loud ? "transcript" : "debug") => {
-    $.ui.log(`Blast Radius did not read ${marker.path} (${why}), so \`${invoked}\` ran unchecked.`, { to });
-    return null;
+  const skip = (why) => {
+    $.ui.log(`Blast Radius did not read ${marker.path} (${why}), so \`${invoked}\` ran unchecked.`, { to: loud ? "transcript" : "debug" });
+    return { skipped: true };
   };
   if (marker.unexpanded !== null) {
     return skip(`its path was not expanded: ${marker.unexpanded.why}`);
@@ -786,8 +794,11 @@ async function scriptRisk($, marker) {
   }
   const name = real.slice(real.lastIndexOf("/") + 1);
   if (marker.via === "path" && !looksLikeShell(name, text)) {
+    // Read, so not a skip: a program in another language is out of scope, as `python x.py` is.
     const first = text.split("\n", 1)[0];
-    return skip(first.startsWith("#!") ? `${first.slice(0, 60)} is not a shell` : "it has no shell shebang and no .sh name", "debug");
+    const why = first.startsWith("#!") ? `${first.slice(0, 60)} is not a shell` : "it has no shell shebang and no .sh name";
+    $.ui.log(`Blast Radius read ${real} and did not check it (${why}), so \`${invoked}\` ran unchecked.`, { to: "debug" });
+    return null;
   }
   const lines = riskyLines(text);
   const lineCount = text.split("\n").filter((l, i, arr) => i < arr.length - 1 || l !== "").length;

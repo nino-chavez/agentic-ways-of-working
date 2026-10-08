@@ -127,7 +127,14 @@ Vendored from Anthropic's claude-code-playground.
    draft let the rejection reach the hook's `.catch` and refuse the command with
    no Proceed (the third review round). Scripts on a held line that were not
    read, after the risky one or beside an inline risk, are named in the summary:
-   "Proceed also runs wipe-db.sh, which was not read" (same round). Two of that
+   "Proceed also runs wipe-db.sh, which was not read" (same round). So are
+   scripts skipped before the risky one, ahead of those after it: `scriptRisk`
+   returns `{ skipped: true }` for a skip and null for a clean read, so
+   `/opt/tools/wipe && ./build.sh` held on `build.sh` reads "Proceed also runs
+   wipe, which was not read". The first version named only the scripts after
+   the hold, so Proceed ran `wipe` unchecked with its skip in the debug log
+   only (found by the commit review of bfe5269). A bare path read and found not
+   to be a shell script was read, so it is not named. Two of that
    round's suggestions were not taken, as decisions rather than oversights:
    reading from `/tmp` and `$TMPDIR` would widen the three-folder rule the task
    set (session folder, scratchpad, `$HOME`), so a script there still skips with
@@ -188,7 +195,7 @@ of the three folders a script may be read from.
 
 ## Proving it
 
-- `claude plugin test mods/blast-radius` runs the unit tests (70): the pane, the
+- `claude plugin test mods/blast-radius` runs the unit tests (71): the pane, the
   question dialog's answers, the nobody-to-ask deny, the hold limit, `rm` word
   splitting, scripts run by path (each invocation form, the three folders, a
   link that lands outside, the size cap, a read that rejects, one level,
@@ -208,7 +215,7 @@ of the three folders a script may be read from.
 - `evals/no-weaker/run.sh [ref]` loads the classifier at `ref` (default `main`)
   and this folder's, and runs every string literal in the test file plus the
   shapes review traced: each one the old holds, the new must hold. 2026-10-08:
-  46 held by `main`, 0 no longer held; with the reading as written switched
+  48 held by `main`, 0 no longer held; with the reading as written switched
   off, it reported the escaped-backslash line, so it can fail.
 - `evals/sdk-host-canary/run.sh <mode> [inline|script]` runs Haiku in a
   stream-json host shaped like the desktop app's Code tab. The host answers the

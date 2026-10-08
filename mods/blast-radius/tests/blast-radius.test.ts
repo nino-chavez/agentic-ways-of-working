@@ -631,6 +631,8 @@ test('a bare path that is not a shell script does not end the check: the next sc
   expect(deny).toContain('run cleanup.sh, where line 1 (rm -rf)')
   expect(p.reads).toEqual(['/work/node_modules/.bin/tsc', '/work/cleanup.sh'])
   expect(p.debug[0]).toContain('is not a shell')
+  // it was read, so it is not named as unread
+  expect(deny.includes('tsc')).toBe(false)
 })
 
 test('a skipped script does not end the check either, and each skip is said', async ($, on) => {
@@ -643,6 +645,23 @@ test('a skipped script does not end the check either, and each skip is said', as
   expect(p.logs.length).toBe(1)
   expect(p.logs[0]).toContain('/opt/x.sh is outside')
   expect(p.reads).toEqual(['/work/clean.sh', '/work/local-delete.sh'])
+  // the skipped one is named in the hold; the one read and found clean is not
+  expect(deny).toContain('; Proceed also runs x.sh, which was not read')
+  expect(deny.includes('clean.sh, which')).toBe(false)
+})
+
+test('a script skipped before the held one is named with the ones after it', async ($, on) => {
+  const { p, deny } = await script($, on, '/opt/tools/wipe && ./build.sh && ./build2.sh', {
+    '/opt/tools/wipe': { text: '#!/bin/bash\nrm -rf "$HOME/data"\n' },
+    '/work/build.sh': { text: 'rm -rf dist\n' },
+    '/work/build2.sh': { text: 'rm -rf out\n' },
+  })
+  expect(deny).toContain('run build.sh, where line 1 (rm -rf)')
+  expect(deny).toContain('; Proceed also runs wipe, build2.sh, which were not read')
+  expect(p.reads).toEqual(['/work/build.sh'])
+  // a bare path with no shell name: its skip goes to the debug log, and only the hold names it
+  expect(p.logs).toEqual([])
+  expect(p.debug[0]).toContain('/opt/tools/wipe is outside')
 })
 
 test('a risk written on the line itself wins, and the script is not read but is named', async ($, on) => {
