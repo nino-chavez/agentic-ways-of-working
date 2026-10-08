@@ -24,6 +24,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -36,11 +37,13 @@ PATTERN_SOURCE = REPO / "git-hooks" / "pre-commit-secret-scan"
 
 # KEY only as a whole word at the end (API_KEY, SERVICE_ROLE_KEY), so KEYRING_SERVICE is not a secret.
 SECRET_NAME = r"[A-Z][A-Z0-9_]*?(?:(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)[A-Z0-9_]*|_KEY|APIKEY)"
-ASSIGN = re.compile(rf"(?<![A-Za-z0-9_])({SECRET_NAME})\s*[=:]\s*[\"']?([^\s\"'\\,;)}}\]`]+)")
+# Matched against decoded text. The optional quote after the name covers JSON
+# config ("API_KEY": "value"); the one before the value covers export X="value".
+ASSIGN = re.compile(rf"(?<![A-Za-z0-9_])({SECRET_NAME})[\"']?\s*[=:]\s*[\"']?([^\s\"'\\,;)}}\]`]+)")
 BEARER = re.compile(r"Bearer\s+([A-Za-z0-9._~+/=-]+)")
 # Client-side keys that are public by design (Supabase publishable and anon keys,
-# NEXT_PUBLIC_/PUBLIC_ variables), and names that announce a test fixture.
-PUBLIC_NAME = re.compile(r"^(?:NEXT_|VITE_)?PUBLIC_|PUBLISHABLE|ANON_KEY$|FAKE|DUMMY|EXAMPLE")
+# Turnstile site keys, NEXT_PUBLIC_/PUBLIC_ variables), and names that announce a test fixture.
+PUBLIC_NAME = re.compile(r"^(?:NEXT_|VITE_)?PUBLIC_|PUBLISHABLE|ANON_KEY$|SITE_KEY$|FAKE|DUMMY|EXAMPLE")
 PLACEHOLDER = re.compile(r"redacted|example|placeholder|changeme|your[-_]|xxxx|\*\*\*", re.I)
 
 
@@ -100,17 +103,38 @@ def resolve(session_id: str | None, transcript: str | None, cwd: Path) -> tuple[
     for p in sorted((home / ".codex" / "sessions").rglob("rollout-*.jsonl"), key=lambda p: p.stat().st_mtime)[-50:]:
         try:
             with p.open() as fp:
-                first = fp.readline()
-        except OSError:
+                meta = json.loads(fp.readline())
+        except (OSError, ValueError):
             continue
-        if f'"cwd":"{cwd}"' in first.replace(" ", ""):
+        payload = meta.get("payload") if isinstance(meta, dict) else None
+        if isinstance(payload, dict) and payload.get("cwd") == str(cwd):
             candidates.append(p)
     if not candidates:
         raise FileNotFoundError(f"no transcript found for cwd {cwd}; pass --session-id or --transcript")
     return max(candidates, key=lambda p: p.stat().st_mtime), "guessed from cwd (newest); confirm it is this session"
 
 
-def scan(files: list[Path]) -> list[tuple[str, str, Path, list[int]]]:
+def strings(node) -> list[str]:
+    if isinstance(node, str):
+        return [node]
+    if isinstance(node, dict):
+        node = list(node.values())
+    if isinstance(node, list):
+        return [s for item in node for s in strings(item)]
+    return []
+
+
+def decoded(line: str) -> str:
+    """A transcript line as the text it holds. JSONL stores a newline as the two
+    characters backslash-n and a quote as backslash-quote, which hides
+    `cat .env` output and quoted assignments from a raw-line match."""
+    try:
+        return "\n".join(strings(json.loads(line)))
+    except ValueError:
+        return line
+
+
+def scan(files: list[Path], main_file: Path) -> tuple[list[tuple[str, str, Path, list[int]]], list[Path]]:
     patterns = load_patterns()
     live = live_values()
     found: dict[tuple[str, str, Path], list[int]] = {}
@@ -120,13 +144,18 @@ def scan(files: list[Path]) -> list[tuple[str, str, Path, list[int]]]:
         if not lines or lines[-1] != n:
             lines.append(n)
 
+    skipped = []
     for path in files:
         try:
             fp = path.open(errors="replace")
         except OSError:
+            if path == main_file:
+                raise  # an unread transcript is an error, never clean
+            skipped.append(path)
             continue
         with fp:
-            for n, line in enumerate(fp, 1):
+            for n, raw in enumerate(fp, 1):
+                line = decoded(raw)
                 for label, rx in patterns:
                     # Skip low-variety filler (a prefix padded with one repeated letter) and placeholders.
                     if any(len(set(m.group(0))) >= 10 and not PLACEHOLDER.search(m.group(0))
@@ -141,7 +170,7 @@ def scan(files: list[Path]) -> list[tuple[str, str, Path, list[int]]]:
                 for name, value in live:
                     if value in line:
                         add("live", name, path, n)
-    return [(k, nm, p, ln) for (k, nm, p), ln in found.items()]
+    return [(k, nm, p, ln) for (k, nm, p), ln in found.items()], skipped
 
 
 def main() -> int:
@@ -154,11 +183,16 @@ def main() -> int:
         if not main_file.is_file():
             raise FileNotFoundError(f"transcript not found: {main_file}")
         files = session_files(main_file)
-        findings = scan(files)
+        findings, skipped = scan(files, main_file)
     except (OSError, ValueError, re.error) as exc:
         print(f"SECRET_SCAN_ERROR: {exc}. This is not a clean result.")
         return 2
-    print(f"Scanned: {main_file} ({how}; {len(files)} file(s))")
+    print(f"Scanned: {main_file} ({how}; {len(files) - len(skipped)} file(s))")
+    for p in skipped:
+        print(f"  could not read {p}; it was not scanned")
+    if not findings and skipped:
+        print("SECRET_SCAN_ERROR: some files could not be read. This is not a clean result.")
+        return 2
     if not findings:
         print("SECRET_SCAN_CLEAN: no credential-shaped values found.")
         return 0

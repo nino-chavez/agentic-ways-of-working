@@ -85,11 +85,50 @@ class SecretScanTest(unittest.TestCase):
                    f"QUANTIFAI_KEYRING_SERVICE=svc{rand(20)}",
                    f"VITE_SUPABASE_ANON_KEY=ey{rand(40)}",
                    f"PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY=sb{rand(40)}",
+                   f"TURNSTILE_SITE_KEY=0x{rand(24)}",
                    "STRIPE_SECRET_KEY=your-stripe-secret-key-here",
                    "Authorization: Bearer <token>")
         r = self.run_scan("--session-id", "s3")
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertIn("SECRET_SCAN_CLEAN", r.stdout)
+
+    def test_json_escaped_env_dump_quoted_export_and_json_config(self):
+        a, b, c = rand(40), rand(40), rand(40)
+        # A tool result holding `cat .env` output: real newlines, stored JSON-escaped.
+        env_dump = f"PORT=3000\nSTRIPE_SECRET_KEY={a}\nDEBUG=1\n"
+        p = self.project / "s6.jsonl"
+        p.write_text(json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "content": env_dump}]}}) + "\n"
+            + line(f'export DEPLOY_TOKEN="{b}"')
+            + line(json.dumps({"mcpServers": {"x": {"env": {"SERVICE_API_KEY": c}}}})))
+        r = self.run_scan("--session-id", "s6")
+        self.assertEqual(r.returncode, 1, r.stdout)
+        for name in ("STRIPE_SECRET_KEY", "DEPLOY_TOKEN", "SERVICE_API_KEY"):
+            self.assertIn(f"assign {name}", r.stdout)
+        for value in (a, b, c):
+            self.assertNotIn(value[-12:], r.stdout)
+
+    def test_unreadable_transcript_is_an_error_not_clean(self):
+        p = self.write("s7", "nothing here")
+        p.chmod(0)
+        try:
+            r = self.run_scan("--session-id", "s7")
+        finally:
+            p.chmod(0o600)
+        self.assertEqual(r.returncode, 2, r.stdout)
+
+    def test_codex_guess_matches_a_cwd_with_spaces(self):
+        spaced = self.home / "Application Support" / "work"
+        spaced.mkdir(parents=True)
+        day = self.home / ".codex" / "sessions" / "2026" / "10" / "07"
+        day.mkdir(parents=True)
+        (day / "rollout-2026-10-07T00-00-00-abc.jsonl").write_text(
+            json.dumps({"type": "session_meta", "payload": {"cwd": str(spaced.resolve())}}) + "\n")
+        env = {"HOME": str(self.home), "PATH": os.environ.get("PATH", "")}
+        r = subprocess.run([sys.executable, str(SCRIPT)], cwd=spaced, env=env,
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("rollout-2026-10-07T00-00-00-abc.jsonl", r.stdout)
 
     def test_unsubstituted_session_id_falls_back_to_cwd_guess(self):
         self.write("s4", "nothing here")
