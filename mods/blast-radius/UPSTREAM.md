@@ -40,7 +40,22 @@ Vendored from Anthropic's claude-code-playground.
    - Under plain `claude -p` the ask rejected in 0 ms: "no tool named
      AskUserQuestion". Upstream instead waited the full hold limit there, still
      held at 120 s in an earlier canary.
-   `evals/sdk-host-canary/` reproduces all of it.
+   `evals/sdk-host-canary/` reproduces all of it. That host never asks to draw,
+   which is why its surface list stayed empty.
+
+   Then measured in the real desktop app, with a probe mod hot-loaded into a
+   Code-tab session:
+   - `isInteractive` was false at `session.start`.
+   - `$.session.surfaces()` listed `desktop` when the probe loaded, was empty when
+     a Bash call arrived, and listed `desktop` again after the probe drew.
+   - `$.ui.open` came back placed, and the person saw the pane.
+   - `$.ui.ask` reached the person, who answered in about 13 s.
+
+   So in the desktop both paths reach the person: the pane when `desktop` is
+   listed, the question when the list is empty. A second probe run gave the same
+   readings. After the merge, a delete of a scratch folder in that session took
+   13 s from call to result and then ran. That fits a hold answered with Proceed;
+   the pane or question itself was not seen by the session.
 4. `hooks/blast-radius.mjs`, hold limit. `BLAST_RADIUS_HOLD_SECONDS` (default 600,
    minimum 5) replaces the hard-coded 10 minutes. The deny says nobody answered,
    and for the question that it may still be open.
@@ -59,7 +74,8 @@ Vendored from Anthropic's claude-code-playground.
    and why, where upstream measured the literal text and said "delete nothing".
 6. `hooks/blast-radius.mjs`, the `tool.call` hook carries `.catch`. A throw outside
    the hold's own `try`, or an overrun budget, refuses the command. Upstream let it run.
-7. `tests/blast-radius.test.ts`, `evals/holds-rm-rf/` and `evals/sdk-host-canary/`: new.
+7. `tests/blast-radius.test.ts`, `evals/holds-rm-rf/`, `evals/sdk-host-canary/` and
+   `evals/desktop-probe/`: new.
 8. `README.md`: screenshot links point at the pinned commit; "Local changes" added.
 
 ## Validate output
@@ -98,7 +114,10 @@ Local (CLI 2.1.294):
   unknown. On the personal Mac, cases that grant Bash score 0 for an unrelated
   reason (Docker cli-plugins symlinks), so prove with the two above.
 - The desktop app itself is the final check: after the change loads there, a
-  risky command should raise a Blast Radius question.
+  risky command should raise the Blast Radius pane or question.
+  `evals/desktop-probe/install.sh <session-id>` installs the probe above into a
+  session's hot-reload folder. After the person enables hot reloading, a Bash call
+  containing `BR_DESKTOP_PROBE` reports what that host gives a mod, with no restart.
 
 ## Re-vendoring
 
