@@ -29,8 +29,9 @@ const STALE_MS = 6 * 3600 * 1000
 // Prompts that are not the operator's own words; the matcher is never asked.
 const SKIP_PREFIXES = ['/', '<', '[Request interrupted', 'This session is being continued', 'Caveat: The messages below']
 
-const LOG_IT_TEXT =
-  "Record the correction I just gave: run correction-log (~/.local/bin/correction-log --scope <this repo or *> --job … --not … --use … --why … --source …). Point --use at the rule's owner and write the owner first if there is none. Then continue the task."
+function logItText(text) {
+  return `Record this correction I gave with correction-log: "${text}". Run ~/.local/bin/correction-log --scope <this repo or *> --job … --not … --use … --why … --source …, point --use at the rule's owner and write the owner first if there is none. Then continue the task.`
+}
 
 export function register(on) {
   on('session.start', async ($, e, next) => {
@@ -44,6 +45,8 @@ export function register(on) {
       if ((await $.env.get('CORRECTION_BAND_OFF')) === '1') return next(e)
       if (next.origin?.plugin === NAME) return next(e)
       if (!isOperatorText(e.text)) return next(e)
+      // The row never outlives the prompt that matched.
+      await update($, CORRECTION, () => null)
       await checkPrompt($, e.text)
     } catch {
       // Fail open: the prompt goes on as typed.
@@ -74,7 +77,7 @@ async function checkPrompt($, text) {
   const home = await $.env.get('HOME')
   if (!home) return
   const r = await $.process.run(['python3', `${home}/.claude/hooks/correction-nudge.py`, '--match'], {
-    timeoutMs: 3000,
+    timeoutMs: 1500,
     stdin: JSON.stringify({ prompt: text }),
   })
   if (r.exitCode !== 0) return
@@ -138,7 +141,7 @@ function correctionRow($, e, correction) {
         label: 'Log it',
         hotkey: '1',
         onPress: async () => {
-          await $.prompt.submit({ text: LOG_IT_TEXT })
+          await $.prompt.submit({ text: logItText(correction.text) })
           await update($, CORRECTION, () => null)
           $.ui.invalidate('ui.render')
         },

@@ -247,3 +247,28 @@ test('CORRECTION_BAND_OFF=1 skips the matcher', async ($, on) => {
   expect(out.text).toBe(CORRECTION_PROMPT)
   expect(seen.runs).toBe(0)
 })
+
+test('a matching prompt followed by a neutral prompt leaves no band', async ($, on) => {
+  let n = 0
+  const seen = stubs(on, {
+    run: () => ({ value: { exitCode: 0, stdout: n++ === 0 ? MATCH : NONE, stderr: '' } }),
+  })
+  await start($)
+  await submit($, CORRECTION_PROMPT)
+  await submit($, 'run the tests please')
+  expect(seen.runs).toBe(2)
+  const ui = await $.ui.mount(band('terminal'))
+  expect(await ui.find({ text: /Correction\?/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('Log it submits a text containing the stored correction text', async ($, on) => {
+  const seen = stubs(on, { run: () => ({ value: { exitCode: 0, stdout: MATCH, stderr: '' } }) })
+  await start($)
+  await submit($, CORRECTION_PROMPT)
+  seen.submitted.length = 0
+  const ui = await $.ui.mount(band('terminal'))
+  await ui.press({ key: 'log' })
+  expect(seen.submitted[0]).toContain(`"${CORRECTION_PROMPT}"`)
+  await ui.unmount()
+})

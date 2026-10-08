@@ -16,7 +16,7 @@ recall sync stale (10h ago)  Recall: 33 memory candidates pending review  [ Revi
 
 | Key | Hotkey | What it does |
 | --- | --- | --- |
-| `log` | 1 | Submits an instruction, as the mod, telling the agent to run `correction-log`. Clears the row. |
+| `log` | 1 | Submits an instruction, as the mod, quoting the stored correction text and telling the agent to run `correction-log`. The row clears at the next operator prompt. Clears the row. |
 | `dismiss` | 2 | Clears the row. Submits nothing. |
 | `review` | 3 | Runs `/recall review` through `$.command.run`. If that rejects, fills the prompt box with `/recall review` (the host refuses a `$.prompt.submit` text that starts with `/`). Hides the row for the session. |
 
@@ -25,7 +25,7 @@ The stale prefix shows when the heartbeat is missing a `last_success`, unparsabl
 ## What it reads and runs
 
 - `~/.claude/recall-context-heartbeat.json`, read with `$.fs.read` at `session.start`.
-- `python3 ~/.claude/hooks/correction-nudge.py --match`, with `{"prompt": "<text>"}` on stdin and a 3 s timeout. The matcher stays owned by that script; this mod holds no pattern.
+- `python3 ~/.claude/hooks/correction-nudge.py --match`, with `{"prompt": "<text>"}` on stdin and a 1.5 s timeout. The matcher stays owned by that script; this mod holds no pattern.
 - Prompts starting with `/`, `<`, `[Request interrupted`, `This session is being continued`, or `Caveat: The messages below`, and prompts over 1200 characters, are never sent to the matcher.
 
 `claude plugin validate --strict` reports:
@@ -35,7 +35,7 @@ hooks: session.start, prompt.submit, ui.render{component=AbovePrompt}
 calls: $.command.run, $.env.get, $.fs.read, $.process.run, $.prompt.fill, $.prompt.submit, $.state.get, $.state.set, $.ui.invalidate, $.ui.resolve
 ```
 
-Any error, timeout, non-zero exit, or unparsable output fails open: the prompt flows and no band is drawn.
+A submitted prompt waits for the matcher up to 1.5 s (measured about 30 ms) and goes through unchanged if it times out. Any error, timeout, non-zero exit, or unparsable output fails open: the prompt flows and no band is drawn.
 
 ## The `--match` contract
 
@@ -57,7 +57,7 @@ Off switch: `CORRECTION_BAND_OFF=1` skips the matcher; recall rows still draw.
 claude plugin test mods/correction-band
 ```
 
-Eighteen drawing and flow tests, in both the terminal and desktop surfaces for the rows and buttons. The test kit does not honor a plugin origin on `$.prompt.submit`, so the own-submission guard (`next.origin.plugin`) is not unit tested. The engine skips the calling plugin's own hooks for `$.prompt.submit`, and the canary covers the flow.
+Twenty drawing and flow tests, in both the terminal and desktop surfaces for the rows and buttons. The test kit does not honor a plugin origin on `$.prompt.submit`, so the own-submission guard (`next.origin.plugin`) is not unit tested. The engine skips the calling plugin's own hooks for `$.prompt.submit`, and the canary covers the flow.
 
 `evals/does-not-block-prompts` checks that a correction-shaped prompt still reaches the model with the mod loaded (`claude plugin eval`). The band itself is covered by the drawing tests, since an eval cannot press a button.
 
