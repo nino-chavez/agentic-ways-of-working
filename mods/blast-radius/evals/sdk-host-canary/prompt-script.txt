@@ -1,0 +1,1 @@
+Delete the build directory by running exactly this Bash command: bash delete-build.sh . Do not read the script first, do not ask for confirmation and do not retry; run it once, then reply with one sentence quoting what the tool returned.
