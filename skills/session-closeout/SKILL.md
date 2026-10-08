@@ -23,10 +23,20 @@ Keep what should survive the task without treating the full transcript as perman
    - a process the task started: stop it.
    - a worktree or ignored folder that a build or release depends on: lock it with `git worktree lock --reason "<what depends on it>"`, or move the dependency to the repository-level `.artifacts/`. A note in memory protects nothing; the reaper and fleet sweeps skip locked worktrees.
    Touch only what this task created. Leave a worktree held by a live session, a locked one, and the worktree this session is running in (its host removes that one). Report anything you could not decide. Reclaiming build output in idle worktrees is the reaper's job, not this step's.
-4. Prefer an existing source of truth over a new recap file. Update it only when the task already authorized the underlying change. Never manufacture human approval, readiness, or evidence.
-5. Save a reusable recipe only when another task is likely to benefit. Use the project's documented memory command or knowledge store. Keep the entry short, sourced, and free of raw private text. If no durable recipe exists, save none.
-6. Confirm the transcript has been queued or ingested by the configured lifecycle hook. Do not perform mining inside the hook; the hook should enqueue identity and return quickly.
-7. Do not archive or delete the task. Give the operator the receipt and let them take the irreversible action.
+4. Scan this session's transcript for credentials. Run it after step 3, so it also covers the commands the closeout ran:
+
+   ```bash
+   python3 "${CLAUDE_SKILL_DIR}/scripts/secret-scan.py" --session-id "${CLAUDE_SESSION_ID}"
+   ```
+
+   Outside Claude Code, run `scripts/secret-scan.py` from this skill's directory with `--transcript <this session's file>`. With no arguments it takes the newest session for the current folder. Either way, check that the `Scanned:` line names this session. The scan prints names and line numbers, never values. Do not print or quote a value to judge a finding.
+   - Exit 0 is clean. Exit 2 means the scan did not run, which is not clean.
+   - `live` means a credential that is current in this environment was printed into the transcript. You cannot rotate it. Make rotating it the `Next action`.
+   - Any other finding: it was rotated, or it is not a credential (a test fixture, a public client key, documentation). Say which. Otherwise treat it like `live`.
+5. Prefer an existing source of truth over a new recap file. Update it only when the task already authorized the underlying change. Never manufacture human approval, readiness, or evidence.
+6. Save a reusable recipe only when another task is likely to benefit. Use the project's documented memory command or knowledge store. Keep the entry short, sourced, and free of raw private text. If no durable recipe exists, save none.
+7. Confirm the transcript has been queued or ingested by the configured lifecycle hook. Do not perform mining inside the hook; the hook should enqueue identity and return quickly.
+8. Do not archive or delete the task. Give the operator the receipt and let them take the irreversible action.
 
 ## Required receipt
 
@@ -41,7 +51,8 @@ Still unproven: <remaining claims or none>
 Next action: <single concrete action or none>
 Recall recipe: <recipe id/path or none>
 Workspace: <each worktree, branch, and process this task created, with its disposition; or none>
+Secret scan: <clean; or each finding (kind and name) with its disposition; or error>
 Archive-safe: yes|no
 ```
 
-Set `Archive-safe: yes` only when the durable lesson is stored, secrets are excluded, evidence is named, every worktree, branch, and process the task created has a recorded disposition, no commit exists only on this machine, and nothing requires the raw transcript to resume safely.
+Set `Archive-safe: yes` only when the durable lesson is stored, the secret scan exited 0 or every finding is rotated or shown not to be a credential, evidence is named, every worktree, branch, and process the task created has a recorded disposition, no commit exists only on this machine, and nothing requires the raw transcript to resume safely.

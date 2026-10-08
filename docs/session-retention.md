@@ -114,10 +114,13 @@ Still unproven: old transcripts may contain project details not promoted elsewhe
 Next action: review the archive after the grace window
 Recall recipe: session-retention-v1
 Workspace: none
+Secret scan: clean
 Archive-safe: no
 ```
 
 `Archive-safe: no` is a successful closeout result when raw context is still carrying something important.
+
+A transcript is raw context too, and it can hold a credential that a command printed. The skill runs `scripts/secret-scan.py` over the session before it writes the receipt. A transcript about to be mined or kept should not depend on the model noticing a leak: in a replay test, one model flagged a token that `pgrep -fl` had printed and another, given the same evidence, missed it twice.
 
 ## Worktree artifacts are a separate cleanup problem
 
