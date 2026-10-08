@@ -88,6 +88,9 @@ export function register(on) {
       // surfaces() empty, yet $.ui.ask reached the host as a can_use_tool request
       // for AskUserQuestion. Under `claude -p` the ask rejects at once ("no tool
       // named AskUserQuestion"), which is what marks a session with no one to ask.
+      // In the real desktop (a probe mod, same day) surfaces() listed `desktop` at
+      // load, was empty when a Bash call arrived, and listed `desktop` again after;
+      // the desktop drew a mod pane the person saw and answered the question.
       surfaces = await $.session.surfaces();
       if (surfaces.length > 0) {
         const opened = await $.ui.open({ id: PANE_ID, title: "Blast Radius", focus: true, rows: paneRows(mine.report) });
