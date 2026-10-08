@@ -37,10 +37,11 @@ PATTERN_SOURCE = REPO / "git-hooks" / "pre-commit-secret-scan"
 
 # KEY only as a whole word at the end (API_KEY, SERVICE_ROLE_KEY), so KEYRING_SERVICE is not a secret.
 SECRET_NAME = r"[A-Z][A-Z0-9_]*?(?:(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)[A-Z0-9_]*|_KEY|APIKEY)"
-# Matched against decoded text. The optional quote after the name covers JSON
+# Matched against decoded text, so [ \t]* and not \s*: a real newline must not
+# carry an empty NAME= onto the next line's value. The optional quote after the name covers JSON
 # config ("API_KEY": "value"); the one before the value covers export X="value".
-ASSIGN = re.compile(rf"(?<![A-Za-z0-9_])({SECRET_NAME})[\"']?\s*[=:]\s*[\"']?([^\s\"'\\,;)}}\]`]+)")
-BEARER = re.compile(r"Bearer\s+([A-Za-z0-9._~+/=-]+)")
+ASSIGN = re.compile(rf"(?<![A-Za-z0-9_])({SECRET_NAME})[\"']?[ \t]*[=:][ \t]*[\"']?([^\s\"'\\,;)}}\]`]+)")
+BEARER = re.compile(r"Bearer[ \t]+([A-Za-z0-9._~+/=-]+)")
 # Client-side keys that are public by design (Supabase publishable and anon keys,
 # Turnstile site keys, NEXT_PUBLIC_/PUBLIC_ variables), and names that announce a test fixture.
 PUBLIC_NAME = re.compile(r"^(?:NEXT_|VITE_)?PUBLIC_|PUBLISHABLE|ANON_KEY$|SITE_KEY$|FAKE|DUMMY|EXAMPLE")
@@ -76,14 +77,16 @@ def live_values() -> list[tuple[str, str]]:
     return [(k, v) for k, v in os.environ.items() if name.match(k) and len(v) >= 16]
 
 
-def session_files(main: Path) -> list[Path]:
+def session_files(main: Path) -> tuple[list[Path], list[Path]]:
     """The transcript plus what Claude stores beside it: subagent transcripts and
-    large tool outputs that were saved to disk with only a preview kept inline."""
-    files = [main]
+    large tool outputs that were saved to disk with only a preview kept inline.
+    Also returns folders that could not be listed; rglob would skip them silently."""
+    files, unlisted = [main], []
     side = main.with_suffix("")
     if side.is_dir():
-        files += sorted(p for p in side.rglob("*") if p.is_file())
-    return files
+        for root, _dirs, names in os.walk(side, onerror=lambda e: unlisted.append(Path(e.filename))):
+            files += sorted(Path(root) / n for n in names)
+    return files, unlisted
 
 
 def resolve(session_id: str | None, transcript: str | None, cwd: Path) -> tuple[Path, str]:
@@ -118,7 +121,10 @@ def strings(node) -> list[str]:
     if isinstance(node, str):
         return [node]
     if isinstance(node, dict):
-        node = list(node.values())
+        # Keep the key beside a string value: a tool call's input object
+        # {"API_KEY": "..."} has to read as API_KEY: ... for the assign rule.
+        return [f"{k}: {v}" if isinstance(v, str) else s
+                for k, v in node.items() for s in ([v] if isinstance(v, str) else strings(v))]
     if isinstance(node, list):
         return [s for item in node for s in strings(item)]
     return []
@@ -182,8 +188,9 @@ def main() -> int:
         main_file, how = resolve(args.session_id, args.transcript, Path.cwd())
         if not main_file.is_file():
             raise FileNotFoundError(f"transcript not found: {main_file}")
-        files = session_files(main_file)
+        files, unlisted = session_files(main_file)
         findings, skipped = scan(files, main_file)
+        skipped += unlisted
     except (OSError, ValueError, re.error) as exc:
         print(f"SECRET_SCAN_ERROR: {exc}. This is not a clean result.")
         return 2

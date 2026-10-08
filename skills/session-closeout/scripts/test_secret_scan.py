@@ -108,6 +108,34 @@ class SecretScanTest(unittest.TestCase):
         for value in (a, b, c):
             self.assertNotIn(value[-12:], r.stdout)
 
+    def test_secret_in_a_tool_call_input_object(self):
+        value = rand(40)
+        p = self.project / "s8.jsonl"
+        p.write_text(json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "mcp__x__configure", "input": {"API_KEY": value}}]}}) + "\n")
+        r = self.run_scan("--session-id", "s8")
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("assign API_KEY", r.stdout)
+        self.assertNotIn(value[-12:], r.stdout)
+
+    def test_empty_assignment_does_not_take_the_next_line(self):
+        self.write("s9", f"API_KEY=\nDATABASE_URL_X=postgres{rand(24)}\n")
+        r = self.run_scan("--session-id", "s9")
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_unlistable_side_folder_is_an_error_not_clean(self):
+        self.write("s10", "nothing here")
+        sub = self.project / "s10" / "subagents"
+        sub.mkdir(parents=True)
+        (sub / "agent.jsonl").write_text(line("nothing"))
+        sub.chmod(0)
+        try:
+            r = self.run_scan("--session-id", "s10")
+        finally:
+            sub.chmod(0o700)
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("could not read", r.stdout)
+
     def test_unreadable_transcript_is_an_error_not_clean(self):
         p = self.write("s7", "nothing here")
         p.chmod(0)
