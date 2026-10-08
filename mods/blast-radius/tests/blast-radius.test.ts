@@ -449,11 +449,11 @@ const SCRIPT = [
 const CLEAN = ['#!/bin/bash', '# rm -rf is only mentioned here', 'echo "nothing to see"', ''].join('\n')
 
 // Runs `command` where nobody can be asked, with HOME set, over the stubbed files.
-async function script($: any, on: any, command: string, files: Record<string, Stubbed>, extra: { dirs?: string[]; ask?: (e: any) => any } = {}) {
+async function script($: any, on: any, command: string, files: Record<string, Stubbed>, extra: { dirs?: string[]; ask?: (e: any) => any; env?: Record<string, string> } = {}) {
   const p = probe()
   mock.clock(on)
   stubs(on, p, { surfaces: [], onSleep: yieldTick, files, dirs: ['/Users/me', ...(extra.dirs ?? [])], ask: extra.ask })
-  mock.env(on, { HOME: '/Users/me' })
+  mock.env(on, { HOME: '/Users/me', ...extra.env })
   await start($, false)
   const out: any = await $.tool.call({ tool: 'Bash', command })
   return { p, out, deny: String(out.deny ?? '') }
@@ -595,6 +595,50 @@ test('a missing script passes with the reason', async ($, on) => {
   const { p, out } = await script($, on, 'bash nope.sh', {})
   expect(out).toEqual({ result: 'ran' })
   expect(p.logs[0]).toContain('no such file')
+  expect(p.stats).toEqual(['/work/nope.sh']) // no PATH set: nothing else is looked up
+})
+
+// A name with no `/` is looked up as the shell does. Measured 2026-10-08 on macOS
+// (bash 3.2, zsh 5.9): `source` and `.` try PATH first, except zsh's `source`,
+// which tries the folder first; `bash x.sh` tries the folder, then PATH.
+const ON_PATH = { PATH: '/usr/bin:/Users/me/bin' }
+
+test('`. x.sh` reads the copy on PATH, which the shell runs before the one in the folder', async ($, on) => {
+  const { p, deny } = await script($, on, '. x.sh', { '/work/x.sh': { text: CLEAN }, '/Users/me/bin/x.sh': { text: 'rm -rf "$HOME/data"\n' } }, { env: ON_PATH })
+  expect(deny).toContain('run x.sh, where line 1 (rm -rf)')
+  expect(p.reads).toEqual(['/Users/me/bin/x.sh'])
+})
+
+test('`source x.sh` also reads the copy in the folder, which zsh runs first', async ($, on) => {
+  const { p, deny } = await script($, on, 'source x.sh', { '/work/x.sh': { text: 'rm -rf build\n' }, '/Users/me/bin/x.sh': { text: CLEAN } }, { env: ON_PATH })
+  expect(deny).toContain('run x.sh, where line 1 (rm -rf)')
+  expect(p.reads).toEqual(['/Users/me/bin/x.sh', '/work/x.sh'])
+})
+
+test('`bash x.sh` runs the copy in the folder when there is one, so PATH is not read', async ($, on) => {
+  const { p, out } = await script($, on, 'bash x.sh', { '/work/x.sh': { text: CLEAN }, '/Users/me/bin/x.sh': { text: 'rm -rf build\n' } }, { env: ON_PATH })
+  expect(out).toEqual({ result: 'ran' })
+  expect(p.reads).toEqual(['/work/x.sh'])
+})
+
+test('`bash x.sh` with no copy in the folder reads the one on PATH', async ($, on) => {
+  const { p, deny } = await script($, on, 'bash x.sh', { '/Users/me/bin/x.sh': { text: 'rm -rf build\n' } }, { env: ON_PATH })
+  expect(deny).toContain('run x.sh, where line 1 (rm -rf)')
+  expect(p.reads).toEqual(['/Users/me/bin/x.sh'])
+})
+
+test('a name found nowhere passes, said to be missing from the folder and PATH', async ($, on) => {
+  const { p, out } = await script($, on, 'source nope.sh', {}, { env: ON_PATH })
+  expect(out).toEqual({ result: 'ran' })
+  expect(p.logs[0]).toContain('no such file in the folder it runs in or on PATH')
+})
+
+// Review finding 2026-10-08, not taken: separators inside quotes split the line, as
+// upstream's splitter does for an inline rm too. The cut path is said, not hidden.
+test('a ; inside a quoted script name cuts the path: the cut name is skipped and said', async ($, on) => {
+  const { p, out } = await script($, on, 'bash "cleanup;prod.sh"', {})
+  expect(out).toEqual({ result: 'ran' })
+  expect(p.logs[0]).toContain('did not read cleanup (no such file')
 })
 
 test('a folder run by path passes with the reason', async ($, on) => {
@@ -754,6 +798,25 @@ test('in a script, a heredoc with an apostrophe and a comment line leave the rea
   expect(deny).toContain('run notes.sh, where line 5 (rm -rf)')
   expect(deny.includes('line 4')).toBe(false)
   expect(measured(p)).toEqual([['build']])
+})
+
+// The shell removes a `\`-newline pair, so a word continued with no space is one word.
+for (const [name, command, target] of [
+  ['bare', 'rm -rf foo\\\nbar', 'foobar'],
+  ['in double quotes', 'rm -rf "foo\\\nbar"', 'foobar'],
+  ['in single quotes, where the pair is kept', "rm -rf 'foo\\\nbar'", 'foo\\\nbar'],
+] as const) {
+  test(`a word continued with no space is one path, ${name}`, async ($, on) => {
+    const { p, deny } = await denied($, on, command)
+    expect(deny).toContain('did not run')
+    expect(measured(p)).toEqual([[target]])
+  })
+}
+
+test('rm glued to its flag by a continuation runs `rm-rf`, which deletes nothing, so it passes', async ($, on) => {
+  // bash and zsh both glue `echo\⏎hi` into `echohi: command not found` (2026-10-08).
+  const { out } = await script($, on, 'rm\\\n-rf build', {})
+  expect(out).toEqual({ result: 'ran' })
 })
 
 test('a continued line is one command, and the lines after it keep their numbers', async ($, on) => {

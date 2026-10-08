@@ -291,9 +291,10 @@ function classify(command) {
 
 /**
  * Local change: the text with each `\`-continued line joined, the pair replaced
- * by U+2028, a word break the splitter does not count as a new line. So
- * `rm -rf \⏎ build` is one rm, and the lines after it keep their numbers.
- * It does not know quotes, so it is never read alone (see classifyCommand).
+ * by U+2028, which the splitter does not count as a new line and `tokenize`
+ * drops, as the shell drops the pair. So `rm -rf \⏎ build` is one rm,
+ * `foo\⏎bar` is the one word `foobar`, and the lines after it keep their
+ * numbers. It does not know quotes, so it is never read alone (see classifyCommand).
  */
 function joinLines(text) {
   return text.replace(/\\\n/g, "\u2028");
@@ -642,6 +643,10 @@ function tokenize(text, vars = new Map(), notes = new Map()) {
   };
   while (i < text.length) {
     const c = text[i];
+    if (c === "\u2028") {
+      i += 1; // Local change: a joined `\`-newline, which the shell removes: `foo\⏎bar` is `foobar`
+      continue;
+    }
     if (/\s/.test(c)) {
       if (word !== null) {
         push();
@@ -654,12 +659,15 @@ function tokenize(text, vars = new Map(), notes = new Map()) {
     }
     if (c === "'") {
       const end = text.indexOf("'", i + 1);
-      word += end === -1 ? text.slice(i + 1) : text.slice(i + 1, end);
+      // Local change: single quotes keep a `\`-newline as written.
+      word += (end === -1 ? text.slice(i + 1) : text.slice(i + 1, end)).replace(/\u2028/g, "\\\n");
       i = end === -1 ? text.length : end + 1;
     } else if (c === '"') {
       i += 1;
       while (i < text.length && text[i] !== '"') {
-        if (text[i] === "\\" && i + 1 < text.length && '"\\$`'.includes(text[i + 1])) {
+        if (text[i] === "\u2028") {
+          i += 1; // Local change: removed inside double quotes too
+        } else if (text[i] === "\\" && i + 1 < text.length && '"\\$`'.includes(text[i + 1])) {
           word += text[i + 1];
           i += 2;
         } else if (text[i] === "$" || text[i] === "`") {
@@ -742,9 +750,9 @@ function unexpandedWhy(targets, notes) {
  * risky lines, null when it was read and there is nothing to hold, or
  * `{ skipped: true }` when it was not read, so a later hold can name it. A bare
  * path read and found not to be a shell script was read, so it returns null.
- * The file is read only when it is a regular file, under SCRIPT_BYTES_MAX, and
- * lands (every link followed) inside the session folder, the home folder or
- * Claude Code's temp folder. A
+ * Which file a bare name runs is found by scriptFiles. A file is read only when
+ * it is a regular file, under SCRIPT_BYTES_MAX, and lands (every link followed)
+ * inside the session folder, the home folder or this session's scratchpad. A
  * skip is logged with its reason, since no hold means no summary to say it in:
  * to the transcript for a shell invocation or a path with a shell name, to the
  * debug sink for any other bare path, which is usually a program (`/usr/bin/git`,
@@ -772,43 +780,91 @@ async function scriptRisk($, marker) {
       return skip(`the folder it is relative to, ${marker.dir}, was not found or could not be expanded without running a command`);
     }
   }
-  const stat = await $.fs.stat(absolutePath(marker.path, cwd, home), { resolve: true }).catch(() => undefined);
-  if (stat === undefined || stat.realPath === undefined) {
-    return skip("no such file");
-  }
-  const real = stat.realPath;
-  if (stat.kind !== "file") {
-    return skip(`${real} is not a regular file`);
+  const found = await scriptFiles($, marker, cwd, home);
+  if (found.length === 0) {
+    return skip(marker.path.includes("/") || marker.path.startsWith("~") ? "no such file" : "no such file in the folder it runs in or on PATH");
   }
   const roots = await localRoots($, [sessionCwd, home]);
   const id = await $.session.id().catch(() => "");
-  if (!roots.some((root) => real.startsWith(`${root}/`)) && !(id !== "" && SCRATCHPAD(id).test(real))) {
-    return skip(`${real} is outside the session folder, your home folder and this session's scratchpad`);
+  const check = async (stat) => {
+    const real = stat.realPath;
+    if (stat.kind !== "file") {
+      return skip(`${real} is not a regular file`);
+    }
+    if (!roots.some((root) => real.startsWith(`${root}/`)) && !(id !== "" && SCRATCHPAD(id).test(real))) {
+      return skip(`${real} is outside the session folder, your home folder and this session's scratchpad`);
+    }
+    if (stat.size > SCRIPT_BYTES_MAX) {
+      return skip(`${kib(stat.size)} is over the ${kib(SCRIPT_BYTES_MAX)} limit`);
+    }
+    const text = await $.fs.read(real).catch(() => undefined);
+    if (typeof text !== "string") {
+      return skip("it could not be read"); // no permission, or not text
+    }
+    const name = real.slice(real.lastIndexOf("/") + 1);
+    if (marker.via === "path" && !looksLikeShell(name, text)) {
+      // Read, so not a skip: a program in another language is out of scope, as `python x.py` is.
+      const first = text.split("\n", 1)[0];
+      const why = first.startsWith("#!") ? `${first.slice(0, 60)} is not a shell` : "it has no shell shebang and no .sh name";
+      $.ui.log(`Blast Radius read ${real} and did not check it (${why}), so \`${invoked}\` ran unchecked.`, { to: "debug" });
+      return null;
+    }
+    const lines = riskyLines(text);
+    const lineCount = text.split("\n").filter((l, i, arr) => i < arr.length - 1 || l !== "").length;
+    if (lines.length === 0) {
+      $.ui.log(`Blast Radius read ${real} (${lineCount} lines): nothing risky in it.`, { to: "debug" });
+      return null;
+    }
+    const more = lines.length - 1;
+    const label = `${lines[0].risk.label} in ${name} line ${lines[0].line}${more > 0 ? ` and ${more} more risky ${more === 1 ? "line" : "lines"}` : ""}`;
+    return { kind: "script", label, path: real, name, dir: marker.dir, invoked, lines, lineCount };
+  };
+  // Two copies can be found for a sourced name: the first risky one holds, and a
+  // skip of either is kept so a later hold can name it.
+  let result = null;
+  for (const stat of found) {
+    const read = await check(stat);
+    if (read !== null && read.skipped !== true) {
+      return read;
+    }
+    result = read ?? result;
   }
-  if (stat.size > SCRIPT_BYTES_MAX) {
-    return skip(`${kib(stat.size)} is over the ${kib(SCRIPT_BYTES_MAX)} limit`);
+  return result;
+}
+
+/**
+ * Local change: the files `marker` may run, as stats that found something. A
+ * path with a `/` or a `~` names one file. A bare name is looked up as the shell
+ * does it. Measured 2026-10-08 on macOS, bash 3.2 and zsh 5.9: `source` and `.`
+ * try PATH first in bash and sh and with zsh's `.`, and zsh's `source` tries the
+ * folder first, so the first match on PATH and the folder's copy are both
+ * returned, in that order. `bash x.sh` and the other shells take the folder's
+ * copy, and only without one the first match on PATH (bash and sh look there,
+ * zsh does not). PATH is Claude Code's own, which may lack a folder that the Bash
+ * tool's shell profile adds.
+ */
+async function scriptFiles($, marker, cwd, home) {
+  const at = async (path) => {
+    const stat = await $.fs.stat(path, { resolve: true }).catch(() => undefined);
+    return stat?.realPath === undefined ? null : stat;
+  };
+  const here = await at(absolutePath(marker.path, cwd, home));
+  const bare = !marker.path.includes("/") && !marker.path.startsWith("~");
+  const sourced = marker.via === "." || marker.via === "source";
+  if (!bare || (here !== null && !sourced)) {
+    return here === null ? [] : [here];
   }
-  const text = await $.fs.read(real).catch(() => undefined);
-  if (typeof text !== "string") {
-    return skip("it could not be read"); // no permission, or not text
+  let onPath = null;
+  for (const dir of ((await $.env.get("PATH")) ?? "").split(":")) {
+    if (dir.startsWith("/")) {
+      const stat = await at(`${dir.replace(/\/+$/, "")}/${marker.path}`);
+      if (stat?.kind === "file") {
+        onPath = stat;
+        break;
+      }
+    }
   }
-  const name = real.slice(real.lastIndexOf("/") + 1);
-  if (marker.via === "path" && !looksLikeShell(name, text)) {
-    // Read, so not a skip: a program in another language is out of scope, as `python x.py` is.
-    const first = text.split("\n", 1)[0];
-    const why = first.startsWith("#!") ? `${first.slice(0, 60)} is not a shell` : "it has no shell shebang and no .sh name";
-    $.ui.log(`Blast Radius read ${real} and did not check it (${why}), so \`${invoked}\` ran unchecked.`, { to: "debug" });
-    return null;
-  }
-  const lines = riskyLines(text);
-  const lineCount = text.split("\n").filter((l, i, arr) => i < arr.length - 1 || l !== "").length;
-  if (lines.length === 0) {
-    $.ui.log(`Blast Radius read ${real} (${lineCount} lines): nothing risky in it.`, { to: "debug" });
-    return null;
-  }
-  const more = lines.length - 1;
-  const label = `${lines[0].risk.label} in ${name} line ${lines[0].line}${more > 0 ? ` and ${more} more risky ${more === 1 ? "line" : "lines"}` : ""}`;
-  return { kind: "script", label, path: real, name, dir: marker.dir, invoked, lines, lineCount };
+  return [onPath, here].filter((s, i, all) => s !== null && all.findIndex((t) => t?.realPath === s.realPath) === i);
 }
 
 /** `path` as an absolute path: `~` from `home`, a relative path under `cwd`. */

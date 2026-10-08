@@ -142,6 +142,28 @@ Vendored from Anthropic's claude-code-playground.
    folder, and usually the script, does not exist when the hook runs, the same
    reasoning as the unresolvable `cd` above.
 
+   A bare name is looked up as the shell does (`scriptFiles`), from Codex's
+   review of PR #23, which found `source x.sh` read in the folder while bash
+   runs the copy on `PATH`. Measured 2026-10-08 on macOS (bash 3.2, zsh 5.9,
+   the Bash tool's shell): `source` and `.` try `PATH` first in bash and sh,
+   and with zsh's `.`, which never tries the folder; zsh's `source` tries the
+   folder first; `bash x.sh` and `sh x.sh` try the folder, then `PATH`; `zsh
+   x.sh` tries the folder only. So after `source` or `.` the first match on
+   `PATH` and the folder's copy are both read, `PATH` first, and the first
+   risky one holds; after a shell, the folder's copy, or without one the first
+   match on `PATH` (for zsh that is a hold on a command that would fail).
+   `PATH` is read with `$.env.get`, so it is Claude Code's own and may lack a
+   folder the Bash tool's shell profile adds; spawning a login shell to ask was
+   not done. A copy found on `PATH` still has to pass the three-folder rule.
+
+   Not taken from the same review, as a decision: splitting the line only at a
+   `;`, `|` or `&` outside quotes. Upstream's splitter ignores quotes for an
+   inline risk too (`rm -rf "a;b"` is measured as `a`), and change 10 records
+   four review rounds in which tracking quote state hid a real `rm -rf`. So
+   `bash "cleanup;prod.sh"` is read as `bash cleanup`: with no file by that
+   name it is skipped with a transcript line, and a later hold names it. A file
+   named `cleanup` in the folder would be read in its place.
+
    Why: observed 2026-10-08 in the desktop Code tab. A scratchpad script holding
    two `rm -rf` lines (a Local Sites folder and its run dir, 9.2 GiB) ran at once
    as `bash local-delete.sh`, while the same deletions written inline in a
@@ -156,12 +178,22 @@ Vendored from Anthropic's claude-code-playground.
    changing between the read and Proceed.
 10. `hooks/blast-radius.mjs`, continued lines. The hook reads a command line,
     and `riskyLines` reads a script, twice: as written, and with each `\`-newline
-    pair replaced by U+2028, a word break the splitter does not count as a new
-    line. A risk in either reading holds; the joined one is reported, since it
+    pair replaced by U+2028, which the splitter does not count as a new line.
+    A risk in either reading holds; the joined one is reported, since it
     measures `rm -rf \` + `build` as one `rm`. So the joined reading only adds
     holds, such as `rm \` + `-rf build`, which upstream missed. Its naive join
     misreads `echo foo\\` at a line end, and the reading as written still holds
     that line.
+
+    `tokenize` drops U+2028 outside quotes and inside double quotes, as the shell
+    drops the pair, and puts the `\`-newline back inside single quotes. The
+    first version read it as a word break, so `rm -rf foo\` + `bar` was
+    measured as `foo` and `bar` and could say "delete nothing" while Proceed
+    deletes `foobar` (Codex's review of PR #23). One hold goes with it:
+    `rm\` + `-rf build`, with no space, is now the command `rm-rf`, as bash and
+    zsh run it (`echo\` + `hi` gave "command not found: echohi" in both,
+    2026-10-08), so it passes. `evals/no-weaker/run.sh 5d42f8f` reports that
+    one command and nothing else.
 
     Why two readings and no comment stripping: an earlier draft of this change
     removed `#` comments before reading. Four commit-review rounds each traced a
@@ -185,23 +217,26 @@ Local (CLI 2.1.294):
 
     hooks: session.start, tool.call{tool=Bash}, ui.render{component=Pane}, ui.render{component=AbovePrompt}
     gating hook with .catch: tool.call{tool=Bash}
-    calls: $.clock.now, $.env.get, $.fs.read (via scriptRisk), $.fs.stat (via localRoots, scriptRisk), $.process.run, $.session.cwd, $.session.id (via scriptRisk), $.session.surfaces, $.ui.ask, $.ui.close, $.ui.invalidate, $.ui.log, $.ui.open, $.ui.resolve, $.ui.toast
+    calls: $.clock.now, $.env.get, $.fs.read (via scriptRisk), $.fs.stat (via localRoots, scriptFiles), $.process.run, $.session.cwd, $.session.id (via scriptRisk), $.session.surfaces, $.ui.ask, $.ui.close, $.ui.invalidate, $.ui.log, $.ui.open, $.ui.resolve, $.ui.toast
     env writes: nothing
-    env reads: BLAST_RADIUS_HEADLESS, BLAST_RADIUS_HOLD_SECONDS, HOME
+    env reads: BLAST_RADIUS_HEADLESS, BLAST_RADIUS_HOLD_SECONDS, HOME, PATH
 
 `$.fs.read`, `$.fs.stat` and `$.session.id` are the script read (change 9):
 `$.session.id` names this session's scratchpad. `HOME` resolves `~` and is one
-of the three folders a script may be read from.
+of the three folders a script may be read from. `PATH` finds the file a bare
+name after `source`, `.` or a shell runs.
 
 ## Proving it
 
-- `claude plugin test mods/blast-radius` runs the unit tests (71): the pane, the
+- `claude plugin test mods/blast-radius` runs the unit tests (81): the pane, the
   question dialog's answers, the nobody-to-ask deny, the hold limit, `rm` word
   splitting, scripts run by path (each invocation form, the three folders, a
   link that lands outside, the size cap, a read that rejects, one level,
   several scripts on one line and the unread ones named, a risk on the line
-  winning, continued lines, this session's scratchpad and not another's,
-  `cd` on the line and in the script, the question's text), and four inputs
+  winning, a bare name looked up on `PATH`, a `;` inside a quoted name,
+  continued lines and a word continued with no space, this session's
+  scratchpad and not another's, `cd` on the line and in the script, the
+  question's text), and four inputs
   that review traced to a removed comment stripper, each still held. The
   file system is stubbed: `fs.stat` answers from a map of paths to real paths,
   sizes and kinds, `fs.read` from the same map.
@@ -215,8 +250,10 @@ of the three folders a script may be read from.
 - `evals/no-weaker/run.sh [ref]` loads the classifier at `ref` (default `main`)
   and this folder's, and runs every string literal in the test file plus the
   shapes review traced: each one the old holds, the new must hold. 2026-10-08:
-  48 held by `main`, 0 no longer held; with the reading as written switched
-  off, it reported the escaped-backslash line, so it can fail.
+  50 held by `main`, 0 no longer held; with the reading as written switched
+  off, it reported the escaped-backslash line, so it can fail. Against
+  5d42f8f: 52 held, 1 no longer held, the deliberate `rm\` + `-rf build` of
+  change 10.
 - `evals/sdk-host-canary/run.sh <mode> [inline|script]` runs Haiku in a
   stream-json host shaped like the desktop app's Code tab. The host answers the
   question as a person would, or plays plain `claude -p`. With `script`, the
