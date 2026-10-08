@@ -139,10 +139,13 @@ Git is a trademark of Software Freedom Conservancy. Python is a registered trade
 
 ## Local changes
 
-This copy is vendored at upstream commit `e9ab132` and tested with Claude Code CLI 2.1.288. See `UPSTREAM.md` for the full list.
+This copy is vendored at upstream commit `e9ab132` and tested with Claude Code CLI 2.1.288, and 2.1.294 for the question-dialog hold. See `UPSTREAM.md` for the full list.
 
-- **Unattended sessions deny at once.** Under `claude -p`, the Agent SDK, or a cloud session nothing can draw the pane, so there is no button to press. The command is refused with a reason Claude can act on. Set `BLAST_RADIUS_HEADLESS=allow` to let unattended runs proceed; one line is logged.
-- **The hold has a configurable limit.** `BLAST_RADIUS_HOLD_SECONDS` (default 600, minimum 5) sets how long a hold waits before refusing. This replaces the fixed 10 minutes above.
+- **Where no surface draws the pane, Claude Code's own question dialog holds the command.** The desktop app's Code tab draws no pane: the mod sees `isInteractive=false` and no drawing surface there. It does show Claude Code's questions, so the command is put to you as a question with Proceed and Cancel. It includes the command, what it would delete, and the first few paths. Proceed runs it. Cancel, dismissing the question, or typing your own answer refuses it, and a typed answer is passed back to Claude.
+- **Sessions with no one to ask still deny at once.** Under `claude -p` there is no question dialog, so the question fails straight away and the command is refused. The refusal names the signals that decided: `isInteractive`, the drawing surfaces, and why the question failed. To let such runs delete, start Claude Code with `BLAST_RADIUS_HEADLESS=allow` in its own environment; one line is logged. A `VAR=value` prefix on the Bash command does not reach the mod. The setting applies only where no question dialog exists. It never skips a question, and never runs a command whose question was refused.
+- **The hold has a configurable limit.** `BLAST_RADIUS_HOLD_SECONDS` (default 600, minimum 5) sets how long a hold waits before refusing. This replaces the fixed 10 minutes above. A question nobody answers is refused at the limit; it may stay open, and answering it then does nothing.
+- **`rm` paths are read the way the shell reads them.** The pieces of one word stay together, so `"$DIR"/*` is one path, not `$DIR` and the filesystem root `/*`. A variable set to a plain value earlier on the same line is filled in, and `$HOME` becomes `~`. Anything else is not measured, and the summary says why instead of "delete nothing". That covers a variable from the shell's environment, `$(...)`, and an unquoted value with spaces. Nothing is run to find a value.
+- **A hook failure refuses the command.** Upstream let it run.
 - To load it for every session, add its folder to `CLAUDE_CODE_PLUGIN_DIRS`.
 
 ---

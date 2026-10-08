@@ -20,12 +20,17 @@ const POLL_SECONDS = "0.25";
 const HOLD_SECONDS_DEFAULT = 600;
 const HOLD_SECONDS_MIN = 5;
 const LIST_MAX = 10;
+// Local change: the engine's question dialog, the hold where no surface draws the pane.
+const PROCEED = "Proceed";
+const CANCEL = "Cancel";
+const QUESTION_LIST_MAX = 3;
 
 // The call being held, or null. One at a time: Bash calls in a turn run in order.
 let held = null;
 
 // Local change: whether a person is at the prompt, from session.start. null until
-// that event is seen (a mod loaded mid-session), which defers to the surfaces check.
+// that event is seen (a mod loaded mid-session). Reported in a deny, not used to
+// decide: the desktop app's Code tab reports false with a person present.
 let sessionInteractive = null;
 
 export function register(on) {
@@ -35,6 +40,8 @@ export function register(on) {
     return next(e);
   });
 
+  // Local change: `.catch` refuses the command when the hook itself fails (a
+  // throw outside the hold's own try, or an overrun budget). Upstream failed open.
   on("tool.call", { tool: "Bash" }, async ($, e, next) => {
     const risk = classify(String(e.command ?? ""));
     if (risk === null) {
@@ -49,13 +56,14 @@ export function register(on) {
       }
       await $.process.run(["sleep", POLL_SECONDS], { timeoutMs: 5000 });
     }
-    const mine = { command: String(e.command), risk, report: null, decision: null, where: "pane" };
+    const mine = { command: String(e.command), risk, report: null, decision: null, where: "pane", polls: 0, answer: null, askError: null, askRejectedAtPoll: null };
     held = mine;
 
-    let opened = { isPlaced: false };
+    let paneOpened = false;
     let decision;
     let holdSeconds = HOLD_SECONDS_DEFAULT;
     let summary = risk.label;
+    let surfaces = [];
     try {
       // Measure where the command will run: the session folder, moved by any
       // `cd dir &&` or `git -C dir` earlier in the same command line.
@@ -66,53 +74,76 @@ export function register(on) {
         : await measure($, risk, cwd);
       summary = mine.report.summary;
 
-      // Local change. Measured: under `claude -p` nothing draws, so upstream waited
-      // the full hold limit for a button no one could press (canary hung past 120 s).
-      // With no one present, deny at once, or pass through when the user opted in.
-      const surfaces = await $.session.surfaces();
-      const canDraw = sessionInteractive !== false && surfaces.length > 0;
-      if (!canDraw) {
-        if ((await $.env.get("BLAST_RADIUS_HEADLESS")) === "allow") {
-          $.ui.log(`Blast Radius: unattended session, BLAST_RADIUS_HEADLESS=allow, running: ${summary}`);
-          mine.decision = "headless-allow";
+      // Local change: the limit is BLAST_RADIUS_HOLD_SECONDS (default 600, minimum 5);
+      // upstream hard-coded 10 minutes.
+      const asked = Number(await $.env.get("BLAST_RADIUS_HOLD_SECONDS"));
+      if (Number.isFinite(asked) && asked > 0) {
+        holdSeconds = Math.max(HOLD_SECONDS_MIN, asked);
+      }
+
+      // Local change: where the person answers. A surface that draws gets the pane,
+      // as upstream. With none, the engine's own question dialog holds the call.
+      // Measured 2026-10-08 in a stream-json SDK host shaped like the desktop app's
+      // Code tab (--permission-prompt-tool stdio): isInteractive was false and
+      // surfaces() empty, yet $.ui.ask reached the host as a can_use_tool request
+      // for AskUserQuestion. Under `claude -p` the ask rejects at once ("no tool
+      // named AskUserQuestion"), which is what marks a session with no one to ask.
+      surfaces = await $.session.surfaces();
+      if (surfaces.length > 0) {
+        const opened = await $.ui.open({ id: PANE_ID, title: "Blast Radius", focus: true, rows: paneRows(mine.report) });
+        paneOpened = true;
+        if (opened.isPlaced) {
+          mine.where = "pane";
+        } else if (surfaces.includes("terminal")) {
+          mine.where = "band"; // a narrow terminal: the report is drawn above the prompt
         } else {
-          mine.decision = "headless";
+          mine.where = "ask"; // a remote surface that places no panes
         }
       } else {
-        // Local change: the limit is BLAST_RADIUS_HOLD_SECONDS (default 600, minimum 5);
-        // upstream hard-coded 10 minutes.
-        const asked = Number(await $.env.get("BLAST_RADIUS_HOLD_SECONDS"));
-        if (Number.isFinite(asked) && asked > 0) {
-          holdSeconds = Math.max(HOLD_SECONDS_MIN, asked);
-        }
+        mine.where = "ask";
+      }
+      if (mine.where === "ask") {
+        // Not awaited: the poll loop below keeps the interrupt and the hold limit.
+        $.ui.ask(question(mine), { header: "Blast Radius", options: [PROCEED, CANCEL] }).then(
+          (answer) => {
+            if (mine.decision === null) {
+              mine.answer = String(answer);
+              mine.decision = mine.answer === PROCEED ? "proceed" : "answered";
+            }
+          },
+          (error) => {
+            if (mine.decision === null) {
+              mine.askError = String(error?.message ?? error).slice(0, 200);
+              mine.askRejectedAtPoll = mine.polls;
+              mine.decision = "ask-rejected";
+            }
+          },
+        );
+      }
+      $.ui.invalidate("ui.render");
 
-        opened = await $.ui.open({ id: PANE_ID, title: "Blast Radius", focus: true, rows: paneRows(mine.report) });
-        if (!opened.isPlaced) {
-          mine.where = "band";
+      const startedAt = await $.clock.now();
+      while (mine.decision === null) {
+        if (next.signal.aborted) {
+          mine.decision = "interrupted";
+          break;
         }
-        $.ui.invalidate("ui.render");
-
-        const startedAt = await $.clock.now();
-        while (mine.decision === null) {
-          if (next.signal.aborted) {
-            mine.decision = "interrupted";
-            break;
-          }
-          if ((await $.clock.now()) - startedAt > holdSeconds * 1000) {
-            mine.decision = "timeout";
-            break;
-          }
-          await $.process.run(["sleep", POLL_SECONDS], { timeoutMs: 5000 });
+        if ((await $.clock.now()) - startedAt > holdSeconds * 1000) {
+          mine.decision = "timeout";
+          break;
         }
+        await $.process.run(["sleep", POLL_SECONDS], { timeoutMs: 5000 });
+        mine.polls += 1;
       }
     } catch {
       mine.decision = "error"; // anything unexpected refuses the command
     } finally {
       decision = mine.decision;
       // Close this call's pane before releasing the hold, so the next call's
-      // pane can't be the one that gets closed.
+      // pane can't be the one that gets closed. Local change: an opened pane that
+      // waits unplaced is closed too, so it is not seated later with nothing held.
       try {
-        if (opened.isPlaced) {
+        if (paneOpened) {
           await $.ui.close({ id: PANE_ID });
         }
       } catch {
@@ -128,28 +159,57 @@ export function register(on) {
       $.ui.toast("Blast Radius: running it");
       return next(e);
     }
-    if (decision === "headless-allow") {
-      return next(e);
+    // Local change: what a rejected question means. Only a session with no question
+    // dialog at all (`claude -p`: "no tool named AskUserQuestion") is one nobody can
+    // be asked in, and only that one honours BLAST_RADIUS_HEADLESS=allow. A rejection
+    // before the first poll ended is a dismissal straight away, or a host answering
+    // without a person (one that refuses questions, or approves every request with no
+    // answer); a person may be there, so it is refused, never run. Later, it was dismissed.
+    if (decision === "ask-rejected") {
+      if (/no tool named/i.test(mine.askError ?? "")) {
+        decision = "nobody";
+      } else {
+        decision = mine.askRejectedAtPoll === 0 ? "refused" : "dismissed";
+      }
     }
-    if (decision === "headless") {
+    // Local change: the signals that decided, so Claude can report them accurately.
+    const signals = `isInteractive=${sessionInteractive ?? "not seen"}, drawing surfaces: ${surfaces.length > 0 ? surfaces.join(", ") : "none"}, question rejected at once: ${mine.askError ?? "no reason given"}`;
+    if (decision === "nobody") {
+      if ((await $.env.get("BLAST_RADIUS_HEADLESS")) === "allow") {
+        $.ui.log(`Blast Radius: no one could be asked, BLAST_RADIUS_HEADLESS=allow, running: ${summary}`);
+        return next(e);
+      }
       return {
-        deny: `Blast Radius held this command and did not run it: no one is present to approve it in this unattended session. It would have: ${summary}. Do not retry it; ask the user, or run with BLAST_RADIUS_HEADLESS=allow when an unattended run may delete.`,
+        deny: `Blast Radius held this command and did not run it: no one could be asked to approve it (${signals}). It would have: ${summary}. Do not retry it. Ask the user to run it themselves, or to start Claude Code with BLAST_RADIUS_HEADLESS=allow in Claude Code's own environment when an unattended run may delete; the mod reads it from that environment, so a VAR=value prefix on the Bash command does not reach it.`,
+      };
+    }
+    if (decision === "refused") {
+      return {
+        deny: `Blast Radius held this command and did not run it: its question was refused at once (${signals}). Either the user dismissed it straight away, or this host answers Claude Code's questions without a person. It would have: ${summary}. Do not retry it unless the user asks you to.`,
       };
     }
     if (decision === "timeout") {
+      const where = mine.where === "ask" ? "the question; it may still be open, and answering it now does nothing" : "the pane";
       return {
-        deny: `Blast Radius held this command for ${holdSeconds} s and nobody answered; it did not run. It would have: ${summary}. Do not retry it unless the user asks you to.`,
+        deny: `Blast Radius held this command for ${holdSeconds} s and nobody answered ${where}. It did not run. It would have: ${summary}. Do not retry it unless the user asks you to.`,
+      };
+    }
+    if (decision === "answered") {
+      const said = mine.answer === CANCEL ? "the user chose Cancel" : `the user answered "${mine.answer.slice(0, 300)}" instead of choosing Proceed`;
+      return {
+        deny: `Blast Radius held this command and did not run it: ${said}. It would have: ${summary}. Do not retry it unless the user asks you to; act on what they said.`,
       };
     }
     const why = {
       cancel: "the user pressed Cancel",
+      dismissed: "the user dismissed the Blast Radius question",
       interrupted: "the turn was interrupted",
       error: "Blast Radius hit an error while holding it",
     }[decision] ?? "no answer was recorded";
     return {
       deny: `Blast Radius held this command and did not run it: ${why}. It would have: ${summary}. Do not retry it unless the user asks you to.`,
     };
-  });
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: "Blast Radius failed while checking this command, so it did not run. Do not retry it unless the user asks you to." }));
 
   on("ui.render", { component: "Pane" }, ($, e, next) => {
     if (e.requestId !== PANE_ID || held === null || held.report === null) {
@@ -186,15 +246,26 @@ function classify(command) {
   let dir = null; // where a `cd` earlier on the line moved to; null means the session folder
   const scopes = []; // dir to restore when a ( subshell ) closes
   const pushed = []; // pushd stack, for popd
-  for (const raw of command.split(/&&|\|\||;|\||\n/)) {
+  // Local change: NAME -> a value set earlier on the line, or null when it can't be
+  // known without running something. Saved and restored around ( subshells ).
+  const vars = new Map();
+  const varScopes = [];
+  // Local change: the separators are kept, so an assignment can be told apart by
+  // what runs it. Only one that follows `;` or a line start and feeds no pipe
+  // surely ran in this shell.
+  const parts = command.split(/(&&|\|\||;|\||\n)/);
+  for (let p = 0; p < parts.length; p += 2) {
+    const raw = parts[p];
+    const certain = (p === 0 || parts[p - 1] === ";" || parts[p - 1] === "\n") && parts[p + 1] !== "|";
     const opens = (raw.match(/^\s*\(+/)?.[0].trim().length) ?? 0;
     // Trailing redirects and & don't hide a closing ) : `(cd sub && make) > log`.
     const tail = raw.replace(/(?:\s*(?:\d*>>?|&>>?|<)\s*\S+|\s*&)+\s*$/, "");
     const closes = (tail.match(/\)+\s*$/)?.[0].trim().length) ?? 0;
     for (let k = 0; k < opens; k += 1) {
       scopes.push(dir);
+      varScopes.push(new Map(vars));
     }
-    const risk = classifySegment(raw, dir, pushed);
+    const risk = classifySegment(raw, dir, pushed, vars, certain);
     if (risk !== null && risk.cd === undefined) {
       return risk;
     }
@@ -203,6 +274,9 @@ function classify(command) {
     }
     for (let k = 0; k < closes && scopes.length > 0; k += 1) {
       dir = scopes.pop(); // a cd inside ( ... ) doesn't outlive it
+      const outer = varScopes.pop(); // nor does an assignment
+      vars.clear();
+      outer.forEach((value, name) => vars.set(name, value));
     }
   }
   return null;
@@ -212,9 +286,21 @@ function classify(command) {
 const PREFIXES = new Set(["command", "exec", "env", "nohup", "time", "then", "do", "else", "!"]);
 
 /** One segment: a risk, { cd } for a folder change, or null. */
-function classifySegment(segment, dir, pushed) {
+function classifySegment(segment, dir, pushed, vars, certain) {
   {
-    const words = tokenize(segment.trim().replace(/^[({]+\s*/, "").replace(/\s*[)}]+$/, ""));
+    const notes = new Map(); // word -> what it left unexpanded (Local change)
+    const words = tokenize(segment.trim().replace(/^[({]+\s*/, "").replace(/\s*[)}]+$/, ""), vars, notes);
+    // Local change: a segment of plain assignments (`X=/path`, `export X=...`) sets
+    // a value later words expand. One that needs a command or another unknown
+    // variable is recorded as unknowable (null), never run.
+    const assigns = words[0] === "export" ? words.slice(1) : words;
+    if (assigns.length > 0 && assigns.every((w) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(w))) {
+      for (const w of assigns) {
+        const eq = w.indexOf("=");
+        vars.set(w.slice(0, eq), certain && !notes.has(w) ? w.slice(eq + 1) : null);
+      }
+      return null;
+    }
     while (words.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) {
       words.shift(); // leading VAR=value
     }
@@ -259,7 +345,8 @@ function classifySegment(segment, dir, pushed) {
       const force = flags.some((f) => f === "--force" || (/^-[^-]/.test(f) && f.includes("f")));
       if (recursive || force) {
         const targets = args.filter((a) => !a.startsWith("-") || a === "-");
-        return { kind: "rm", label: `rm ${flags.join(" ")}`.trim(), targets, dir };
+        // Local change: targets the tokenizer could not expand are named, with why.
+        return { kind: "rm", label: `rm ${flags.join(" ")}`.trim(), targets, dir, unexpanded: unexpandedWhy(targets, notes) };
       }
     }
     if (cmd === "git") {
@@ -325,15 +412,172 @@ async function resolveDir($, sessionCwd, dir) {
   return run.exitCode === 0 && out !== "" ? out : null;
 }
 
-/** Splits one segment into words, honouring quotes. Good enough to read flags and paths. */
-function tokenize(text) {
+/**
+ * Splits one segment into words the way the shell does, honouring quotes and
+ * backslashes. Good enough to read flags and paths.
+ *
+ * Local change. Upstream split at every quote, so `rm -rf "$DIR"/*` read as the
+ * two targets `$DIR` and `/*`, the second one the filesystem root. Here the pieces
+ * of one word stay together. Outside single quotes, `$NAME` and `${NAME}` take a
+ * value set earlier on the line (`vars`), and `$HOME` at the start of a word
+ * becomes `~`. Every other expansion stays as written and is recorded in `notes`
+ * (word -> what it left, and why), so the caller can say it was not measured:
+ * an unset variable, one whose value is unknown, an unquoted value with spaces
+ * (the shell would split it), `$1` or `${X:-y}`, and `$(...)` or backticks, which
+ * are kept whole and never run. A `$` from single quotes or `\$` is a plain `$`.
+ */
+function tokenize(text, vars = new Map(), notes = new Map()) {
   const words = [];
-  const re = /"((?:[^"\\]|\\.)*)"|'([^']*)'|(\S+)/g;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    words.push(m[1] ?? m[2] ?? m[3]);
+  let word = null; // null between words
+  let left = []; // what this word left unexpanded
+  let i = 0;
+  const push = () => {
+    if (left.length > 0) {
+      notes.set(word, left);
+    }
+    words.push(word);
+    word = null;
+    left = [];
+  };
+  // Reads the expansion at text[i] (a `$` or a backtick): its value, or the text as written.
+  const expansion = (quoted) => {
+    if (text[i] === "`") {
+      const end = text.indexOf("`", i + 1);
+      const raw = end === -1 ? text.slice(i) : text.slice(i, end + 1);
+      i += raw.length;
+      left.push({ kind: "command", raw });
+      return raw;
+    }
+    if (text[i + 1] === "(") {
+      const raw = text.slice(i, closing(text, i + 1));
+      i += raw.length;
+      left.push({ kind: "command", raw });
+      return raw;
+    }
+    const m = /^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/.exec(text.slice(i));
+    if (m === null) {
+      const special = /^\$(?:[0-9?@*#$!-]|\{[^}]*\}?)/.exec(text.slice(i));
+      if (special === null) {
+        i += 1;
+        return "$"; // a lone $, as the shell leaves it
+      }
+      i += special[0].length;
+      left.push({ kind: "special", raw: special[0] });
+      return special[0];
+    }
+    i += m[0].length;
+    const name = m[1] ?? m[2];
+    if (!vars.has(name)) {
+      if (name === "HOME" && word === "") {
+        return "~";
+      }
+      left.push({ kind: "unset", name });
+      return m[0];
+    }
+    const value = vars.get(name);
+    if (value === null) {
+      left.push({ kind: "unknown", name });
+      return m[0];
+    }
+    if (!quoted && /\s/.test(value)) {
+      left.push({ kind: "split", name });
+      return m[0];
+    }
+    return value;
+  };
+  while (i < text.length) {
+    const c = text[i];
+    if (/\s/.test(c)) {
+      if (word !== null) {
+        push();
+      }
+      i += 1;
+      continue;
+    }
+    if (word === null) {
+      word = "";
+    }
+    if (c === "'") {
+      const end = text.indexOf("'", i + 1);
+      word += end === -1 ? text.slice(i + 1) : text.slice(i + 1, end);
+      i = end === -1 ? text.length : end + 1;
+    } else if (c === '"') {
+      i += 1;
+      while (i < text.length && text[i] !== '"') {
+        if (text[i] === "\\" && i + 1 < text.length && '"\\$`'.includes(text[i + 1])) {
+          word += text[i + 1];
+          i += 2;
+        } else if (text[i] === "$" || text[i] === "`") {
+          word += expansion(true);
+        } else {
+          word += text[i];
+          i += 1;
+        }
+      }
+      i += 1;
+    } else if (c === "\\") {
+      word += text[i + 1] ?? "";
+      i += 2;
+    } else if (c === "$" || c === "`") {
+      word += expansion(false);
+    } else {
+      word += c;
+      i += 1;
+    }
+  }
+  if (word !== null) {
+    push();
   }
   return words;
+}
+
+/** Local change: the index just past the `)` that closes the `(` at `open`, or the end. */
+function closing(text, open) {
+  let depth = 0;
+  for (let k = open; k < text.length; k += 1) {
+    const c = text[k];
+    if (c === "\\") {
+      k += 1;
+    } else if (c === "'") {
+      const end = text.indexOf("'", k + 1);
+      if (end === -1) {
+        return text.length;
+      }
+      k = end;
+    } else if (c === "(") {
+      depth += 1;
+    } else if (c === ")") {
+      depth -= 1;
+      if (depth === 0) {
+        return k + 1;
+      }
+    }
+  }
+  return text.length;
+}
+
+/**
+ * Local change: the rm targets the tokenizer could not expand, and why, or null
+ * when every target was expanded.
+ */
+function unexpandedWhy(targets, notes) {
+  const left = targets.filter((t) => notes.has(t));
+  if (left.length === 0) {
+    return null;
+  }
+  const reasons = new Set();
+  for (const t of left) {
+    for (const n of notes.get(t)) {
+      reasons.add({
+        command: () => `${n.raw} runs a command, which Blast Radius does not run`,
+        special: () => `${n.raw} is not a plain variable`,
+        unset: () => `$${n.name} is not set on this line, and Blast Radius does not read the shell's variables`,
+        unknown: () => `$${n.name} is set on this line from a command or another variable, or where it may not have run`,
+        split: () => `$${n.name} is unquoted and holds spaces, so the shell splits it into several paths`,
+      }[n.kind]());
+    }
+  }
+  return { targets: left, why: [...reasons].join("; ") };
 }
 
 // ---- Measuring the blast radius -------------------------------------------
@@ -375,10 +619,30 @@ echo "$files $(( \${kb:-0} * 1024 )) \${#paths[@]}"
 find "\${paths[@]}" \\( -type f -o -type l \\) 2>/dev/null | head -n ${LIST_MAX}
 `;
 
+
 async function measureRm($, risk, cwd) {
   if (risk.targets.length === 0) {
     return { summary: "rm with no paths", lines: [], note: "No paths to expand." };
   }
+  // Local change: targets Blast Radius could not expand are not measured, and the
+  // summary says so instead of "delete nothing". Upstream measured the literal `$X`.
+  const skipped = risk.unexpanded;
+  const measurable = skipped === null ? risk.targets : risk.targets.filter((t) => !skipped.targets.includes(t));
+  if (measurable.length === 0) {
+    return {
+      summary: `delete what ${skipped.targets.join(" ")} matches: not measured, because ${skipped.why}`,
+      lines: [],
+      note: "Blast Radius does not run commands or read the shell's variables to expand a path, so it could not count what this would delete.",
+    };
+  }
+  const report = await measureRmPaths($, { ...risk, targets: measurable }, cwd);
+  if (skipped !== null) {
+    report.summary += `; and what ${skipped.targets.join(" ")} matches, not measured, because ${skipped.why}`;
+  }
+  return report;
+}
+
+async function measureRmPaths($, risk, cwd) {
   const run = await $.process.run(["bash", "-c", RM_SCRIPT, "blast-radius", ...risk.targets], { cwd, timeoutMs: 15000 });
   const [head, ...rest] = run.stdout.split("\n").filter((l) => l !== "");
   const [files, bytes, found] = (head ?? "0 0 0").split(" ").map(Number);
@@ -529,6 +793,20 @@ function size(bytes) {
 }
 
 // ---- Drawing --------------------------------------------------------------
+
+/**
+ * Local change: the text of the engine's question dialog, for a session where no
+ * surface draws the pane. The command, what it would do, and the first few paths.
+ */
+function question(state) {
+  const { report } = state;
+  const command = state.command.length > 300 ? `${state.command.slice(0, 300)}…` : state.command;
+  const shown = report.lines.slice(0, QUESTION_LIST_MAX);
+  const rest = report.lines.length - shown.length + (report.more ?? 0);
+  const list = shown.length > 0 ? ` That includes ${shown.join(", ")}${rest > 0 ? ` and ${rest} more` : ""}.` : "";
+  const note = report.note ? ` ${/[.?!]$/.test(report.note) ? report.note : `${report.note}.`}` : "";
+  return `Blast Radius held \`${command}\`. It would ${report.summary}.${list}${note} Run it?`;
+}
 
 function paneRows(report) {
   return Math.min(24, 9 + report.lines.length + (report.more ? 1 : 0));
