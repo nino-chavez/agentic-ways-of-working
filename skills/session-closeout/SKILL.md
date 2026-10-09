@@ -1,6 +1,6 @@
 ---
 name: session-closeout
-description: Preserve durable lessons and produce an archive-safety receipt before ending, clearing, or archiving an agent task. Use when the operator says close out, wrap up, end the session, prepare the task for archive, make it archive-ready, or invokes $session-closeout after substantive work.
+description: Preserve durable lessons and produce an archive-safety receipt before ending, clearing, or archiving an agent task. Use without being asked when a task reaches its finish line (its PR merged and its worktree removed, or the deliverable handed over), and when the operator says close out, wrap up, end the session, prepare the task for archive, make it archive-ready, or invokes $session-closeout after substantive work.
 ---
 
 # Session Closeout
