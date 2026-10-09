@@ -14,6 +14,9 @@
 //
 // The host reads `on(...)` and `$.noun.method(...)` from source, so they are
 // spelled literally, and helpers that take `$` are top-level functions.
+//
+// Local change: a script run by path (`bash x.sh`, `./x.sh`, `source x.sh`) is
+// read from disk and its lines are checked as if its text had been the command.
 
 const PANE_ID = "blast-radius";
 const POLL_SECONDS = "0.25";
@@ -24,6 +27,19 @@ const LIST_MAX = 10;
 const PROCEED = "Proceed";
 const CANCEL = "Cancel";
 const QUESTION_LIST_MAX = 3;
+// Local change: scripts run by path. A local file up to this size is read; its
+// first few risky lines are measured.
+const SCRIPT_BYTES_MAX = 256 * 1024;
+const SCRIPT_MEASURE_MAX = 5;
+const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh"]);
+const SHELL_OPTIONS_WITH_VALUE = new Set(["--rcfile", "--init-file"]);
+// A group of short options whose last letter takes a value: -o, -O, -euo, +o.
+const SHELL_OPTION_GROUP_WITH_VALUE = /^[-+][^-]*[oO]$/;
+const SHELL_NAME = /\.(?:sh|bash|zsh|ksh)$/;
+// This session's scratchpad: /tmp/claude-<uid>/<project>/<session id>/scratchpad/.
+// Measured 2026-10-08: $.session.id() is that folder's name under `claude -p`, and
+// the desktop's CLAUDE_CODE_SESSION_ID is its own scratchpad's.
+const SCRATCHPAD = (id) => new RegExp(`^(?:/private)?/tmp/claude-[^/]+/[^/]+/${id.replace(/[^A-Za-z0-9-]/g, "\\$&")}/scratchpad/`);
 
 // The call being held, or null. One at a time: Bash calls in a turn run in order.
 let held = null;
@@ -43,7 +59,25 @@ export function register(on) {
   // Local change: `.catch` refuses the command when the hook itself fails (a
   // throw outside the hold's own try, or an overrun budget). Upstream failed open.
   on("tool.call", { tool: "Bash" }, async ($, e, next) => {
-    const risk = classify(String(e.command ?? ""));
+    let risk = classifyCommand(String(e.command ?? ""));
+    // Local change: a line that runs scripts by path and is not risky itself is
+    // checked by reading each script in order; the first risky one holds. Any
+    // risk written on the line itself wins, as before.
+    if (risk !== null && risk.kind === "scripts") {
+      let found = null;
+      const skipped = [];
+      for (let i = 0; i < risk.list.length && found === null; i += 1) {
+        const read = await scriptRisk($, risk.list[i]);
+        if (read?.skipped === true) {
+          skipped.push(risk.list[i].path);
+        } else if (read !== null) {
+          found = read;
+          // not read: those skipped before this one, and every one after it
+          found.alsoRuns = [...new Set([...skipped, ...risk.list.slice(i + 1).map((m) => m.path)])];
+        }
+      }
+      risk = found;
+    }
     if (risk === null) {
       return next(e);
     }
@@ -72,6 +106,12 @@ export function register(on) {
       mine.report = cwd === null
         ? { summary: `${risk.label} in ${risk.dir}`, lines: [], note: `Couldn't find the folder ${risk.dir}, so I couldn't measure what this would change.` }
         : await measure($, risk, cwd);
+      // Local change: scripts on the line that were not read are named, so Proceed
+      // is not taken as approving only what the report shows.
+      if (risk.alsoRuns !== undefined && risk.alsoRuns.length > 0) {
+        const names = risk.alsoRuns.map((p) => p.slice(p.lastIndexOf("/") + 1)).join(", ");
+        mine.report.summary += `; Proceed also runs ${names}, which ${risk.alsoRuns.length === 1 ? "was" : "were"} not read`;
+      }
       summary = mine.report.summary;
 
       // Local change: the limit is BLAST_RADIUS_HOLD_SECONDS (default 600, minimum 5);
@@ -246,6 +286,67 @@ function joinDir(dir, arg) {
 
 /** The first risky segment of a shell command, or null. */
 function classify(command) {
+  return scan(command, false).first;
+}
+
+/**
+ * Local change: the text with each `\`-continued line joined, the pair replaced
+ * by U+2028, which the splitter does not count as a new line and `tokenize`
+ * drops, as the shell drops the pair. So `rm -rf \⏎ build` is one rm,
+ * `foo\⏎bar` is the one word `foobar`, and the lines after it keep their
+ * numbers. It does not know quotes, so it is never read alone (see classifyCommand).
+ */
+function joinLines(text) {
+  return text.replace(/\\\n/g, "\u2028");
+}
+
+/**
+ * Local change: what the hook holds for a command line. The line is read as
+ * written and with its continued lines joined; a risk in either holds, so the
+ * joined reading can add a hold and never remove one. The joined reading's risk
+ * is the one reported, since it measures `rm -rf \⏎ build` as written. With no
+ * risk, the scripts both readings run by path come back as `{ kind: "scripts",
+ * list }`; with one, their paths ride on it as `alsoRuns`, since they are not
+ * read then.
+ */
+function classifyCommand(command) {
+  const joined = scan(joinLines(command), true);
+  const raw = scan(command, true);
+  const seen = new Set();
+  const scripts = [...joined.scripts, ...raw.scripts].filter((m) => {
+    const key = `${m.dir ?? ""}\0${m.path}`;
+    return seen.has(key) ? false : seen.add(key);
+  });
+  const first = joined.first ?? raw.first;
+  if (first !== null) {
+    first.alsoRuns = [...new Set(scripts.map((m) => m.path))];
+    return first;
+  }
+  return scripts.length > 0 ? { kind: "scripts", list: scripts } : null;
+}
+
+/**
+ * Local change: every risky segment of a script's text as `[{ line, risk }]`,
+ * by line. Read both ways, as classifyCommand does: the joined reading's lines,
+ * plus any line only the reading as written finds. It looks for no scripts, so
+ * a script is read one level deep.
+ */
+function riskyLines(text) {
+  const joined = scan(joinLines(text), false).found;
+  const raw = scan(text, false).found.filter((r) => !joined.some((j) => j.line === r.line));
+  return [...joined, ...raw].sort((x, y) => x.line - y.line);
+}
+
+/**
+ * The segments of a command: `first`, the first risky one or null; `found`,
+ * every risky one with its line number; and with `withScripts`, `scripts`, each
+ * script the line runs by path (Local change: upstream returned the first risk).
+ */
+function scan(command, withScripts) {
+  const found = [];
+  const scripts = [];
+  let first = null;
+  let line = 1;
   let dir = null; // where a `cd` earlier on the line moved to; null means the session folder
   const scopes = []; // dir to restore when a ( subshell ) closes
   const pushed = []; // pushd stack, for popd
@@ -258,6 +359,9 @@ function classify(command) {
   // surely ran in this shell.
   const parts = command.split(/(&&|\|\||;|\||\n)/);
   for (let p = 0; p < parts.length; p += 2) {
+    if (p > 0 && parts[p - 1] === "\n") {
+      line += 1;
+    }
     const raw = parts[p];
     const certain = (p === 0 || parts[p - 1] === ";" || parts[p - 1] === "\n") && parts[p + 1] !== "|";
     const opens = (raw.match(/^\s*\(+/)?.[0].trim().length) ?? 0;
@@ -268,13 +372,16 @@ function classify(command) {
       scopes.push(dir);
       varScopes.push(new Map(vars));
     }
-    const risk = classifySegment(raw, dir, pushed, vars, certain);
-    if (risk !== null && risk.cd === undefined) {
-      return risk;
-    }
-    if (risk !== null) {
+    const risk = classifySegment(raw, dir, pushed, vars, certain, withScripts);
+    if (risk !== null && risk.cd !== undefined) {
       dir = risk.cd; // a cd, pushd or popd moved the folder
+    } else if (risk !== null && risk.kind === "script") {
+      scripts.push(risk); // read later, in this order, if nothing on the line is risky itself
+    } else if (risk !== null) {
+      first ??= risk; // the scan goes on, for every risky line and every script
+      found.push({ line, risk });
     }
+    line += (raw.match(/\u2028/g) ?? []).length; // continued lines inside this segment
     for (let k = 0; k < closes && scopes.length > 0; k += 1) {
       dir = scopes.pop(); // a cd inside ( ... ) doesn't outlive it
       const outer = varScopes.pop(); // nor does an assignment
@@ -282,21 +389,21 @@ function classify(command) {
       outer.forEach((value, name) => vars.set(name, value));
     }
   }
-  return null;
+  return { first, found, scripts };
 }
 
 // Words that can come before the real command without changing what it does.
 const PREFIXES = new Set(["command", "exec", "env", "nohup", "time", "then", "do", "else", "!"]);
 
-/** One segment: a risk, { cd } for a folder change, or null. */
-function classifySegment(segment, dir, pushed, vars, certain) {
+/** One segment: a risk, { cd } for a folder change, a script run by path when asked, or null. */
+function classifySegment(segment, dir, pushed, vars, certain, scripts = false) {
   {
     const notes = new Map(); // word -> what it left unexpanded (Local change)
     const words = tokenize(segment.trim().replace(/^[({]+\s*/, "").replace(/\s*[)}]+$/, ""), vars, notes);
     // Local change: a segment of plain assignments (`X=/path`, `export X=...`) sets
     // a value later words expand. One that needs a command or another unknown
     // variable is recorded as unknowable (null), never run.
-    const assigns = words[0] === "export" ? words.slice(1) : words;
+    const assigns = words[0] === "export" || words[0] === "local" || words[0] === "readonly" ? words.slice(1) : words;
     if (assigns.length > 0 && assigns.every((w) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(w))) {
       for (const w of assigns) {
         const eq = w.indexOf("=");
@@ -398,8 +505,53 @@ function classifySegment(segment, dir, pushed, vars, certain) {
     if (!READ_ONLY.has(cmd) && args.includes("migrate")) {
       return { kind: "migrate", tool: "unknown", label: "migrate", dir };
     }
+    if (scripts) {
+      return scriptInvocation(cmd, args, dir, notes);
+    }
   }
   return null;
+}
+
+/**
+ * Local change: a script the segment runs by path, or null. `bash x.sh` (also
+ * sh, zsh, dash, ksh, with options before the file), `. x.sh`, `source x.sh`,
+ * and a bare path such as `./x.sh` or `~/bin/x`. `bash -c "..."` and `bash -s`
+ * run no file, so they stay out of scope. A bare path is only a candidate here;
+ * whether it is a shell script is decided after reading it.
+ */
+function scriptInvocation(cmd, args, dir, notes) {
+  const base = cmd.slice(cmd.lastIndexOf("/") + 1);
+  let path;
+  let via;
+  if (cmd === "." || cmd === "source") {
+    via = cmd;
+    path = args[0];
+  } else if (SHELLS.has(base)) {
+    via = base;
+    for (let i = 0; i < args.length; i += 1) {
+      const a = args[i];
+      if (a === "--") {
+        path = args[i + 1];
+        break;
+      }
+      if (/^-[^-]*[cs]/.test(a)) {
+        return null; // -c runs a string, -s reads stdin
+      }
+      if (SHELL_OPTIONS_WITH_VALUE.has(a) || SHELL_OPTION_GROUP_WITH_VALUE.test(a)) {
+        i += 1; // `-euo pipefail`: the value is not the file
+      } else if (!a.startsWith("-") && !a.startsWith("+")) {
+        path = a;
+        break;
+      }
+    }
+  } else if (cmd.includes("/") && !cmd.startsWith("-")) {
+    via = "path";
+    path = cmd;
+  }
+  if (path === undefined || path === "" || /^(?:\d*[<>]|[&|])/.test(path)) {
+    return null;
+  }
+  return { kind: "script", path, via, dir, unexpanded: unexpandedWhy([path], notes) };
 }
 
 // Resolves a `cd` target to an absolute folder, or null if it doesn't exist.
@@ -422,8 +574,8 @@ async function resolveDir($, sessionCwd, dir) {
  * Local change. Upstream split at every quote, so `rm -rf "$DIR"/*` read as the
  * two targets `$DIR` and `/*`, the second one the filesystem root. Here the pieces
  * of one word stay together. Outside single quotes, `$NAME` and `${NAME}` take a
- * value set earlier on the line (`vars`), and `$HOME` at the start of a word
- * becomes `~`. Every other expansion stays as written and is recorded in `notes`
+ * value set earlier on the line (`vars`), and `$HOME` at the start of a word,
+ * or of an assignment's value, becomes `~`. Every other expansion stays as written and is recorded in `notes`
  * (word -> what it left, and why), so the caller can say it was not measured:
  * an unset variable, one whose value is unknown, an unquoted value with spaces
  * (the shell would split it), `$1` or `${X:-y}`, and `$(...)` or backticks, which
@@ -471,7 +623,8 @@ function tokenize(text, vars = new Map(), notes = new Map()) {
     i += m[0].length;
     const name = m[1] ?? m[2];
     if (!vars.has(name)) {
-      if (name === "HOME" && word === "") {
+      // Local change: also at the start of an assignment's value (`OUT="$HOME/x"`).
+      if (name === "HOME" && (word === "" || /^[A-Za-z_][A-Za-z0-9_]*=$/.test(word))) {
         return "~";
       }
       left.push({ kind: "unset", name });
@@ -490,6 +643,10 @@ function tokenize(text, vars = new Map(), notes = new Map()) {
   };
   while (i < text.length) {
     const c = text[i];
+    if (c === "\u2028") {
+      i += 1; // Local change: a joined `\`-newline, which the shell removes: `foo\⏎bar` is `foobar`
+      continue;
+    }
     if (/\s/.test(c)) {
       if (word !== null) {
         push();
@@ -502,12 +659,15 @@ function tokenize(text, vars = new Map(), notes = new Map()) {
     }
     if (c === "'") {
       const end = text.indexOf("'", i + 1);
-      word += end === -1 ? text.slice(i + 1) : text.slice(i + 1, end);
+      // Local change: single quotes keep a `\`-newline as written.
+      word += (end === -1 ? text.slice(i + 1) : text.slice(i + 1, end)).replace(/\u2028/g, "\\\n");
       i = end === -1 ? text.length : end + 1;
     } else if (c === '"') {
       i += 1;
       while (i < text.length && text[i] !== '"') {
-        if (text[i] === "\\" && i + 1 < text.length && '"\\$`'.includes(text[i + 1])) {
+        if (text[i] === "\u2028") {
+          i += 1; // Local change: removed inside double quotes too
+        } else if (text[i] === "\\" && i + 1 < text.length && '"\\$`'.includes(text[i + 1])) {
           word += text[i + 1];
           i += 2;
         } else if (text[i] === "$" || text[i] === "`") {
@@ -583,6 +743,178 @@ function unexpandedWhy(targets, notes) {
   return { targets: left, why: [...reasons].join("; ") };
 }
 
+// ---- Reading a script run by path (Local change) --------------------------
+
+/**
+ * Reads the script `marker` names and returns a risk of kind "script" with its
+ * risky lines, null when it was read and there is nothing to hold, or
+ * `{ skipped: true }` when it was not read, so a later hold can name it. A bare
+ * path read and found not to be a shell script was read, so it returns null.
+ * Which file a bare name runs is found by scriptFiles. A file is read only when
+ * it is a regular file, under SCRIPT_BYTES_MAX, and lands (every link followed)
+ * inside the session folder, the home folder or this session's scratchpad. A
+ * skip is logged with its reason, since no hold means no summary to say it in:
+ * to the transcript for a shell invocation or a path with a shell name, to the
+ * debug sink for any other bare path, which is usually a program (`/usr/bin/git`,
+ * `.venv/bin/python`) and would otherwise say "ran unchecked" on every call.
+ * One level: a script the script runs is not read. The file is read now and may
+ * differ by the time Proceed runs it.
+ */
+async function scriptRisk($, marker) {
+  const invoked = marker.via === "path" ? marker.path : `${marker.via} ${marker.path}`;
+  const loud = marker.via !== "path" || SHELL_NAME.test(marker.path);
+  const skip = (why) => {
+    $.ui.log(`Blast Radius did not read ${marker.path} (${why}), so \`${invoked}\` ran unchecked.`, { to: loud ? "transcript" : "debug" });
+    return { skipped: true };
+  };
+  if (marker.unexpanded !== null) {
+    return skip(`its path was not expanded: ${marker.unexpanded.why}`);
+  }
+  const sessionCwd = await $.session.cwd();
+  const home = (await $.env.get("HOME")) ?? "";
+  // A relative path needs the folder the line moved to; an absolute or ~ path does not.
+  let cwd = sessionCwd;
+  if (marker.dir && !marker.path.startsWith("/") && !marker.path.startsWith("~")) {
+    cwd = await resolveDir($, sessionCwd, marker.dir);
+    if (cwd === null) {
+      return skip(`the folder it is relative to, ${marker.dir}, was not found or could not be expanded without running a command`);
+    }
+  }
+  const found = await scriptFiles($, marker, cwd, home);
+  if (found.length === 0) {
+    return skip(marker.path.includes("/") || marker.path.startsWith("~") ? "no such file" : "no such file in the folder it runs in or on PATH");
+  }
+  const roots = await localRoots($, [sessionCwd, home]);
+  const id = await $.session.id().catch(() => "");
+  const check = async (stat) => {
+    const real = stat.realPath;
+    if (stat.kind !== "file") {
+      return skip(`${real} is not a regular file`);
+    }
+    if (!roots.some((root) => real.startsWith(`${root}/`)) && !(id !== "" && SCRATCHPAD(id).test(real))) {
+      return skip(`${real} is outside the session folder, your home folder and this session's scratchpad`);
+    }
+    if (stat.size > SCRIPT_BYTES_MAX) {
+      return skip(`${kib(stat.size)} is over the ${kib(SCRIPT_BYTES_MAX)} limit`);
+    }
+    const text = await $.fs.read(real).catch(() => undefined);
+    if (typeof text !== "string") {
+      return skip("it could not be read"); // no permission, or not text
+    }
+    const name = real.slice(real.lastIndexOf("/") + 1);
+    if (marker.via === "path" && !looksLikeShell(name, text)) {
+      // Read, so not a skip: a program in another language is out of scope, as `python x.py` is.
+      const first = text.split("\n", 1)[0];
+      const why = first.startsWith("#!") ? `${first.slice(0, 60)} is not a shell` : "it has no shell shebang and no .sh name";
+      $.ui.log(`Blast Radius read ${real} and did not check it (${why}), so \`${invoked}\` ran unchecked.`, { to: "debug" });
+      return null;
+    }
+    const lines = riskyLines(text);
+    const lineCount = text.split("\n").filter((l, i, arr) => i < arr.length - 1 || l !== "").length;
+    if (lines.length === 0) {
+      $.ui.log(`Blast Radius read ${real} (${lineCount} lines): nothing risky in it.`, { to: "debug" });
+      return null;
+    }
+    const more = lines.length - 1;
+    const label = `${lines[0].risk.label} in ${name} line ${lines[0].line}${more > 0 ? ` and ${more} more risky ${more === 1 ? "line" : "lines"}` : ""}`;
+    return { kind: "script", label, path: real, name, dir: marker.dir, invoked, lines, lineCount };
+  };
+  // Two copies can be found for a sourced name: the first risky one holds, and a
+  // skip of either is kept so a later hold can name it.
+  let result = null;
+  for (const stat of found) {
+    const read = await check(stat);
+    if (read !== null && read.skipped !== true) {
+      return read;
+    }
+    result = read ?? result;
+  }
+  return result;
+}
+
+/**
+ * Local change: the files `marker` may run, as stats that found something. A
+ * path with a `/` or a `~` names one file. A bare name is looked up as the shell
+ * does it. Measured 2026-10-08 on macOS, bash 3.2 and zsh 5.9: `source` and `.`
+ * try PATH first in bash and sh and with zsh's `.`, and zsh's `source` tries the
+ * folder first, so the first match on PATH and the folder's copy are both
+ * returned, in that order. `bash x.sh` and the other shells take the folder's
+ * copy, and only without one the first match on PATH (bash and sh look there,
+ * zsh does not). PATH is Claude Code's own, which may lack a folder that the Bash
+ * tool's shell profile adds.
+ */
+async function scriptFiles($, marker, cwd, home) {
+  const at = async (path) => {
+    const stat = await $.fs.stat(path, { resolve: true }).catch(() => undefined);
+    return stat?.realPath === undefined ? null : stat;
+  };
+  const here = await at(absolutePath(marker.path, cwd, home));
+  const bare = !marker.path.includes("/") && !marker.path.startsWith("~");
+  const sourced = marker.via === "." || marker.via === "source";
+  if (!bare || (here !== null && !sourced)) {
+    return here === null ? [] : [here];
+  }
+  let onPath = null;
+  for (const dir of ((await $.env.get("PATH")) ?? "").split(":")) {
+    if (dir.startsWith("/")) {
+      const stat = await at(`${dir.replace(/\/+$/, "")}/${marker.path}`);
+      if (stat?.kind === "file") {
+        onPath = stat;
+        break;
+      }
+    }
+  }
+  return [onPath, here].filter((s, i, all) => s !== null && all.findIndex((t) => t?.realPath === s.realPath) === i);
+}
+
+/** `path` as an absolute path: `~` from `home`, a relative path under `cwd`. */
+function absolutePath(path, cwd, home) {
+  if (path === "~") {
+    return home;
+  }
+  if (path.startsWith("~/")) {
+    return `${home}/${path.slice(2)}`;
+  }
+  return path.startsWith("/") ? path : `${cwd}/${path.replace(/^(?:\.\/)+/, "")}`;
+}
+
+/** Where each of `dirs` lands, every link followed, for an allow-list on real paths. */
+async function localRoots($, dirs) {
+  const roots = [];
+  for (const dir of dirs) {
+    if (!dir) {
+      continue;
+    }
+    const stat = await $.fs.stat(dir, { resolve: true }).catch(() => undefined);
+    const root = (stat?.realPath ?? dir).replace(/\/+$/, "");
+    if (root !== "") {
+      roots.push(root);
+    }
+  }
+  return roots;
+}
+
+/** Whether a file run by its bare path is a shell script: by its shebang, or its name. */
+function looksLikeShell(name, text) {
+  if (SHELL_NAME.test(name)) {
+    return true;
+  }
+  const first = text.split("\n", 1)[0];
+  if (!first.startsWith("#!")) {
+    return false;
+  }
+  const words = first.slice(2).trim().split(/\s+/);
+  let program = words[0] ?? "";
+  if (program.endsWith("/env") || program === "env") {
+    program = words.find((w, i) => i > 0 && !w.startsWith("-")) ?? "";
+  }
+  return SHELLS.has(program.slice(program.lastIndexOf("/") + 1));
+}
+
+function kib(bytes) {
+  return `${Math.round(bytes / 1024)} KiB`;
+}
+
 // ---- Measuring the blast radius -------------------------------------------
 
 /** { summary, lines, note } for the pane. Never throws: a failed read is said, not hidden. */
@@ -593,6 +925,9 @@ async function measure($, risk, cwd) {
     }
     if (risk.kind === "migrate") {
       return await measureMigrations($, risk, cwd);
+    }
+    if (risk.kind === "script") {
+      return await measureScript($, risk, cwd);
     }
     return await measureGit($, risk, cwd);
   } catch (error) {
@@ -661,6 +996,40 @@ async function measureRmPaths($, risk, cwd) {
     more: Math.max(0, files - rest.length),
     note: `Paths: ${risk.targets.join(" ")}`,
   };
+}
+
+/**
+ * Local change: each risky line of a script, measured as the same text inline
+ * would be, from `cwd` (where the script runs) moved by any `cd` above the line
+ * in the script. The first SCRIPT_MEASURE_MAX lines are measured; the rest are
+ * named. A line's variables are filled in only from plain assignments above it
+ * and $HOME; the rest is said to be unmeasured, as for a command line.
+ */
+async function measureScript($, risk, cwd) {
+  const parts = [];
+  const lines = [];
+  const notes = [`Read from ${risk.path} (${risk.lineCount} lines); risky ${risk.lines.length === 1 ? "line" : "lines"}: ${risk.lines.map((l) => l.line).join(", ")}.`];
+  let total = 0;
+  for (const { line, risk: r } of risk.lines.slice(0, SCRIPT_MEASURE_MAX)) {
+    const where = r.dir ? await resolveDir($, cwd, r.dir) : cwd;
+    if (where === null) {
+      parts.push(`line ${line} (${r.label}) is not measured: the folder ${r.dir} was not found`);
+      continue;
+    }
+    const report = await measure($, r, where);
+    parts.push(`line ${line} (${r.label}) would ${report.summary}`);
+    total += report.lines.length + (report.more ?? 0);
+    lines.push(...report.lines.map((l) => `line ${line}: ${l}`));
+    if (report.note) {
+      notes.push(`Line ${line}: ${report.note}`);
+    }
+  }
+  const rest = risk.lines.slice(SCRIPT_MEASURE_MAX);
+  if (rest.length > 0) {
+    parts.push(`${rest.length} more risky ${rest.length === 1 ? "line" : "lines"} (${rest.map((l) => l.line).join(", ")}) ${rest.length === 1 ? "is" : "are"} not measured`);
+  }
+  const shown = lines.slice(0, LIST_MAX);
+  return { summary: `run ${risk.name}, where ${parts.join("; ")}`, lines: shown, more: Math.max(0, total - shown.length), note: notes.join(" ") };
 }
 
 async function measureGit($, risk, cwd) {
