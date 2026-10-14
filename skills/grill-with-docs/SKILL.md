@@ -5,11 +5,14 @@ description: Grilling session that challenges your plan against the existing dom
 
 <what-to-do>
 
-Interview me relentlessly about every aspect of this plan until we reach a shared understanding. Walk down each branch of the design tree, resolving dependencies between decisions one-by-one. For each question, provide your recommended answer.
+Interview me about the unresolved decisions in this plan until we reach a shared understanding. Map which decisions depend on others. For each question, provide your recommended answer and a short reason grounded in the project's code, terminology, or documented trade-offs.
 
-Ask the questions one at a time, waiting for feedback on each question before continuing.
+Work in short rounds:
 
-If a question can be answered by exploring the codebase, explore the codebase instead.
+1. Resolve facts from the codebase and existing documents before asking the user. An unfinished lookup leaves its dependent decisions unready; other independent questions can still proceed.
+2. Ask ready, independent questions together in a numbered round. A question is ready when its prerequisites are settled and its wording, options, and recommendation do not depend on another open answer. Usually two or three concise questions fit; ask one when it is the only ready decision or needs focused discussion. Honor a request for one-at-a-time questions.
+3. Wait for feedback before asking dependent follow-ups. Apply each explicit answer, capture resolved terms as described below, and recompute which decisions are ready. With a partial reply, keep unanswered questions open; silence does not accept a recommendation. Do not repeat settled questions unless new evidence changes their basis.
+4. Finish when the scoped decisions are resolved, or name the remaining dependency if progress requires missing evidence or a user decision. Batching questions does not authorize implementation or turn a proposed answer into an accepted ADR.
 
 </what-to-do>
 
@@ -86,3 +89,5 @@ Only offer to create an ADR when all three are true:
 If any of the three is missing, skip the ADR. Use the format in [ADR-FORMAT.md](./ADR-FORMAT.md).
 
 </supporting-info>
+
+Question-round sequencing adapted from [Matt Pocock's grilling skill](https://github.com/mattpocock/skills/blob/49dd158d1076134a641b33efb035946536778336/skills/productivity/grilling/SKILL.md). Domain checks and inline documentation remain part of this skill.
