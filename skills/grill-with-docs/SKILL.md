@@ -11,7 +11,7 @@ Work in short rounds:
 
 1. Resolve facts from the codebase and existing documents before asking the user. An unfinished lookup leaves its dependent decisions unready; other independent questions can still proceed.
 2. Ask ready, independent questions together in a numbered round. A question is ready when its prerequisites are settled and its wording, options, and recommendation do not depend on another open answer. Usually two or three concise questions fit; ask one when it is the only ready decision or needs focused discussion. Honor a request for one-at-a-time questions.
-3. Wait for feedback before asking dependent follow-ups. Apply each explicit answer, capture resolved terms as described below, and recompute which decisions are ready. With a partial reply, keep unanswered questions open; silence does not accept a recommendation. Do not repeat settled questions unless new evidence changes their basis.
+3. Wait for feedback before asking dependent follow-ups. Apply each explicit answer, capture resolved terms as described below, and recompute which decisions are ready. With a partial reply, keep unanswered questions open; silence does not accept a recommendation. If the reply is ambiguous about which question it answers (for example, a bare “yes” after two different questions), clarify only that mapping instead of applying it to every recommendation. Clear answers need no numbered format; “yes to both” can settle both. Do not repeat settled questions unless new evidence changes their basis.
 4. Finish when the scoped decisions are resolved, or name the remaining dependency if progress requires missing evidence or a user decision. Batching questions does not authorize implementation or turn a proposed answer into an accepted ADR.
 
 </what-to-do>
