@@ -56,6 +56,15 @@ Create files lazily — only when you have something to write. If no `CONTEXT.md
 
 ## During the session
 
+### Keep answers attached to the decision
+
+When several choices remain open, use the [review and decision capture
+reference](../../docs/review-decisions.md#present-only-the-decisions-that-are-ready).
+It owns stable IDs, source versions, partial replies, and revalidation when the
+basis changes. Use the host's question UI or the existing project review page;
+an answer sheet does not replace the project's approval mechanism. Keep resolved
+answers in the existing plan or decision owner, rather than a second ledger.
+
 ### Challenge against the glossary
 
 When the user uses a term that conflicts with the existing language in `CONTEXT.md`, call it out immediately. "Your glossary defines 'cancellation' as X, but you seem to mean Y — which is it?"
