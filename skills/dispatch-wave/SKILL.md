@@ -1,6 +1,6 @@
 ---
 name: dispatch-wave
-description: Use when about to produce ≥2 substantive artifacts whose specs are fully derived in-thread and whose file scopes don't overlap. Codifies the orchestrator workflow for parallel agent dispatch — brief construction (nine mandatory fields, runtime isolation and cleanup included), model selection through the host-owned routing policy, inline work during wait, post-flight cross-review for inter-artifact consistency, and commit-and-push following the project's dev-push pattern. Triggers proactively at the end of any planning thread that produced ≥2 inspectable artifact briefs, OR when the user explicitly says "dispatch", "wave", "in parallel", "across agents". Skip for single-artifact work, vague briefs ("implement X"), or briefs missing a self-contained spec.
+description: Use when about to produce ≥2 substantive artifacts whose specs are fully derived in-thread and whose concurrent read/edit scopes do not conflict. Codifies the orchestrator workflow for parallel agent dispatch — brief construction (nine mandatory fields, runtime isolation and cleanup included), model selection through the host-owned routing policy, inline work during wait, post-flight cross-review for inter-artifact consistency, and commit-and-push following the project's dev-push pattern. Triggers proactively at the end of any planning thread that produced ≥2 inspectable artifact briefs, OR when the user explicitly says "dispatch", "wave", "in parallel", "across agents". Skip for single-artifact work, vague briefs ("implement X"), or briefs missing a self-contained spec.
 ---
 
 # dispatch-wave
@@ -114,7 +114,7 @@ Follow the project's commit + push conventions. For projects stamped from Bluepr
 
 - Single artifact (just write it).
 - Briefs aren't complete (finish them first).
-- File scopes overlap (dispatch serially or narrow scopes).
+- Concurrent read/edit or edit/edit scopes conflict (order those tasks or narrow scopes; shared reads are allowed).
 - Work needs orchestrator synthesis mid-execution (do inline).
 - The artifact is a few minutes of mechanical pattern-matched editing (do inline).
 
@@ -127,5 +127,5 @@ Consider proactively suggesting this skill when:
 
 ## Reference
 
-- `tools/parallel-dispatch-check/check.sh` (blueprint-stamped projects) — pre-flight file-scope overlap detector. Run before dispatching.
+- `tools/parallel-dispatch-check/check.sh` (when available) — use its structured plan mode only when supported; otherwise inspect the assignment map manually. Legacy edit-glob output does not establish coverage or read/edit isolation. Blueprint may separately require its existing overlap check.
 - The canonical worked example (2026-05-27): three Sonnet agents drafted a feasibility doc, a sibling strategy doc, and a methodology amendment in parallel while the orchestrator wrote an ingester inline. The brief shape, the cross-review catch (on reclassification names), and the commit shape are all visible in that one diff. Blueprint's own `dispatch` skill cites the same example.
