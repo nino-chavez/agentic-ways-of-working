@@ -36,7 +36,9 @@ This skill is _informed_ by the project's domain model. Read `CONTEXT.md` and an
 
 Read the project's domain glossary (`CONTEXT.md` or equivalent) and any ADRs in the area you're touching first.
 
-Then walk the codebase organically. Don't follow rigid heuristics — note where you experience friction:
+If the user names a scope, start there. Otherwise, use recent Git history to choose an initial cluster of related changed code, then explore outward organically. Change frequency is only a starting signal, not evidence of architectural friction; require actual interface or dependency friction before presenting a candidate. If history is absent, scattered, or unhelpful, fall back to the organic exploration below.
+
+Within that scope, walk the codebase organically. Don't follow rigid heuristics — note where you experience friction:
 
 - Where does understanding one concept require bouncing between many small modules?
 - Where are modules **shallow** — interface nearly as complex as the implementation?
