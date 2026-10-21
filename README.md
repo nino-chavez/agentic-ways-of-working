@@ -128,6 +128,8 @@ The `blueprint-*` suite (`research`, `prototype`, `docs`, `validate`, `deploy`, 
 
 The Claude Code hooks above fire inside a session. [`git-hooks/`](git-hooks/) is the other direction: a git `post-commit` hook that runs a focused Claude review *after* a commit — but only on the commits worth it (a configurable line threshold, or a touched sensitive path like `auth/` or `*.sql`). It's the local-first answer to a PR-gated review action: no PR required, async so the commit returns instantly, and billed to your Claude subscription rather than a metered API key (it unsets `ANTHROPIC_API_KEY` before calling `claude`). Merge commits and rebase replays are skipped so a ten-commit rebase doesn't fan out ten reviews. Self-contained with its own `install.sh` — see [`git-hooks/README.md`](git-hooks/README.md).
 
+`git-hooks/` is the only copy of these files: a consumer (a dotfiles repo, say) vendors this repository as a submodule and symlinks into this folder instead of carrying its own, so a fix lands here once and reaches every consumer on its next submodule bump (git runs a hook through a symlink chain, so `core.hooksPath` can point at the links; decided 2026-10-21 after a private copy had drifted from this one for three months).
+
 ## In practice
 
 **Campsite Mode raises the bar, per project.** Turn it on when you want north-star-only work — no shims, fix-as-discovered, touched files end clean:

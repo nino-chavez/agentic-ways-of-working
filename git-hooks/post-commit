@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
-# post-commit hook — auto-runs a Claude Code review on meaningful commits.
-#
-# Install globally (via `git config core.hooksPath`) or per-repo (.git/hooks).
-# See README.md and install.sh.
+# Global post-commit hook (installed via `git config --global core.hooksPath`).
 #
 # Two jobs:
 #   1. Chain to any repo-local .git/hooks/post-commit so a global hooksPath
 #      never silently disables a repo's own hook.
-#   2. Trigger a background Claude review when a commit crosses the thresholds
-#      in .claude-review.conf. The review is billed to the logged-in Claude
-#      subscription (claude-review-run.sh unsets ANTHROPIC_API_KEY first).
+#   2. Auto-trigger a background Claude Code review when a commit crosses the
+#      thresholds in .claude-review.conf. The review is billed to the logged-in
+#      Claude subscription (claude-review-run.sh unsets ANTHROPIC_API_KEY first).
 #
 # Per-commit escape hatches:
 #   REVIEW=0 git commit ...   force-skip the review
@@ -24,9 +21,19 @@ set -uo pipefail
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 GIT_DIR="$(git rev-parse --git-dir 2>/dev/null)" || exit 0
 REPO="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+# Repo-local hooks (a commit-attribution hook, say) live in the *common* git dir,
+# shared by the main checkout and every linked worktree. `--git-dir` resolves
+# to a worktree-PRIVATE admin dir (.git/worktrees/<name>) for a linked
+# worktree, which has no hooks/ of its own — chaining against it silently
+# no-ops from inside any worktree (found 2026-07-03 while building
+# a repo-local commit-attribution hook: it never fired from a worktree
+# checkout). Rebase/cherry-pick state markers below stay on $GIT_DIR on
+# purpose — those ARE genuinely worktree-scoped (you can be mid-rebase in one
+# worktree while another is clean).
+COMMON_DIR="$(git rev-parse --git-common-dir 2>/dev/null)" || COMMON_DIR="$GIT_DIR"
 
 # (1) Chain to a repo-local post-commit hook if one exists and isn't this file.
-LOCAL_HOOK="$GIT_DIR/hooks/post-commit"
+LOCAL_HOOK="$COMMON_DIR/hooks/post-commit"
 if [ -x "$LOCAL_HOOK" ]; then
   LOCAL_DIR="$(cd "$(dirname "$LOCAL_HOOK")" && pwd)"
   if [ "$LOCAL_DIR" != "$HOOK_DIR" ]; then
@@ -114,7 +121,15 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 
 SHA="$(git rev-parse HEAD)"
-CLAUDE_REVIEW_HOOK=1 nohup "$HOOK_DIR/claude-review-run.sh" "$REPO" "$SHA" "$LOCK" \
+# env -u: git exports GIT_INDEX_FILE/GIT_DIR (et al.) into hook environments.
+# A detached child that inherits them will aim every later git command at THIS
+# repo's index — from whatever cwd it wanders to. Found 2026-07-21: the spawned
+# review agent wrote a foreign repo's index over another repo's worktree index,
+# three times, destroying the staging area each time. Commit-context env must
+# never outlive the commit.
+CLAUDE_REVIEW_HOOK=1 nohup env -u GIT_INDEX_FILE -u GIT_DIR -u GIT_WORK_TREE \
+  -u GIT_PREFIX -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY \
+  "$HOOK_DIR/claude-review-run.sh" "$REPO" "$SHA" "$LOCK" \
   >/dev/null 2>&1 &
 disown 2>/dev/null || true
 
