@@ -8,6 +8,12 @@ It's the local-first counterpart to a PR-gated GitHub Action: instead of
 reviewing in CI on every pull request, it reviews on the commits that actually
 warrant it, right on your machine.
 
+This folder is the only copy of these hooks. Consumers symlink into it (a
+dotfiles repo through a submodule, for instance) rather than carrying their
+own; the ownership decision is in the repository README under "Git hooks". If
+you are reading this through a symlink, edit the file in the repository that
+owns it.
+
 ## Requirements
 
 - [Claude Code](https://claude.com/claude-code) CLI on your `PATH`, logged in to
@@ -72,22 +78,72 @@ CLAUDE_REVIEW_DRY=1 REVIEW=1 git commit -m "wiring test"
 cat "$(git rev-parse --git-dir)/last-review.md"   # shows a dry-run stub
 ```
 
-## Regression test for failure signalling
+## The verdict line
+
+The first body line of `last-review.md` (the line after the header) is exactly
+`VERDICT: <WORD> <full commit sha>`, so a script can gate on it and on the
+commit it belongs to:
+
+| First body line | Meaning | Notification | Exit |
+|---|---|---|---|
+| `VERDICT: PASS <sha>` | no significant issues | looks good | 0 |
+| `VERDICT: CHANGES <sha>` | findings follow, cited as `file:line` | review ready | 0 |
+| `VERDICT: INVALID <sha>` | the reviewer answered but did not start with a verdict; its text is kept below the line | INVALID | 2 |
+| `VERDICT: FAILED <sha>` | the reviewer did not finish (auth, network, crash); whatever it wrote is kept below | FAILED | 1 |
+
+The runner writes exactly one line starting with `VERDICT:`; a verdict-shaped
+line inside the reviewer's own text is quoted as `> VERDICT: ...`, so a reply
+that got as far as `VERDICT: PASS` before the CLI died still reads as FAILED. A
+dry run writes no `VERDICT` line. The sha is on the line because the hook skips
+a commit that lands while an earlier review is still running (single-flight), so
+the file can describe an older commit than `HEAD`. Gate on the current commit
+with:
+
+```sh
+grep -qx "VERDICT: PASS $(git rev-parse HEAD)" "$(git rev-parse --git-dir)/last-review.md"
+```
+
+Exit 0 means `HEAD` itself was reviewed and passed. Treat `CHANGES`, `INVALID`,
+`FAILED`, a different sha and no line as not finished.
+
+A different sha is the common case after a fix: the hook reviews only commits
+that cross the size threshold or touch a sensitive path, skips a commit that
+lands while another review is running, and skips merge and replayed commits.
+It leaves `last-review.md` alone for every one of those on purpose, so the last
+real review's findings stay readable until the next review replaces them. To
+finish on `HEAD`, review it by hand:
+
+```sh
+~/.config/git-hooks/claude-review-run.sh "$(git rev-parse --show-toplevel)" "$(git rev-parse HEAD)"
+```
+
+or commit the fix with `REVIEW=1` so the hook reviews it regardless of size.
+Added 2026-10-21; before it the only machine-readable signal was a grep for the
+phrase "Looks good to me", so a review with findings and a review that ignored
+the format looked the same to every script downstream.
+
+## Regression test for failure signalling and the verdict line
 
 ```sh
 bash git-hooks/claude-review-run.test.sh
 ```
 
 Stubs `claude` and `osascript`, spends no quota, and asserts that a failed
-review says so. It exists because the script used to notify "review ready" on
-*any* outcome other than "Looks good to me" — including an auth failure — so on
-2026-08-30 twenty-four unreviewed commits looked exactly like reviewed ones for
-sixteen hours. If you touch `notify()` or the `claude` invocation, run this.
+review says so and that every reply lands on one of the three verdict lines. It
+exists because the script used to notify "review ready" on *any* outcome other
+than "Looks good to me" — including an auth failure — so on 2026-08-30
+twenty-four unreviewed commits looked exactly like reviewed ones for sixteen
+hours. If you touch `notify()`, the `claude` invocation or the prompt, run this.
+`RUNNER=<path> bash git-hooks/claude-review-run.test.sh` runs the same
+assertions against another copy of the runner.
 
 ## When a review fails
 
-`last-review.md.err` holds the error and the notification says **FAILED**
-rather than "review ready". The common cause is an expired login: the runner
+`last-review.md.err` holds the error, the notification says **FAILED** rather
+than "review ready", and the file opens `VERDICT: FAILED <sha>`. A reply that
+ignored the verdict format is a different case: the notification says
+**INVALID**, the file opens `VERDICT: INVALID <sha>`, and the review text is
+still there to read. The common cause is an expired login: the runner
 unsets `ANTHROPIC_API_KEY` on purpose to force subscription billing, so an
 expired OAuth session leaves no fallback. Check and fix with:
 
