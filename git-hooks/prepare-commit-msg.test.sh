@@ -72,6 +72,13 @@ g CLAUDE_CODE_SESSION_ID=$'x\nSigned-off-by: evil' git -C "$R" commit -q --allow
 [ -z "$(trailers "$R")" ] && ! git -C "$R" log -1 --format=%B | grep -q evil \
   && pass "malformed id rejected" || fail "malformed id rejected"
 
+# An empty message still aborts, as it does without the hook.
+before="$(git -C "$R" rev-parse HEAD)"
+g CLAUDE_CODE_SESSION_ID="$CID" git -C "$R" commit -q --allow-empty -m "" 2>/dev/null
+g CLAUDE_CODE_SESSION_ID="$CID" GIT_EDITOR=true git -C "$R" commit -q --allow-empty 2>/dev/null
+[ "$(git -C "$R" rev-parse HEAD)" = "$before" ] && pass "empty message still aborts" \
+  || fail "empty message still aborts"
+
 # Rebase replay keeps the original commit's attribution.
 g git -C "$R" checkout -q -b side
 g git -C "$R" commit -q --allow-empty -m "side work"

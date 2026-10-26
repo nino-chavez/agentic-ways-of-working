@@ -31,11 +31,20 @@ command -v git >/dev/null 2>&1 || { echo "ERROR: git not found." >&2; exit 1; }
 command -v claude >/dev/null 2>&1 \
   || echo "WARN: 'claude' CLI not on PATH. Install Claude Code and log in to your subscription before the hook can run."
 
-install_files() {  # $1 = destination dir
-  local dest="$1"
+install_files() {  # $1 = destination dir, $2 = "keep" to never replace a different hook
+  local dest="$1" keep="${2:-}" f
   mkdir -p "$dest"
-  cp "$SRC/post-commit" "$SRC/prepare-commit-msg" "$SRC/claude-review-run.sh" "$dest/"
-  chmod +x "$dest/post-commit" "$dest/prepare-commit-msg" "$dest/claude-review-run.sh"
+  for f in post-commit prepare-commit-msg claude-review-run.sh; do
+    # In a repo's own hooks dir a same-named hook (commitizen, Husky v4, a
+    # ticket-id hook) is the repo's, and nothing would chain to it once replaced.
+    if [ "$keep" = keep ] && [ -e "$dest/$f" ] && ! cmp -s "$SRC/$f" "$dest/$f"; then
+      echo "SKIP: $dest/$f already exists and differs — not replacing it."
+      echo "      Merge it by hand, or move it aside and re-run."
+      continue
+    fi
+    cp "$SRC/$f" "$dest/"
+    chmod +x "$dest/$f"
+  done
 }
 
 case "$MODE" in
@@ -58,7 +67,7 @@ case "$MODE" in
     local_hp="$(git -C "$REPO" config --get core.hooksPath || true)"
     HOOKS="$(git -C "$REPO" rev-parse --git-path hooks)"
     [ -d "$REPO/.git" ] && HOOKS="$REPO/.git/hooks"
-    install_files "$HOOKS"
+    install_files "$HOOKS" keep
     echo "Installed into $HOOKS"
     if [ -n "$local_hp" ]; then
       echo "WARN: core.hooksPath is set to '$local_hp' (repo-local or global, e.g. Husky),"

@@ -51,6 +51,9 @@ for marker in rebase-merge rebase-apply CHERRY_PICK_HEAD; do
 done
 # --squash leaves the message for a later commit, which gets its own pass.
 [ "$SOURCE" = "squash" ] && exit 0
+# An empty message must still abort the commit. git's emptiness check ignores
+# only Signed-off-by lines, so a lone trailer would turn `-m ""` into a commit.
+[ -n "$(git stripspace --strip-comments < "$MSG_FILE" 2>/dev/null)" ] || exit 0
 
 # Ids go into a commit message, so accept only a plain id shape.
 valid_id() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; }
