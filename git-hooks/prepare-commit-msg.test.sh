@@ -89,7 +89,10 @@ g CLAUDE_CODE_SESSION_ID="$CID" git -C "$R" commit -q --allow-empty -v -m verbos
 before="$(git -C "$R" rev-parse HEAD)"
 g CLAUDE_CODE_SESSION_ID="$CID" git -C "$R" commit -q --allow-empty -m "" 2>/dev/null
 g CLAUDE_CODE_SESSION_ID="$CID" GIT_EDITOR=true git -C "$R" commit -q --allow-empty 2>/dev/null
-[ "$(git -C "$R" rev-parse HEAD)" = "$before" ] && pass "empty message still aborts" \
+echo change > "$R/f"; g git -C "$R" add f
+g CLAUDE_CODE_SESSION_ID="$CID" GIT_EDITOR=true git -C "$R" commit -q -v 2>/dev/null
+g git -C "$R" reset -q --hard
+[ "$(git -C "$R" rev-parse HEAD)" = "$before" ] && pass "empty message still aborts (incl. -v with a diff)" \
   || fail "empty message still aborts"
 
 # Rebase replay keeps the original commit's attribution.

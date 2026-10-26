@@ -63,7 +63,10 @@ done
 # only Signed-off-by lines, so a lone trailer would turn `-m ""` into a commit.
 # A blank message here is either that, or an editor commit not yet written;
 # commit-msg stamps the latter once the text exists.
-[ -n "$(git stripspace --strip-comments < "$MSG_FILE" 2>/dev/null)" ] || exit 0
+# `commit -v` appends the diff below a scissors line git cuts later, so drop
+# it first (any comment char) or the diff would count as message text.
+[ -n "$(sed -E '/^[^[:space:]] -{24} >8 -{24}$/,$d' "$MSG_FILE" \
+        | git stripspace --strip-comments 2>/dev/null)" ] || exit 0
 
 # Ids go into a commit message, so accept only a plain id shape.
 valid_id() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; }
