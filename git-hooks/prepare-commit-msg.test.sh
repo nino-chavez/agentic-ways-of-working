@@ -18,6 +18,7 @@ HOOKS="$TMP/hooks"
 mkdir -p "$HOOKS"
 cp "$HOOK" "$HOOKS/prepare-commit-msg"
 chmod +x "$HOOKS/prepare-commit-msg"
+ln -s prepare-commit-msg "$HOOKS/commit-msg"
 
 CID="11111111-2222-3333-4444-555555555555"
 XID="019a0000-aaaa-7bbb-8ccc-dddddddddddd"
@@ -72,6 +73,18 @@ g CLAUDE_CODE_SESSION_ID=$'x\nSigned-off-by: evil' git -C "$R" commit -q --allow
 [ -z "$(trailers "$R")" ] && ! git -C "$R" log -1 --format=%B | grep -q evil \
   && pass "malformed id rejected" || fail "malformed id rejected"
 
+# A message written in the editor gets the trailer (commit-msg's pass), and
+# so does -m under --no-verify (prepare-commit-msg's pass).
+printf '#!/bin/sh\nprintf "from editor\\n" > "$1"\n' > "$TMP/editor"; chmod +x "$TMP/editor"
+g CLAUDE_CODE_SESSION_ID="$CID" GIT_EDITOR="$TMP/editor" git -C "$R" commit -q --allow-empty
+[ "$(git -C "$R" log -1 --format=%s)" = "from editor" ] && [ "$(trailers "$R")" = "claude:$CID" ] \
+  && pass "editor-composed message" || fail "editor-composed message: got '$(trailers "$R")'"
+g CLAUDE_CODE_SESSION_ID="$CID" git -C "$R" commit -q --allow-empty --no-verify -m noverify
+[ "$(trailers "$R")" = "claude:$CID" ] && pass "-m with --no-verify" || fail "-m with --no-verify"
+g CLAUDE_CODE_SESSION_ID="$CID" git -C "$R" commit -q --allow-empty -v -m verbose
+[ "$(trailers "$R")" = "claude:$CID" ] && ! git -C "$R" log -1 --format=%B | grep -q '>8' \
+  && pass "-v scissors template" || fail "-v scissors template"
+
 # An empty message still aborts, as it does without the hook.
 before="$(git -C "$R" rev-parse HEAD)"
 g CLAUDE_CODE_SESSION_ID="$CID" git -C "$R" commit -q --allow-empty -m "" 2>/dev/null
@@ -94,10 +107,14 @@ g git -C "$R" checkout -q main
 W="$TMP/wt"
 g git -C "$R" worktree add -q "$W" -b wt
 printf '#!/bin/sh\necho local-ran >> "%s/local.log"\n' "$TMP" > "$R/.git/hooks/prepare-commit-msg"
+printf '#!/bin/sh\necho local-cm-ran >> "%s/local.log"\n' "$TMP" > "$R/.git/hooks/commit-msg"
+chmod +x "$R/.git/hooks/commit-msg"
 chmod +x "$R/.git/hooks/prepare-commit-msg"
 g CLAUDE_CODE_SESSION_ID="$CID" git -C "$W" commit -q --allow-empty -m "in worktree"
 [ "$(trailers "$W")" = "claude:$CID" ] && pass "linked worktree" || fail "linked worktree"
-grep -q local-ran "$TMP/local.log" 2>/dev/null && pass "chains to repo-local hook" || fail "chains to repo-local hook"
+grep -q local-ran "$TMP/local.log" 2>/dev/null && grep -q local-cm-ran "$TMP/local.log" \
+  && pass "chains to repo-local hooks of both names" || fail "chains to repo-local hooks of both names"
+rm -f "$R/.git/hooks/commit-msg"
 
 # A repo-local hook that rejects the commit still rejects it.
 printf '#!/bin/sh\nexit 1\n' > "$R/.git/hooks/prepare-commit-msg"

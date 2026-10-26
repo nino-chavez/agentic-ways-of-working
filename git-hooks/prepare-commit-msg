@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # Global prepare-commit-msg hook (installed via `git config --global core.hooksPath`).
+# Also installed as commit-msg (a symlink to this file); it acts by the name
+# it runs under.
+#
+# Why both: prepare-commit-msg runs before the editor opens, so for a commit
+# composed in the editor the message is still blank here and the trailer
+# waits for commit-msg, which sees the final text. commit-msg is skipped by
+# --no-verify, which is when prepare-commit-msg's pass covers -m and -F.
 #
 # Two jobs:
-#   1. Chain to any repo-local prepare-commit-msg so a global hooksPath never
-#      silently disables a repo's own hook.
+#   1. Chain to any repo-local hook of the same name so a global hooksPath
+#      never silently disables a repo's own hook.
 #   2. When an agent makes the commit, add a trailer naming the session that
 #      made it, so a commit leads back to the transcript behind it:
 #        Agent-Session: claude:<CLAUDE_CODE_SESSION_ID>
@@ -22,6 +29,7 @@ set -uo pipefail
 
 MSG_FILE="${1:-}"
 SOURCE="${2:-}"
+HOOK_NAME="$(basename "$0")"
 
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 GIT_DIR="$(git rev-parse --git-dir 2>/dev/null)" || exit 0
@@ -29,10 +37,10 @@ GIT_DIR="$(git rev-parse --git-dir 2>/dev/null)" || exit 0
 # see post-commit for why --git-dir is the wrong place to look.
 COMMON_DIR="$(git rev-parse --git-common-dir 2>/dev/null)" || COMMON_DIR="$GIT_DIR"
 
-# (1) Chain to a repo-local prepare-commit-msg if one exists and isn't this
-# file. Its exit status is the hook's: a local hook that aborts the commit
+# (1) Chain to a repo-local hook of the same name if one exists and isn't
+# this file. Its exit status is the hook's: a local hook that aborts the commit
 # keeps aborting it.
-LOCAL_HOOK="$COMMON_DIR/hooks/prepare-commit-msg"
+LOCAL_HOOK="$COMMON_DIR/hooks/$HOOK_NAME"
 if [ -x "$LOCAL_HOOK" ]; then
   LOCAL_DIR="$(cd "$(dirname "$LOCAL_HOOK")" && pwd)"
   if [ "$LOCAL_DIR" != "$HOOK_DIR" ]; then
@@ -53,6 +61,8 @@ done
 [ "$SOURCE" = "squash" ] && exit 0
 # An empty message must still abort the commit. git's emptiness check ignores
 # only Signed-off-by lines, so a lone trailer would turn `-m ""` into a commit.
+# A blank message here is either that, or an editor commit not yet written;
+# commit-msg stamps the latter once the text exists.
 [ -n "$(git stripspace --strip-comments < "$MSG_FILE" 2>/dev/null)" ] || exit 0
 
 # Ids go into a commit message, so accept only a plain id shape.

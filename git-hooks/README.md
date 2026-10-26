@@ -155,7 +155,11 @@ claude auth login       # or: claude setup-token, for a long-lived token
 ## Agent-Session trailer on agent commits
 
 `prepare-commit-msg` adds one trailer per agent session in the environment
-when the commit is made, so any commit leads back to the session behind it:
+when the commit is made, so any commit leads back to the session behind it.
+The same script is installed as `commit-msg` (a symlink). `prepare-commit-msg`
+runs before the editor opens, so it stamps `-m` and `-F` commits, even under
+`--no-verify`. `commit-msg` runs after the editor and stamps commits written
+there. The trailer looks like this:
 
 ```
 Agent-Session: claude:<CLAUDE_CODE_SESSION_ID>
@@ -176,11 +180,15 @@ find ~/.codex/sessions -name "rollout-*-<id>.jsonl"        # codex
 Rebase and cherry-pick replays get no trailer, so a replayed commit keeps the
 original's attribution. An amend in the same session adds nothing; an amend
 in another session adds that session too. An id that is not a plain
-`[A-Za-z0-9._-]` token is ignored rather than written into the message. A
-repo-local `prepare-commit-msg` in the common git dir runs first, and if it
-fails the commit fails, as it would without this hook. Opt out per commit
-with `AGENT_SESSION_TRAILER=0 git commit ...`. Note that `--no-verify` does
-not skip `prepare-commit-msg`.
+`[A-Za-z0-9._-]` token is ignored rather than written into the message. An
+empty message still aborts the commit: the trailer is added only to a message
+that has text. A repo-local hook of the same name in the common git dir runs
+first, and if it fails the commit fails, as it would without this hook. Opt
+out per commit with `AGENT_SESSION_TRAILER=0 git commit ...`.
+
+`install.sh --repo` never replaces a repo's own `post-commit`,
+`prepare-commit-msg` or `commit-msg`. It upgrades only files that carry this
+project's `# Global <name> hook` header, and skips the rest with a message.
 
 Regression test (throwaway repos, no network):
 
@@ -196,7 +204,7 @@ This keeps the link and leaves the transcript local.
 
 Git honors exactly one `hooksPath`. Repos that set their own (Husky, lefthook)
 override the global one — they keep working but won't get these hooks. Repos
-with a hand-written `.git/hooks/post-commit` or `prepare-commit-msg` and no
+with a hand-written `.git/hooks/post-commit`, `prepare-commit-msg` or `commit-msg` and no
 `core.hooksPath` are covered: each hook chains to that local script. Other
 local hook types are not chained, so if
 a repo relies on hand-written non-Husky hooks, install per-repo there instead.
@@ -207,6 +215,7 @@ a repo relies on hand-written non-Husky hooks, install per-repo there instead.
 |------|---------|
 | `post-commit` | The hook: heuristic trigger + detached launch |
 | `prepare-commit-msg` | Adds the `Agent-Session:` trailer to agent commits |
+| `commit-msg` | Symlink to `prepare-commit-msg`; stamps editor-composed commits |
 | `prepare-commit-msg.test.sh` | Regression test for the trailer |
 | `claude-review-run.sh` | Background worker that calls `claude` and writes the review |
 | `claude-review.conf.example` | Per-repo config template |

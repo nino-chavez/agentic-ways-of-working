@@ -31,18 +31,22 @@ command -v git >/dev/null 2>&1 || { echo "ERROR: git not found." >&2; exit 1; }
 command -v claude >/dev/null 2>&1 \
   || echo "WARN: 'claude' CLI not on PATH. Install Claude Code and log in to your subscription before the hook can run."
 
-install_files() {  # $1 = destination dir, $2 = "keep" to never replace a different hook
+install_files() {  # $1 = destination dir, $2 = "keep" to never replace a foreign hook
   local dest="$1" keep="${2:-}" f
   mkdir -p "$dest"
-  for f in post-commit prepare-commit-msg claude-review-run.sh; do
+  for f in post-commit prepare-commit-msg commit-msg claude-review-run.sh; do
     # In a repo's own hooks dir a same-named hook (commitizen, Husky v4, a
-    # ticket-id hook) is the repo's, and nothing would chain to it once replaced.
-    if [ "$keep" = keep ] && [ -e "$dest/$f" ] && ! cmp -s "$SRC/$f" "$dest/$f"; then
-      echo "SKIP: $dest/$f already exists and differs — not replacing it."
+    # ticket-id hook) is the repo's, and nothing would chain to it once
+    # replaced. Our own earlier copies carry the "Global <name> hook" header
+    # and are upgraded; the review runner is never a repo's hook.
+    if [ "$keep" = keep ] && [ "$f" != claude-review-run.sh ] && [ -e "$dest/$f" ] \
+       && ! grep -q '^# Global [a-z-]* hook (installed via' "$dest/$f"; then
+      echo "SKIP: $dest/$f is the repo's own hook — not replacing it."
       echo "      Merge it by hand, or move it aside and re-run."
       continue
     fi
-    cp "$SRC/$f" "$dest/"
+    rm -f "$dest/$f"
+    cp "$SRC/$f" "$dest/$f"
     chmod +x "$dest/$f"
   done
 }
@@ -71,7 +75,7 @@ case "$MODE" in
     echo "Installed into $HOOKS"
     if [ -n "$local_hp" ]; then
       echo "WARN: core.hooksPath is set to '$local_hp' (repo-local or global, e.g. Husky),"
-      echo "      which overrides .git/hooks — the hooks won't fire from here. Place the three"
+      echo "      which overrides .git/hooks — the hooks won't fire from here. Place the four"
       echo "      scripts under '$local_hp' instead, or unset that core.hooksPath."
     fi
     ;;
@@ -83,6 +87,6 @@ case "$MODE" in
     else
       echo "No global core.hooksPath was set."
     fi
-    echo "Per-repo installs: delete post-commit, prepare-commit-msg + claude-review-run.sh from that repo's hooks dir."
+    echo "Per-repo installs: delete post-commit, prepare-commit-msg, commit-msg + claude-review-run.sh from that repo's hooks dir."
     ;;
 esac
