@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# install.sh — set up the Claude post-commit review hook.
+# install.sh — set up the Claude post-commit review hook and the
+# Agent-Session commit trailer (prepare-commit-msg).
 #
 # Usage:
 #   ./install.sh                 install globally (sets git core.hooksPath)
@@ -33,8 +34,8 @@ command -v claude >/dev/null 2>&1 \
 install_files() {  # $1 = destination dir
   local dest="$1"
   mkdir -p "$dest"
-  cp "$SRC/post-commit" "$SRC/claude-review-run.sh" "$dest/"
-  chmod +x "$dest/post-commit" "$dest/claude-review-run.sh"
+  cp "$SRC/post-commit" "$SRC/prepare-commit-msg" "$SRC/claude-review-run.sh" "$dest/"
+  chmod +x "$dest/post-commit" "$dest/prepare-commit-msg" "$dest/claude-review-run.sh"
 }
 
 case "$MODE" in
@@ -61,7 +62,7 @@ case "$MODE" in
     echo "Installed into $HOOKS"
     if [ -n "$local_hp" ]; then
       echo "WARN: core.hooksPath is set to '$local_hp' (repo-local or global, e.g. Husky),"
-      echo "      which overrides .git/hooks — the hook won't fire from here. Place the two"
+      echo "      which overrides .git/hooks — the hooks won't fire from here. Place the three"
       echo "      scripts under '$local_hp' instead, or unset that core.hooksPath."
     fi
     ;;
@@ -73,6 +74,6 @@ case "$MODE" in
     else
       echo "No global core.hooksPath was set."
     fi
-    echo "Per-repo installs: delete post-commit + claude-review-run.sh from that repo's hooks dir."
+    echo "Per-repo installs: delete post-commit, prepare-commit-msg + claude-review-run.sh from that repo's hooks dir."
     ;;
 esac
