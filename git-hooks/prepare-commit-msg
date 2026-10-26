@@ -65,7 +65,7 @@ done
 # commit-msg stamps the latter once the text exists.
 # `commit -v` appends the diff below a scissors line git cuts later, so drop
 # it first (any comment char) or the diff would count as message text.
-[ -n "$(sed -E '/^[^[:space:]] -{24} >8 -{24}$/,$d' "$MSG_FILE" \
+[ -n "$(sed -E '/^[^[:space:]]+ -{24} >8 -{24}$/,$d' "$MSG_FILE" \
         | git stripspace --strip-comments 2>/dev/null)" ] || exit 0
 
 # Ids go into a commit message, so accept only a plain id shape.
