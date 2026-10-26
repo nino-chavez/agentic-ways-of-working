@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Global prepare-commit-msg hook (installed via `git config --global core.hooksPath`).
+# Also installed as commit-msg (a symlink to this file); it acts by the name
+# it runs under.
+#
+# Why both: prepare-commit-msg runs before the editor opens, so for a commit
+# composed in the editor the message is still blank here and the trailer
+# waits for commit-msg, which sees the final text. commit-msg is skipped by
+# --no-verify, which is when prepare-commit-msg's pass covers -m and -F.
+#
+# Two jobs:
+#   1. Chain to any repo-local hook of the same name so a global hooksPath
+#      never silently disables a repo's own hook.
+#   2. When an agent makes the commit, add a trailer naming the session that
+#      made it, so a commit leads back to the transcript behind it:
+#        Agent-Session: claude:<CLAUDE_CODE_SESSION_ID>
+#        Agent-Session: codex:<CODEX_THREAD_ID>
+#      Both appear when one harness runs inside the other (a Codex worker
+#      launched from a Claude session inherits the Claude id).
+#
+# Only the id goes in the commit. The transcript stays local; find it with
+#   ~/.claude/projects/*/<id>.jsonl                        (claude)
+#   ~/.codex/sessions/**/rollout-*-<id>.jsonl              (codex)
+#
+# Per-commit escape hatch:
+#   AGENT_SESSION_TRAILER=0 git commit ...
+
+set -uo pipefail
+
+MSG_FILE="${1:-}"
+SOURCE="${2:-}"
+HOOK_NAME="$(basename "$0")"
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+GIT_DIR="$(git rev-parse --git-dir 2>/dev/null)" || exit 0
+# Repo-local hooks live in the common dir, shared by every linked worktree;
+# see post-commit for why --git-dir is the wrong place to look.
+COMMON_DIR="$(git rev-parse --git-common-dir 2>/dev/null)" || COMMON_DIR="$GIT_DIR"
+
+# (1) Chain to a repo-local hook of the same name if one exists and isn't
+# this file. Its exit status is the hook's: a local hook that aborts the commit
+# keeps aborting it.
+LOCAL_HOOK="$COMMON_DIR/hooks/$HOOK_NAME"
+if [ -x "$LOCAL_HOOK" ]; then
+  LOCAL_DIR="$(cd "$(dirname "$LOCAL_HOOK")" && pwd)"
+  if [ "$LOCAL_DIR" != "$HOOK_DIR" ]; then
+    "$LOCAL_HOOK" "$@" || exit $?
+  fi
+fi
+
+# (2) Session trailer. Never fails the commit from here on.
+[ "${AGENT_SESSION_TRAILER:-1}" = "0" ] && exit 0
+[ -n "$MSG_FILE" ] && [ -f "$MSG_FILE" ] || exit 0
+
+# A replayed commit (rebase, cherry-pick) was made by whoever made the
+# original; stamping the replaying session on it would misattribute it.
+for marker in rebase-merge rebase-apply CHERRY_PICK_HEAD; do
+  [ -e "$GIT_DIR/$marker" ] && exit 0
+done
+# --squash leaves the message for a later commit, which gets its own pass.
+[ "$SOURCE" = "squash" ] && exit 0
+# An empty message must still abort the commit. git's emptiness check ignores
+# only Signed-off-by lines, so a lone trailer would turn `-m ""` into a commit.
+# A blank message here is either that, or an editor commit not yet written;
+# commit-msg stamps the latter once the text exists.
+# `commit -v` appends the diff below a scissors line git cuts later, so drop
+# it first (any comment char) or the diff would count as message text.
+[ -n "$(sed -E '/^[^[:space:]]+ -{24} >8 -{24}$/,$d' "$MSG_FILE" \
+        | git stripspace --strip-comments 2>/dev/null)" ] || exit 0
+
+# Ids go into a commit message, so accept only a plain id shape.
+valid_id() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; }
+
+TRAILERS=()
+if [ -n "${CODEX_THREAD_ID:-}" ] && valid_id "$CODEX_THREAD_ID"; then
+  TRAILERS+=(--trailer "Agent-Session: codex:$CODEX_THREAD_ID")
+fi
+if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] && valid_id "$CLAUDE_CODE_SESSION_ID"; then
+  TRAILERS+=(--trailer "Agent-Session: claude:$CLAUDE_CODE_SESSION_ID")
+fi
+[ ${#TRAILERS[@]} -eq 0 ] && exit 0
+
+# addIfDifferent: an amend in the same session adds nothing; an amend in
+# another session adds that session too.
+git interpret-trailers --in-place --if-exists addIfDifferent \
+  "${TRAILERS[@]}" "$MSG_FILE" 2>/dev/null || true
+exit 0
