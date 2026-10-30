@@ -45,6 +45,14 @@ Contention model — two hazards, two checks:
      MERGE_HEAD plus five staged files behind. Nothing blocked it, because
      `merge` was not a contended op and B was no longer in main.
 
+One check ignores contention. `git submodule deinit` in a linked worktree
+deletes the submodule.* entries from the SHARED .git/config, so the main
+checkout and every other worktree lose their submodule registration. That
+happens even when this session is the only one in the repo, so the check runs
+before the contention gate. It happened three times in one dotfiles repo
+(2026-10-23 and twice on 2026-10-30), each time to remove a worktree that `git
+worktree remove` refused because it held initialized submodules.
+
 Effective-repo resolution: the guard does not blindly use the session cwd. It
 walks the shell command, tracking `cd <dir>` and honoring `git -C <dir>`, so a
 command like `cd ~/other-repo && git commit` is judged against ~/other-repo —
@@ -412,6 +420,14 @@ def _is_contended_args(args: list[str], cwd: str | None = None) -> bool:
     return False
 
 
+def _is_submodule_deinit(args: list[str]) -> bool:
+    """True for `git submodule [--quiet] deinit ...`."""
+    sub, rest = _subcommand(args)
+    if sub != "submodule":
+        return False
+    return next((a for a in rest if not a.startswith("-")), None) == "deinit"
+
+
 def _integration_operands(args: list[str]) -> list[str]:
     """Non-flag operands of a merge/rebase — the refs it folds into this checkout.
 
@@ -562,6 +578,34 @@ def deny_reason_edit(others: list[dict], repo_dir: str, ld: Path, path: str, ctx
     ]
     lines += unwind_lines(ctx, repo_dir)
     return "\n".join(lines)
+
+
+def deny_reason_deinit(repo_dir: str, ctx: dict) -> str:
+    # Paste-ready, like suggest_worktree: real paths and the remote's default
+    # branch, so the safe route needs no template filling.
+    worktree = git(["rev-parse", "--show-toplevel"], repo_dir) or repo_dir
+    common = ctx["common_dir"]
+    main = os.path.dirname(common) if os.path.basename(common) == ".git" else common
+    base = git(["rev-parse", "--abbrev-ref", "origin/HEAD"], repo_dir) or "main"
+    return "\n".join([
+        "Worktree isolation guard: BLOCKED (submodule deinit in a linked worktree).",
+        "",
+        f"`git submodule deinit` here edits the repository's SHARED config ({common}/config).",
+        "It deletes the submodule.* entries, so the main checkout and every other worktree",
+        "lose their submodule registration too, even with no other session running.",
+        "",
+        "If you are removing this worktree: `git worktree remove` refuses one with",
+        "initialized submodules, and deinit does not change that. Instead:",
+        "",
+        f"  git -C {worktree} status --porcelain      # must print nothing",
+        f"  git -C {worktree} cherry {base} HEAD      # no '+' lines: every commit is in {base}",
+        f"  git -C {main} worktree remove --force {worktree}",
+        "",
+        "--force also discards uncommitted work, which is why both checks come first.",
+        "If the main checkout already shows '-' in `git submodule status`, re-register it:",
+        "",
+        f"  git -C {main} submodule init",
+    ])
 
 
 def ask_reason_branch(held: list[dict], repo_dir: str, ctx: dict) -> str:
@@ -742,6 +786,9 @@ def cmd_check(payload: dict) -> None:
         tld = lock_dir(tctx["common_dir"])
         if (tld / OVERRIDE_FILENAME).exists():
             continue  # per-repo escape hatch
+        # Shared-config damage needs no second session, so this precedes the gate.
+        if tctx["is_worktree"] and _is_submodule_deinit(args):
+            deny(deny_reason_deinit(eff_dir, tctx))
         others = live_others(tld, session_id)
         if not others:
             continue  # solo in this repo => never blocked
