@@ -44,7 +44,7 @@ Keep what should survive the task without treating the full transcript as perman
 The receipt is your closing message, written as Markdown that the reader takes in at a glance. Never wrap it in a code block: a fence renders as one monospace run with no links and no bold. Do not put a recap above it that repeats it. Keep every label, and write "none" or "nothing" instead of dropping one, so the reader can tell an empty answer from a forgotten one.
 
 ```markdown
-**Archive-safe: yes.** <What that means here, such as "You can archive this session; nothing still needs its transcript."> **Your next step:** <one concrete action, or none>.
+**Archive-safe: <yes|no>.** <For yes, what that means here, such as "You can archive this session; nothing still needs its transcript." For no, the blocker.> **Your next step:** <one concrete action, or none>.
 
 **What landed**
 - <link to the PR, release, or file>: <what it changed, in plain words>
