@@ -32,7 +32,7 @@ Keep what should survive the task without treating the full transcript as perman
 
    Codex fills in neither variable, so that command fails there. In Codex, run `scripts/secret-scan.py` from this skill's directory with `--session-id "$CODEX_THREAD_ID"`; Codex names each rollout file after that thread id. In any other harness, pass `--transcript <this session's file>`. With no arguments the script takes the newest session for the current folder. In every case, check that the `Scanned:` line names this session. The scan prints names and line numbers, never values. Do not print or quote a value to judge a finding.
    - Exit 0 is clean. Exit 2 means the scan did not run, which is not clean.
-   - `live` means a credential that is current in this environment was printed into the transcript. You cannot rotate it. Make rotating it the `Next action`.
+   - `live` means a credential that is current in this environment was printed into the transcript. You cannot rotate it. Make rotating it the receipt's next step.
    - Any other finding: it was rotated, or it is not a credential (a test fixture, a public client key, documentation). Say which. Otherwise treat it like `live`.
 5. Prefer an existing source of truth over a new recap file. Update it only when the task already authorized the underlying change. Never manufacture human approval, readiness, or evidence.
 6. Save a reusable recipe only when another task is likely to benefit. Use the project's documented memory command or knowledge store. If `~/.config/session-closeout/recipe-store.md` exists, it names this machine's store for each harness; follow it. Keep the entry short, sourced, and free of raw private text. If no durable recipe exists, save none.
@@ -41,19 +41,33 @@ Keep what should survive the task without treating the full transcript as perman
 
 ## Required receipt
 
-End with exactly these fields:
+The receipt is your closing message, written as Markdown that the reader takes in at a glance. Never wrap it in a code block: a fence renders as one monospace run with no links and no bold. Do not put a recap above it that repeats it. Keep every label, and write "none" or "nothing" instead of dropping one, so the reader can tell an empty answer from a forgotten one.
 
-```text
-CLOSEOUT_COMPLETE
-Outcome: <what landed>
-Canonical updates: <paths or none>
-Verified evidence: <checks or receipts>
-Still unproven: <remaining claims or none>
-Next action: <single concrete action or none>
-Recall recipe: <recipe id/path or none>
-Workspace: <each worktree, branch, process, and file outside git this task created, with its disposition; or none>
-Secret scan: <clean; or each finding (kind and name) with its disposition; or error>
-Archive-safe: yes|no
+```markdown
+**Archive-safe: yes.** <What that means here, such as "You can archive this session; nothing still needs its transcript."> **Your next step:** <one concrete action, or none>.
+
+**What landed**
+- <link to the PR, release, or file>: <what it changed, in plain words>
+
+**Still open:** <each claim not yet proven, or item waiting on someone; or nothing>
+
+**Saved for later:** <each canonical document, memory, or recall recipe updated, and what it holds; or nothing new>
+
+**Checks**
+- Secret scan: <clean; or each finding (kind and name) with its disposition; or error>
+- Evidence: <how you verified what landed>
+- Cleanup: <each worktree, branch, process, and file outside git this task created, with its disposition; or none>
 ```
+
+When the answer is `no`, the first line names the blocker, and the next step clears it. Example: `**Archive-safe: no.** A live token was printed into this transcript. **Your next step:** rotate the Cloudflare token.`
+
+Write it to be read, not parsed:
+
+- One item per bullet, about 15 words or fewer after the link. A label with one short answer keeps it on the label's line; two or more become bullets.
+- Link every PR, then say what it changed. The desktop app shows a PR link's state and title, but a terminal shows a bare URL, so the plain clause carries the meaning.
+- When more than about six items landed, list the ones that change behavior and fold the rest into one bullet, such as "Follow-ups, all merged:" and their links.
+- Group cleanup by disposition when several items share one ("4 task branches merged; their worktrees and branches removed").
+- Use backticks only for a path, SHA, or command the reader would copy.
+- No tables, nested lists, or headings. Long table cells wrap badly in a chat column. Fit the receipt on one screen.
 
 Set `Archive-safe: yes` only when the durable lesson is stored, the secret scan exited 0 or every finding is rotated or shown not to be a credential, evidence is named, every worktree, branch, process, and file outside git the task created has a recorded disposition, no commit exists only on this machine, nothing still needed lives only in a scratch location, and nothing requires the raw transcript to resume safely.
