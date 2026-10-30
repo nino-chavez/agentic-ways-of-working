@@ -158,6 +158,23 @@ class SecretScanTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("rollout-2026-10-07T00-00-00-abc.jsonl", r.stdout)
 
+    def test_codex_thread_id_finds_its_rollout(self):
+        # SKILL.md step 4 tells Codex to pass --session-id "$CODEX_THREAD_ID".
+        thread = "01a00000-0000-7000-8000-00000000c0de"
+        value = rand(40)
+        day = self.home / ".codex" / "sessions" / "2026" / "10" / "30"
+        day.mkdir(parents=True)
+        rollout = day / f"rollout-2026-10-30T09-00-00-{thread}.jsonl"
+        rollout.write_text(
+            json.dumps({"type": "session_meta", "payload": {"id": thread}}) + "\n"
+            + json.dumps({"type": "response_item", "payload": {
+                "type": "custom_tool_call_output", "output": f"$ cat .env\nDEPLOY_TOKEN={value}\n"}}) + "\n")
+        r = self.run_scan("--session-id", thread)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn(f"{rollout} (session id;", r.stdout)
+        self.assertIn("assign DEPLOY_TOKEN", r.stdout)
+        self.assertNotIn(value[-12:], r.stdout)
+
     def test_unsubstituted_session_id_falls_back_to_cwd_guess(self):
         self.write("s4", "nothing here")
         r = self.run_scan("--session-id", "${CLAUDE_SESSION_ID}")

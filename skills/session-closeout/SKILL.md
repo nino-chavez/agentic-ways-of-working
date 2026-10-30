@@ -24,18 +24,18 @@ Keep what should survive the task without treating the full transcript as perman
    - a file the task wrote outside git (the session scratchpad, `/tmp`, a notes or handoff folder, an untracked file in a shared checkout, an external drive): delete it, or first move it to a durable home (the repository, a tools folder, or beside the thing it records) and name where. A receipt that memory or a document points to must live somewhere that outlives the session; a scratchpad or an app-managed notes folder does not.
    - a worktree or ignored folder that a build or release depends on: lock it with `git worktree lock --reason "<what depends on it>"`, or move the dependency to the repository-level `.artifacts/`. A note in memory protects nothing; the reaper and fleet sweeps skip locked worktrees.
    Touch only what this task created. Leave a worktree held by a live session, a locked one, and the worktree this session is running in (its host removes that one). Report anything you could not decide. Reclaiming build output in idle worktrees is the reaper's job, not this step's.
-4. Scan this session's transcript for credentials. Run it after step 3, so it also covers the commands the closeout ran:
+4. Scan this session's transcript for credentials. Run it after step 3, so it also covers the commands the closeout ran. In Claude Code:
 
    ```bash
    python3 "${CLAUDE_SKILL_DIR}/scripts/secret-scan.py" --session-id "${CLAUDE_SESSION_ID}"
    ```
 
-   Outside Claude Code, run `scripts/secret-scan.py` from this skill's directory with `--transcript <this session's file>`. With no arguments it takes the newest session for the current folder. Either way, check that the `Scanned:` line names this session. The scan prints names and line numbers, never values. Do not print or quote a value to judge a finding.
+   Codex fills in neither variable, so that command fails there. In Codex, run `scripts/secret-scan.py` from this skill's directory with `--session-id "$CODEX_THREAD_ID"`; Codex names each rollout file after that thread id. In any other harness, pass `--transcript <this session's file>`. With no arguments the script takes the newest session for the current folder. In every case, check that the `Scanned:` line names this session. The scan prints names and line numbers, never values. Do not print or quote a value to judge a finding.
    - Exit 0 is clean. Exit 2 means the scan did not run, which is not clean.
    - `live` means a credential that is current in this environment was printed into the transcript. You cannot rotate it. Make rotating it the `Next action`.
    - Any other finding: it was rotated, or it is not a credential (a test fixture, a public client key, documentation). Say which. Otherwise treat it like `live`.
 5. Prefer an existing source of truth over a new recap file. Update it only when the task already authorized the underlying change. Never manufacture human approval, readiness, or evidence.
-6. Save a reusable recipe only when another task is likely to benefit. Use the project's documented memory command or knowledge store. Keep the entry short, sourced, and free of raw private text. If no durable recipe exists, save none.
+6. Save a reusable recipe only when another task is likely to benefit. Use the project's documented memory command or knowledge store. If `~/.config/session-closeout/recipe-store.md` exists, it names this machine's store for each harness; follow it. Keep the entry short, sourced, and free of raw private text. If no durable recipe exists, save none.
 7. Confirm the transcript has been queued or ingested by the configured lifecycle hook. Do not perform mining inside the hook; the hook should enqueue identity and return quickly.
 8. Do not archive or delete the task. Give the operator the receipt and let them take the irreversible action.
 
