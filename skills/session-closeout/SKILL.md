@@ -15,12 +15,13 @@ Keep what should survive the task without treating the full transcript as perman
    - a reusable method that belongs in the configured memory or recipe store;
    - chronology that can disappear with the transcript;
    - unresolved work, secrets, private material, or unverified claims that block safe archival.
-3. Decide the fate of the workspace this task created. List each linked worktree, branch, and running dev server, database stack, or browser tab the task started (`git worktree list`, `git branch`, the commands it ran). Give each exactly one disposition and record it:
+3. Decide the fate of the workspace this task created. List each linked worktree, branch, file written outside git, and running dev server, database stack, or browser tab the task started (`git worktree list`, `git branch`, `git status --porcelain` in each checkout it wrote to, the session scratchpad, the commands it ran). Give each exactly one disposition and record it:
    - merged into the base branch, or landed by squash or cherry-pick (confirm with `git cherry <base> <branch>` or a content check): remove the worktree with `git worktree remove` (no `--force`) and delete the local branch;
    - commits not in the base branch: push the branch so the work is not only on this machine, and name the open PR or the reason it stays open;
    - uncommitted changes: commit them to the task's branch, or state why they are discarded. Never leave them undecided;
    - evidence in an ignored folder that is still needed (`.artifacts/`, receipts, a backup app): move it to the repository-level `.artifacts/` or a canonical document before removing the worktree, and name what was kept;
    - a process the task started: stop it.
+   - a file the task wrote outside git (the session scratchpad, `/tmp`, a notes or handoff folder, an untracked file in a shared checkout, an external drive): delete it, or first move it to a durable home (the repository, a tools folder, or beside the thing it records) and name where. A receipt that memory or a document points to must live somewhere that outlives the session; a scratchpad or an app-managed notes folder does not.
    - a worktree or ignored folder that a build or release depends on: lock it with `git worktree lock --reason "<what depends on it>"`, or move the dependency to the repository-level `.artifacts/`. A note in memory protects nothing; the reaper and fleet sweeps skip locked worktrees.
    Touch only what this task created. Leave a worktree held by a live session, a locked one, and the worktree this session is running in (its host removes that one). Report anything you could not decide. Reclaiming build output in idle worktrees is the reaper's job, not this step's.
 4. Scan this session's transcript for credentials. Run it after step 3, so it also covers the commands the closeout ran:
@@ -50,9 +51,9 @@ Verified evidence: <checks or receipts>
 Still unproven: <remaining claims or none>
 Next action: <single concrete action or none>
 Recall recipe: <recipe id/path or none>
-Workspace: <each worktree, branch, and process this task created, with its disposition; or none>
+Workspace: <each worktree, branch, process, and file outside git this task created, with its disposition; or none>
 Secret scan: <clean; or each finding (kind and name) with its disposition; or error>
 Archive-safe: yes|no
 ```
 
-Set `Archive-safe: yes` only when the durable lesson is stored, the secret scan exited 0 or every finding is rotated or shown not to be a credential, evidence is named, every worktree, branch, and process the task created has a recorded disposition, no commit exists only on this machine, and nothing requires the raw transcript to resume safely.
+Set `Archive-safe: yes` only when the durable lesson is stored, the secret scan exited 0 or every finding is rotated or shown not to be a credential, evidence is named, every worktree, branch, process, and file outside git the task created has a recorded disposition, no commit exists only on this machine, nothing still needed lives only in a scratch location, and nothing requires the raw transcript to resume safely.
