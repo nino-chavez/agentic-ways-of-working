@@ -150,6 +150,38 @@ class ContentionBasisTests(_TwoSessionRepo):
         self.assertEqual(self.bash("A", self.root, "git commit -m x")[0], "allow")
 
 
+class SubmoduleDeinitTests(_TwoSessionRepo):
+    """Deinit in a linked worktree wipes the shared submodule config. One
+    session is enough to do the damage, so no second session arrives here."""
+
+    def test_deinit_in_a_worktree_is_denied_for_a_solo_session(self) -> None:
+        for command in [
+            "git submodule deinit --all",
+            "git submodule --quiet deinit -f vendor/x",
+            f"git -C {self.worktree} submodule deinit --all",
+            f"cd {self.worktree} && git submodule deinit --all",
+        ]:
+            cwd = self.root if str(self.worktree) in command else self.worktree
+            decision, reason = self.bash("A", cwd, command)
+            self.assertEqual(decision, "deny", command)
+            # git reports resolved paths (/private/var on macOS), so compare those.
+            self.assertIn(f"worktree remove --force {self.worktree.resolve()}", reason)
+            self.assertIn(f"git -C {self.root.resolve()} submodule init", reason)
+
+    def test_deinit_in_the_main_checkout_is_allowed(self) -> None:
+        self.assertEqual(self.bash("A", self.root, "git submodule deinit --all")[0], "allow")
+
+    def test_other_submodule_ops_in_a_worktree_are_allowed(self) -> None:
+        for command in ["git submodule update --init", "git submodule status",
+                        "git submodule foreach git status"]:
+            self.assertEqual(self.bash("A", self.worktree, command)[0], "allow", command)
+
+    def test_guard_off_also_releases_the_deinit_check(self) -> None:
+        self.locks.mkdir(parents=True, exist_ok=True)
+        (self.locks / ".guard-off").write_text("", encoding="utf-8")
+        self.assertEqual(self.bash("A", self.worktree, "git submodule deinit --all")[0], "allow")
+
+
 class ContendedOpCoverageTests(_TwoSessionRepo):
     """The op set that stranded the operator merge. Both sessions in main."""
 
