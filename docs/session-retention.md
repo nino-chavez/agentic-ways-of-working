@@ -106,7 +106,9 @@ Advance the watermark only after the database transaction commits. A useful wate
 Invoke [`$session-closeout`](../skills/session-closeout/SKILL.md) before archiving substantive work. Its receipt makes the missing judgment visible:
 
 ```markdown
-**Archive-safe: no.** Old transcripts may hold project details that nothing else records yet. **Your next step:** review the archive after the grace window.
+### Archive-safe: no. Old transcripts may hold project details that nothing else records yet.
+
+**Your next step:** review the archive after the grace window.
 
 **What landed**
 - Cross-client retention pipeline: installed
@@ -121,7 +123,7 @@ Invoke [`$session-closeout`](../skills/session-closeout/SKILL.md) before archivi
 - Cleanup: none
 ```
 
-The skill sends the receipt as Markdown, not inside a code block, so the reader sees bold labels and clickable links.
+The skill sends the receipt as Markdown, not inside a code block, so the reader sees the verdict as a heading, bold labels, and clickable links.
 
 `Archive-safe: no` is a successful closeout result when raw context is still carrying something important.
 
