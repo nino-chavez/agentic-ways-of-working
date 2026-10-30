@@ -44,10 +44,12 @@ Keep what should survive the task without treating the full transcript as perman
 The receipt is your closing message, written as Markdown that the reader takes in at a glance. Never wrap it in a code block: a fence renders as one monospace run with no links and no bold. Do not put a recap above it that repeats it. Keep every label, and write "none" or "nothing" instead of dropping one, so the reader can tell an empty answer from a forgotten one.
 
 ```markdown
-**Archive-safe: <yes|no>.** <For yes, what that means here, such as "You can archive this session; nothing still needs its transcript." For no, the blocker.> **Your next step:** <one concrete action, or none>.
+### Archive-safe: <yes|no>. <For yes, a short reason, such as "Ready to archive." For no, the blocker.>
+
+**Your next step:** <one concrete action, or none>.
 
 **What landed**
-- <link to the PR, release, or file>: <what it changed, in plain words>
+- [<repo>#<number>](<full PR URL>): <what it changed, in plain words>
 
 **Still open:** <each claim not yet proven, or item waiting on someone; or nothing>
 
@@ -59,15 +61,15 @@ The receipt is your closing message, written as Markdown that the reader takes i
 - Cleanup: <each worktree, branch, process, and file outside git this task created, with its disposition; or none>
 ```
 
-When the answer is `no`, the first line names the blocker, and the next step clears it. Example: `**Archive-safe: no.** A live token was printed into this transcript. **Your next step:** rotate the Cloudflare token.`
+When the answer is `no`, the first line names the blocker, and the next step clears it. Example: `### Archive-safe: no. A live token was printed into this transcript.` then `**Your next step:** rotate the Cloudflare token.`
 
 Write it to be read, not parsed:
 
 - One item per bullet, about 15 words or fewer after the link. A label with one short answer keeps it on the label's line; two or more become bullets.
-- Link every PR, then say what it changed. The desktop app shows a PR link's state and title, but a terminal shows a bare URL, so the plain clause carries the meaning.
+- Link every PR with short text, `[repo#number](full URL)`, then say what it changed. In the desktop app, link text of the form `owner/repo#number` turns into a wide chip with a truncated commit title and a cached state that can be stale (a merged PR showed as open). Short link text stays a plain link, and the plain clause carries the meaning.
 - When more than about six items landed, list the ones that change behavior and fold the rest into one bullet, such as "Follow-ups, all merged:" and their links.
 - Group cleanup by disposition when several items share one ("4 task branches merged; their worktrees and branches removed").
 - Use backticks only for a path, SHA, or command the reader would copy.
-- No tables, nested lists, or headings. Long table cells wrap badly in a chat column. Fit the receipt on one screen.
+- The verdict is the only heading: bold barely shows in the app's dark theme, and the heading also marks where the receipt starts. No other headings, no tables (long cells wrap badly in a chat column), no nested lists. Fit the receipt on one screen.
 
 Set `Archive-safe: yes` only when the durable lesson is stored, the secret scan exited 0 or every finding is rotated or shown not to be a credential, evidence is named, every worktree, branch, process, and file outside git the task created has a recorded disposition, no commit exists only on this machine, nothing still needed lives only in a scratch location, and nothing requires the raw transcript to resume safely.
