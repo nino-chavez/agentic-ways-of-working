@@ -105,18 +105,23 @@ Advance the watermark only after the database transaction commits. A useful wate
 
 Invoke [`$session-closeout`](../skills/session-closeout/SKILL.md) before archiving substantive work. Its receipt makes the missing judgment visible:
 
-```text
-CLOSEOUT_COMPLETE
-Outcome: cross-client retention pipeline installed
-Canonical updates: docs/session-retention.md
-Verified evidence: parser fixtures and database integrity check passed
-Still unproven: old transcripts may contain project details not promoted elsewhere
-Next action: review the archive after the grace window
-Recall recipe: session-retention-v1
-Workspace: none
-Secret scan: clean
-Archive-safe: no
+```markdown
+**Archive-safe: no.** Old transcripts may hold project details that nothing else records yet. **Your next step:** review the archive after the grace window.
+
+**What landed**
+- Cross-client retention pipeline: installed
+
+**Still open:** old transcripts may contain project details not promoted elsewhere
+
+**Saved for later:** `docs/session-retention.md`; recall recipe `session-retention-v1`
+
+**Checks**
+- Secret scan: clean
+- Evidence: parser fixtures and the database integrity check passed
+- Cleanup: none
 ```
+
+The skill sends the receipt as Markdown, not inside a code block, so the reader sees bold labels and clickable links.
 
 `Archive-safe: no` is a successful closeout result when raw context is still carrying something important.
 
