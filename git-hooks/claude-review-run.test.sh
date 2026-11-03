@@ -15,6 +15,11 @@
 # reviewer's text are quoted. Before the contract the only machine-readable
 # signal was a grep for the phrase "Looks good to me".
 #
+# Extended 2026-11-03 for the sha argument: a short sha passed by hand used to
+# land verbatim on the VERDICT line, so `VERDICT: PASS 3b0a934` never matched
+# the documented gate on `$(git rev-parse HEAD)`. The runner now resolves the
+# argument to the full sha, and one that names no commit exits 1 with no review.
+#
 # Stubs `claude` (the thing that fails) and `osascript` (where a human would see
 # it), then asserts on the notification text, the file and the exit status.
 #
@@ -44,11 +49,12 @@ setup() {                       # $1 = stub body for `claude`
 }
 teardown() { rm -rf "$TMP"; }
 
-_run() {
-  PATH="$TMP/bin:$PATH" bash "$RUNNER" "$TMP/repo" "$SHA" >/dev/null 2>&1
+_run() {                        # SHA_ARG overrides the sha passed to the runner
+  PATH="$TMP/bin:$PATH" bash "$RUNNER" "$TMP/repo" "${SHA_ARG:-$SHA}" >/dev/null 2>"$TMP/stderr"
   RC=$?
   MD="$(cat "$TMP/repo/.git/last-review.md" 2>/dev/null)"
   NOTE="$(cat "$NOTIFY_LOG")"
+  ERR="$(cat "$TMP/stderr")"
   # First non-blank line after the header (the header ends with the "> commit" line).
   FIRSTBODY="$(awk 'hdr && NF {print; exit} /^> commit/ {hdr=1}' "$TMP/repo/.git/last-review.md" 2>/dev/null)"
   # How many lines a naive consumer grep would match.
@@ -86,6 +92,8 @@ check_md() { _run; _assert "$1" "$MD"   "$2" "last-review.md" "$3"; }
 check_verdict() { _run; _assert_eq "$1" "$FIRSTBODY" "$2" "first body line" "$3"; }
 # assert on how many lines a consumer grep for '^VERDICT:' / '^VERDICT: PASS' finds
 check_counts()  { _run; _assert_eq "$1" "$NVERDICT/$NPASS" "$2" "verdict-lines/pass-lines" "$3"; }
+# assert on what the person who ran it by hand is told
+check_err()     { _run; _assert "$1" "$ERR" "$2" "stderr" "$3"; }
 
 echo "claude-review-run.sh — failure signalling"
 
@@ -191,6 +199,26 @@ teardown
 setup 'echo "src/a.ts:12 — off-by-one"; exit 0'
 check "findings with no verdict line are INVALID" "INVALID"       2
 teardown
+
+echo
+echo "claude-review-run.sh — sha argument"
+
+# The finish line tells agents to review HEAD by hand, and one did so with a
+# short sha on 2026-11-03: the PASS it wrote could not match the HEAD gate.
+setup 'echo "VERDICT: PASS"; exit 0'
+SHA_ARG="${SHA:0:7}"
+check_verdict "a short sha lands as the full sha" "VERDICT: PASS $SHA" 0
+unset SHA_ARG; teardown
+
+setup 'echo "VERDICT: PASS"; exit 0'
+SHA_ARG=deadbeef
+check_counts "a sha that names no commit writes no verdict" "0/0" 1
+unset SHA_ARG; teardown
+
+setup 'echo "VERDICT: PASS"; exit 0'
+SHA_ARG=deadbeef
+check_err "a sha that names no commit says so" "'deadbeef' is not a commit" 1
+unset SHA_ARG; teardown
 
 echo
 echo "  ${pass} passed, ${fail} failed"
