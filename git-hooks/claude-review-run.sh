@@ -3,6 +3,8 @@
 # logged-in Claude subscription, and writes the result to <git-dir>/last-review.md.
 #
 # Args: <repo-toplevel> <commit-sha> [lock-dir]
+#   The sha may be short or any commit-ish; it is resolved to the full sha
+#   first. One that names no commit exits 1 and leaves last-review.md alone.
 #
 # Env:
 #   CLAUDE_REVIEW_DRY=1   skip the claude call (wiring test, no quota spend)
@@ -31,6 +33,14 @@ cleanup() { [ -n "$LOCK" ] && rmdir "$LOCK" 2>/dev/null; return 0; }
 trap cleanup EXIT
 
 cd "$REPO" || exit 1
+
+# The VERDICT line must carry the full sha, because the HEAD gate greps for
+# `$(git rev-parse HEAD)`. A short sha passed by hand on 2026-11-03 was written
+# verbatim, and the PASS it produced did not match the gate.
+SHA="$(git rev-parse --quiet --verify "${2}^{commit}")" || {
+  echo "claude-review-run: '$2' is not a commit in $REPO" >&2
+  exit 1
+}
 
 # Force subscription billing: never let an API key leak into this run.
 # (If you WANT to use a metered API key instead, comment the next line out.)
