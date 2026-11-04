@@ -20,6 +20,11 @@ def rand(n: int = 32) -> str:
     return secrets.token_hex(n // 2)
 
 
+def typed_password() -> str:
+    """The shape a person types: short, mixed case, a digit, a symbol. Too short for token_shaped."""
+    return f"Tulip{secrets.randbelow(10)}:{secrets.randbelow(90) + 10}moss"
+
+
 def line(text: str) -> str:
     return json.dumps({"type": "user", "message": {"content": text}}) + "\n"
 
@@ -122,6 +127,50 @@ class SecretScanTest(unittest.TestCase):
         self.write("s9", f"API_KEY=\nDATABASE_URL_X=postgres{rand(24)}\n")
         r = self.run_scan("--session-id", "s9")
         self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_typed_password_after_a_label(self):
+        # Regression (2026-11-04): a password pasted into a chat message, read through
+        # an MCP tool, scanned clean. The tool returns JSON as text, so the message
+        # sits in JSON inside the transcript's JSON, and one decode leaves its
+        # newlines as backslash-n. This mirrors that record's structure.
+        pw, pw2, pw3 = typed_password(), typed_password(), typed_password()
+        chat = json.dumps({"messages": "=== Message from A (U01) at 2026-11-04 ===\n"
+                           f"Login for the test account:\nsomeone@corp.test\nPW: {pw}\n",
+                           "pagination_info": "No more messages"})
+        mcp = [{"type": "text", "text": chat}]
+        p = self.project / "s11.jsonl"
+        p.write_text(json.dumps({"type": "user", "message": {"role": "user", "content": [
+            {"tool_use_id": "toolu_01", "type": "tool_result", "content": mcp}]},
+            "toolUseResult": mcp}) + "\n"
+            + json.dumps({"type": "user", "message": {"content": [
+                {"type": "tool_result", "content": f"$ cat notes.txt\nstaging admin\npassword: {pw2}\n"}]}}) + "\n"
+            + line(f"Server=db.test;Uid=app;Pwd={pw3};"))
+        r = self.run_scan("--session-id", "s11")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("passwd PW  s11.jsonl line 1", r.stdout)
+        self.assertIn("passwd password  s11.jsonl line 2", r.stdout)
+        self.assertIn("passwd Pwd  s11.jsonl line 3", r.stdout)
+        for value in (pw, pw2, pw3):
+            self.assertNotIn(value, r.stdout)
+            self.assertNotIn(value[-6:], r.stdout)
+
+    def test_password_lookalikes_are_clean(self):
+        self.write("s12",
+                   "cd $(pwd)/build && pwd=$(pwd)",
+                   "PWD=/Users/someone/work\nOLDPWD=/Users/someone",
+                   "def login(user: str, password: str, pw: Optional[str] = None):",
+                   'password=os.environ.get("DB_PASSWORD")',
+                   "password=sha256(raw).hexdigest()",
+                   "password: changeme123",
+                   "password: process.env.DB_PASSWORD, pw: true",
+                   'config = {"password": "${DB_PASSWORD}", "pwd": "<your password>"}',
+                   "password: ********",
+                   "PW: same as the one in 1Password",
+                   "To reset the password: step2 in the runbook.",
+                   f"https://zoom.test/j/8123?pwd={rand(30)}.1&from=addon")
+        r = self.run_scan("--session-id", "s12")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("SECRET_SCAN_CLEAN", r.stdout)
 
     def test_unlistable_side_folder_is_an_error_not_clean(self):
         self.write("s10", "nothing here")

@@ -11,6 +11,7 @@ What it reports, never the value or any part of it:
   prefix  a known provider key shape (the pre-commit hook's PATTERNS list)
   assign  NAME=value where NAME looks secret and value looks like a token
   bearer  an Authorization: Bearer header with a token-shaped value
+  passwd  a password typed after a label (PW:, password:, Pwd=), even a short one
   live    the value of a secret-named variable in this process's environment
           appears verbatim; this one is certain, rotate it
 
@@ -42,6 +43,10 @@ SECRET_NAME = r"[A-Z][A-Z0-9_]*?(?:(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)[A
 # config ("API_KEY": "value"); the one before the value covers export X="value".
 ASSIGN = re.compile(rf"(?<![A-Za-z0-9_])({SECRET_NAME})[\"']?[ \t]*[=:][ \t]*[\"']?([^\s\"'\\,;)}}\]`]+)")
 BEARER = re.compile(r"Bearer[ \t]+([A-Za-z0-9._~+/=-]+)")
+# A password a person typed or pasted (PW: x, password = x, Pwd=x;), which is too short
+# for token_shaped. Only a standalone label: DB_PASSWORD belongs to ASSIGN, and ?pwd= in
+# a meeting link is a URL parameter.
+PASSWORD = re.compile(r"(?<![A-Za-z0-9_?&])(pw|pwd|passwd|password)[\"']?[ \t]*[=:][ \t]*[\"']?([^\s\"'\\,;)}\]`]+)", re.I)
 # Client-side keys that are public by design (Supabase publishable and anon keys,
 # Turnstile site keys, NEXT_PUBLIC_/PUBLIC_ variables), and names that announce a test fixture.
 PUBLIC_NAME = re.compile(r"^(?:NEXT_|VITE_)?PUBLIC_|PUBLISHABLE|ANON_KEY$|SITE_KEY$|FAKE|DUMMY|EXAMPLE")
@@ -70,6 +75,13 @@ def token_shaped(value: str) -> bool:
     if re.fullmatch(r"[A-Z0-9_]+", value) or PLACEHOLDER.search(value):
         return False
     return bool(re.search(r"[0-9]", value) and re.search(r"[A-Za-z]", value)) and len(set(value)) >= 10
+
+
+def password_shaped(value: str) -> bool:
+    """A value a person might use as a password, not a variable, path, call or type name."""
+    if len(value) < 8 or value[0] in "$<{%/~." or value.startswith(("op://", "http")) or "(" in value:
+        return False
+    return not PLACEHOLDER.search(value) and bool(re.search(r"[0-9]", value) and re.search(r"[A-Za-z]", value))
 
 
 def live_values() -> list[tuple[str, str]]:
@@ -119,12 +131,23 @@ def resolve(session_id: str | None, transcript: str | None, cwd: Path) -> tuple[
 
 def strings(node) -> list[str]:
     if isinstance(node, str):
+        # An MCP tool returns JSON as text, so a transcript holds JSON inside a
+        # JSON string. One decode leaves that text's newlines as backslash-n,
+        # which glues a "PW:" label to the end of the line before it.
+        if node.lstrip()[:1] in ("{", "["):
+            try:
+                return strings(json.loads(node))
+            except ValueError:
+                pass
         return [node]
     if isinstance(node, dict):
         # Keep the key beside a string value: a tool call's input object
         # {"API_KEY": "..."} has to read as API_KEY: ... for the assign rule.
-        return [f"{k}: {v}" if isinstance(v, str) else s
-                for k, v in node.items() for s in ([v] if isinstance(v, str) else strings(v))]
+        out = []
+        for k, v in node.items():
+            parts = strings(v)
+            out += [f"{k}: {v}"] if parts == [v] else parts
+        return out
     if isinstance(node, list):
         return [s for item in node for s in strings(item)]
     return []
@@ -173,6 +196,9 @@ def scan(files: list[Path], main_file: Path) -> tuple[list[tuple[str, str, Path,
                 for m in BEARER.finditer(line):
                     if token_shaped(m.group(1)):
                         add("bearer", "Authorization: Bearer", path, n)
+                for m in PASSWORD.finditer(line):
+                    if password_shaped(m.group(2)):
+                        add("passwd", m.group(1), path, n)
                 for name, value in live:
                     if value in line:
                         add("live", name, path, n)
@@ -203,7 +229,7 @@ def main() -> int:
     if not findings:
         print("SECRET_SCAN_CLEAN: no credential-shaped values found.")
         return 0
-    order = {"live": 0, "prefix": 1, "assign": 2, "bearer": 3}
+    order = {"live": 0, "prefix": 1, "assign": 2, "passwd": 3, "bearer": 4}
     print(f"SECRET_SCAN_FINDINGS: {len(findings)}. Values are never printed.")
     for kind, name, path, lines in sorted(findings, key=lambda f: (order[f[0]], f[1])):
         where = path.name if path == main_file else str(path.relative_to(main_file.with_suffix("")))
