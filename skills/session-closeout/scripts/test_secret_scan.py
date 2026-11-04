@@ -172,6 +172,25 @@ class SecretScanTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertIn("SECRET_SCAN_CLEAN", r.stdout)
 
+    def test_password_label_in_an_image_is_not_text(self):
+        # A PDF page saved beside the transcript as a JPEG: random bytes can spell "pw:".
+        self.write("s13", "nothing here")
+        side = self.project / "s13" / "tool-results" / "pdf-1"
+        side.mkdir(parents=True)
+        (side / "page-01.jpg").write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\n\x8aPw:" + typed_password().encode() + b"\x00\xff\xd9")
+        r = self.run_scan("--session-id", "s13")
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_too_deeply_nested_line_is_scanned_as_text(self):
+        bearer = rand(48)
+        depth = 5000  # past the JSON decoder's recursion limit
+        self.project.joinpath("s14.jsonl").write_text(
+            "[" * depth + json.dumps(f"curl -H 'Authorization: Bearer {bearer}'") + "]" * depth + "\n")
+        r = self.run_scan("--session-id", "s14")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("bearer", r.stdout)
+        self.assertNotIn(bearer[-12:], r.stdout)
+
     def test_unlistable_side_folder_is_an_error_not_clean(self):
         self.write("s10", "nothing here")
         sub = self.project / "s10" / "subagents"

@@ -159,8 +159,14 @@ def decoded(line: str) -> str:
     `cat .env` output and quoted assignments from a raw-line match."""
     try:
         return "\n".join(strings(json.loads(line)))
-    except ValueError:
+    except (ValueError, RecursionError):  # nested too deep to decode: scan it as text
         return line
+
+
+def binary(path: Path) -> bool:
+    """A NUL byte in the first 8 KB, as git decides; an image saved beside the transcript is binary."""
+    with path.open("rb") as fp:
+        return b"\0" in fp.read(8192)
 
 
 def scan(files: list[Path], main_file: Path) -> tuple[list[tuple[str, str, Path, list[int]]], list[Path]]:
@@ -176,6 +182,8 @@ def scan(files: list[Path], main_file: Path) -> tuple[list[tuple[str, str, Path,
     skipped = []
     for path in files:
         try:
+            # Random bytes can spell a two-letter label, so passwd reads text files only.
+            text = not binary(path)
             fp = path.open(errors="replace")
         except OSError:
             if path == main_file:
@@ -196,7 +204,7 @@ def scan(files: list[Path], main_file: Path) -> tuple[list[tuple[str, str, Path,
                 for m in BEARER.finditer(line):
                     if token_shaped(m.group(1)):
                         add("bearer", "Authorization: Bearer", path, n)
-                for m in PASSWORD.finditer(line):
+                for m in PASSWORD.finditer(line) if text else ():
                     if password_shaped(m.group(2)):
                         add("passwd", m.group(1), path, n)
                 for name, value in live:
