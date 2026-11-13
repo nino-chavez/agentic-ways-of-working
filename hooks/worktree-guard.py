@@ -342,9 +342,11 @@ def _strip_heredocs(command: str) -> str:
     `cat > notes <<'EOF'` as a command. An unbalanced quote in a body (`it's`)
     also made shlex raise, which failed the whole command open.
     """
+    lines = command.split("\n")
     out: list[str] = []
     pending: list[tuple[str, bool]] = []  # (delimiter, <<- strips leading tabs)
-    for line in command.split("\n"):
+    opened_at = 0  # index of the line whose markers are pending
+    for idx, line in enumerate(lines):
         if pending:
             delim, dash = pending[0]
             if (line.lstrip("\t") if dash else line) == delim:
@@ -352,10 +354,12 @@ def _strip_heredocs(command: str) -> str:
             continue
         out.append(line)
         pending = [(m.group(3), m.group(1) == "-") for m in _HEREDOC.finditer(line)]
+        opened_at = idx
     if pending:
         # The delimiter never came, so that `<<` was not a heredoc (`"a <<EOF"`
-        # in quotes, `$((a<<b))`). Dropping every later line would hide them.
-        return command
+        # in quotes, `$((a<<b))`). Keep what was stripped before it, and give
+        # back the lines it swallowed, still stripping real heredocs among them.
+        out.append(_strip_heredocs("\n".join(lines[opened_at + 1:])))
     return "\n".join(out)
 
 

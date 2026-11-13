@@ -310,6 +310,25 @@ class StatementSplittingTests(_TwoSessionRepo):
             with self.subTest(command=command):
                 self.assertEqual(self.bash("A", self.root, command)[0], "deny")
 
+    def test_an_unclosed_marker_keeps_closed_heredocs_stripped(self) -> None:
+        # Review of 273adc6: restoring the whole command un-stripped a closed
+        # body, its apostrophe made shlex raise, and the command failed open.
+        note = "cat > notes.md <<'EOF'\nit's done\nEOF"
+        deinit = f"git -C {self.worktree} submodule deinit --all"
+        for command in (
+            f"{note}\n{deinit}\necho $((1<<b))",       # closed heredoc, then a false marker
+            f"echo $((1<<b))\n{note}\n{deinit}",       # false marker, then a closed heredoc
+            f'{note}\n{deinit}\necho "a <<EOF"',
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.bash("A", self.root, command)[0], "deny")
+        # A closed body stays data on both sides of a false marker.
+        self.arrive("A", self.root)
+        self.arrive("B", self.root)
+        body = "cat > notes.md <<'EOF'\ngit commit -m x\nEOF"
+        self.assertEqual(self.bash("A", self.root, f"echo $((1<<b))\n{body}")[0], "allow")
+        self.assertEqual(self.bash("A", self.root, f"{body}\necho $((1<<b))")[0], "allow")
+
 
 class ContendedOpCoverageTests(_TwoSessionRepo):
     """The op set that stranded the operator merge. Both sessions in main."""
