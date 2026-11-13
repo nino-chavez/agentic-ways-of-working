@@ -21,7 +21,8 @@
 # argument to the full sha, and one that names no commit exits 1 with no review.
 #
 # Stubs `claude` (the thing that fails) and `osascript` (where a human would see
-# it), then asserts on the notification text, the file and the exit status.
+# it), then asserts on the notification text, the file, the review history and
+# the exit status.
 #
 #   bash git-hooks/claude-review-run.test.sh
 #   RUNNER=/path/to/other/claude-review-run.sh bash git-hooks/claude-review-run.test.sh
@@ -42,6 +43,8 @@ setup() {                       # $1 = stub body for `claude`
     > "$TMP/bin/osascript"
   chmod +x "$TMP/bin/claude" "$TMP/bin/osascript"
   export NOTIFY_LOG="$TMP/notify.log"; : > "$NOTIFY_LOG"
+  # Keep test history out of the real per-user state directory.
+  export CLAUDE_REVIEW_HISTORY_DIR="$TMP/history"
   git -C "$TMP/repo" init -q
   git -C "$TMP/repo" -c user.email=t@t -c user.name=t \
       -c core.hooksPath="$TMP/nohooks" commit -q --allow-empty -m "test commit"
@@ -94,6 +97,42 @@ check_verdict() { _run; _assert_eq "$1" "$FIRSTBODY" "$2" "first body line" "$3"
 check_counts()  { _run; _assert_eq "$1" "$NVERDICT/$NPASS" "$2" "verdict-lines/pass-lines" "$3"; }
 # assert on what the person who ran it by hand is told
 check_err()     { _run; _assert "$1" "$ERR" "$2" "stderr" "$3"; }
+
+_history() {
+  HISTORY="$CLAUDE_REVIEW_HISTORY_DIR/history.tsv"
+  if [ -f "$HISTORY" ]; then
+    HCOUNT="$(wc -l < "$HISTORY" | tr -d ' ')"
+    HFIELDS="$(awk -F '\t' 'NR == 1 { print NF }' "$HISTORY")"
+    HREPO="$(awk -F '\t' 'NR == 1 { print $2 }' "$HISTORY")"
+    HSHA="$(awk -F '\t' 'NR == 1 { print $3 }' "$HISTORY")"
+    HVERDICT="$(awk -F '\t' 'NR == 1 { print $4 }' "$HISTORY")"
+    HFILE="$(awk -F '\t' 'NR == 1 { print $5 }' "$HISTORY")"
+  else
+    HCOUNT= HFIELDS= HREPO= HSHA= HVERDICT= HFILE=
+  fi
+}
+
+check_pass_history() {
+  _run; _history
+  if [ "$HCOUNT/$HFIELDS/$HREPO/$HSHA/$HVERDICT/$HFILE" = "1/5/repo/$SHA/PASS/" ] && \
+     [ ! -e "$CLAUDE_REVIEW_HISTORY_DIR/reviews/repo/$SHA.md" ]; then
+    GOT=kept
+  else
+    GOT="${HCOUNT:-missing}/${HFIELDS:-missing}/${HREPO:-missing}/${HSHA:-missing}/${HVERDICT:-missing}/${HFILE:-unexpected}"
+  fi
+  _assert_eq "$1" "$GOT" "kept" "history.tsv" 0
+}
+
+check_kept_history() {          # name, verdict, expected exit
+  _run; _history
+  if [ "$HCOUNT/$HFIELDS/$HREPO/$HSHA/$HVERDICT" = "1/5/repo/$SHA/$2" ] && \
+     [ -f "$HFILE" ] && grep -Fqx "VERDICT: $2 $SHA" "$HFILE"; then
+    GOT=kept
+  else
+    GOT="${HCOUNT:-missing}/${HFIELDS:-missing}/${HREPO:-missing}/${HSHA:-missing}/${HVERDICT:-missing}/${HFILE:-missing}"
+  fi
+  _assert_eq "$1" "$GOT" "kept" "history.tsv and saved review" "$3"
+}
 
 echo "claude-review-run.sh — failure signalling"
 
@@ -219,6 +258,63 @@ setup 'echo "VERDICT: PASS"; exit 0'
 SHA_ARG=deadbeef
 check_err "a sha that names no commit says so" "'deadbeef' is not a commit" 1
 unset SHA_ARG; teardown
+
+echo
+echo "claude-review-run.sh — review history"
+
+setup 'echo "VERDICT: PASS"; exit 0'
+check_pass_history "PASS appends five fields with no saved review"
+teardown
+
+setup 'printf "VERDICT: CHANGES\n\n- src/a.ts:12 off-by-one\n"; exit 0'
+check_kept_history "CHANGES keeps the finished review" CHANGES 0
+teardown
+
+setup 'echo "Looks good to me!"; exit 0'
+check_kept_history "INVALID keeps the finished review" INVALID 2
+teardown
+
+setup 'echo "boom: model overloaded" >&2; exit 1'
+check_kept_history "FAILED keeps the finished review" FAILED 1
+teardown
+
+setup 'echo "VERDICT: PASS"; exit 0'
+_run; _run
+if [ -f "$CLAUDE_REVIEW_HISTORY_DIR/history.tsv" ]; then
+  HCOUNT="$(wc -l < "$CLAUDE_REVIEW_HISTORY_DIR/history.tsv" | tr -d ' ')"
+else
+  HCOUNT=
+fi
+_assert_eq "two reviews append two history rows" "$HCOUNT" 2 "history.tsv rows" 0
+teardown
+
+setup 'echo "VERDICT: PASS"; exit 0'
+CLAUDE_REVIEW_DRY=1 _run
+if [ ! -e "$CLAUDE_REVIEW_HISTORY_DIR" ]; then GOT=none; else GOT=created; fi
+_assert_eq "a dry run creates no history directory" "$GOT" none "history directory" 0
+teardown
+
+setup 'echo "VERDICT: PASS"; exit 0'
+git -C "$TMP/repo" worktree add -q -b review-history-test "$TMP/worktree"
+PATH="$TMP/bin:$PATH" bash "$RUNNER" "$TMP/worktree" "$SHA" >/dev/null 2>"$TMP/stderr"
+RC=$?
+if [ -f "$CLAUDE_REVIEW_HISTORY_DIR/history.tsv" ]; then
+  HREPO="$(awk -F '\t' 'NR == 1 { print $2 }' "$CLAUDE_REVIEW_HISTORY_DIR/history.tsv")"
+else
+  HREPO=
+fi
+git -C "$TMP/repo" worktree remove --force "$TMP/worktree"
+_assert_eq "a linked worktree records its main repository name" "$HREPO" repo "history.tsv repo" 0
+teardown
+
+setup 'echo "VERDICT: PASS"; exit 0'
+_run
+BASE_RC=$RC; BASE_MD=$MD
+: > "$TMP/history-file"
+export CLAUDE_REVIEW_HISTORY_DIR="$TMP/history-file/blocked"
+_run
+_assert_eq "an unwritable history leaves the review unchanged" "$RC/$MD" "$BASE_RC/$BASE_MD" "exit and last-review.md" 0
+teardown
 
 echo
 echo "  ${pass} passed, ${fail} failed"

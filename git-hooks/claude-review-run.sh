@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Background worker: reviews a single commit with Claude Code, billed to the
 # logged-in Claude subscription, and writes the result to <git-dir>/last-review.md.
+# Every finished review also appends a machine-readable row to history.tsv in
+# CLAUDE_REVIEW_HISTORY_DIR, keeping non-PASS reviews there as separate files.
 #
 # Args: <repo-toplevel> <commit-sha> [lock-dir]
 #   The sha may be short or any commit-ish; it is resolved to the full sha
@@ -70,6 +72,27 @@ notify() {  # title, body — best-effort, cross-platform
 # The reviewer's text, with any line of its own that looks like a verdict quoted,
 # so the one VERDICT line this script writes is the only one a grep can find.
 quoted_body() { sed 's/^VERDICT:/> VERDICT:/' "$BODY"; }
+
+record_history() {              # verdict — never changes review behavior
+  local history_dir common_dir repo_name repo_top review_file
+  history_dir="${CLAUDE_REVIEW_HISTORY_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-review}"
+  mkdir -p "$history_dir" 2>/dev/null || return 0
+  history_dir="$(cd "$history_dir" 2>/dev/null && pwd -P)" || return 0
+  common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
+  case "$common_dir" in
+    */.git) repo_name="$(basename "$(dirname "$common_dir")")" ;;
+    *)
+      repo_top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+      repo_name="$(basename "$repo_top")" ;;
+  esac
+  review_file=
+  if [ "$1" != PASS ]; then
+    mkdir -p "$history_dir/reviews/$repo_name" 2>/dev/null || return 0
+    review_file="$history_dir/reviews/$repo_name/$SHA.md"
+    cp "$OUT" "$review_file" 2>/dev/null || return 0
+  fi
+  { printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$repo_name" "$SHA" "$1" "$review_file" >> "$history_dir/history.tsv"; } 2>/dev/null || true
+}
 
 {
   echo "# Claude review — ${SHORT}"
@@ -152,6 +175,7 @@ else
     echo "_(review failed — ${WHERE})_"
   } >> "$OUT"
   rm -f "$BODY"
+  record_history FAILED
   case "$ERRLINE" in
     *uthenticat*|*OAuth*|*oauth*|*"ogged out"*|*"og in"*)
       # Machine state, not a bad commit. Every later commit fails the same way
@@ -189,6 +213,7 @@ if [ "$VERDICT" = INVALID ]; then
     quoted_body
   } >> "$OUT"
   rm -f "$BODY"
+  record_history INVALID
   notify "Claude review INVALID — no verdict line" \
          "$(basename "$REPO") ${SHORT}: review text saved, but it cannot be read as PASS"
   exit 2
@@ -201,6 +226,7 @@ fi
   sed '/./,$!d' "$BODY" | tail -n +2 | sed 's/^VERDICT:/> VERDICT:/'
 } >> "$OUT"
 rm -f "$BODY"
+record_history "$VERDICT"
 
 if [ "$VERDICT" = PASS ]; then
   notify "Claude review" "$(basename "$REPO") ${SHORT}: looks good (VERDICT: PASS)"
