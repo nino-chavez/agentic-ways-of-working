@@ -57,12 +57,27 @@ Effective-repo resolution: the guard does not blindly use the session cwd. It
 walks the shell command, tracking `cd <dir>` and honoring `git -C <dir>`, so a
 command like `cd ~/other-repo && git commit` is judged against ~/other-repo —
 not the session's repo. A commit in an uncontended repo is never blocked just
-because the *session* happens to live in a busy one.
+because the *session* happens to live in a busy one. Statements split on
+newlines and on separators glued to a word (`cd x;git`), heredoc bodies are
+data and are dropped, a `$(...)` or backtick substitution is checked as a
+command of its own, and a statement may open with `(`, `{` or a reserved word
+such as `do` or `then`. Until 2026-11-13 any git call after a newline was
+invisible to every check.
 
 Fail-open by design: anything uncertain (not a git repo, git error, unparseable
 command, malformed payload) results in *allow*. A guard that blocks legitimate
 solo work gets ripped out; this one only blocks when it is certain the
 preconditions hold. Per-repo escape hatch: a `.guard-off` file in the lock dir.
+
+One exception fails closed. A `-C` or `cd` target the guard cannot evaluate
+(`$W`, `${W}`, `$(...)`, backticks, an unknown `~user`) leaves the target
+unknown. For `submodule deinit` that is a deny: the damage needs no second
+session, the op is rare, and a false positive costs one re-run with a literal
+path. On 2026-11-13 `W=<worktree>; git -C $W submodule deinit --all` went
+through and de-registered every dotfiles submodule. The occupancy and branch
+checks stay fail-open on an unknown target. Both need a second live session in
+that same repo, which cannot be looked up without the path, and denying every
+`git -C "$X" commit` would block routine solo work.
 
 Pure stdlib, no external deps, degrades quietly outside git repos. Wire via
 settings.json (the repo's install.sh does this):
@@ -89,7 +104,17 @@ ROLE_ENV = "CLAUDE_GUARD_ROLE"  # a session may declare itself non-contending
 READONLY_ROLE = "readonly"
 
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_SEPARATORS = {"&&", "||", ";", "|", "|&", "&"}
+# Characters the tokenizer returns as their own tokens. A run of them (`&&`,
+# `;\n`, `\n\n`) comes back as one token, and any such token ends a statement.
+_SEPARATOR_CHARS = ";&|\n"
+# Words that open a statement without being its command: `do git ...` in a loop,
+# `then git ...`, `( cd x && git ...)`, `{ git ...; }`.
+_STATEMENT_PREFIXES = {"do", "then", "else", "elif", "if", "while", "until", "!", "{", "(", "time"}
+# `<<EOF`, `<<-EOF`, `<< 'EOF'`, `<<"EOF"`, `<<\EOF`; not the here-string `<<<`.
+_HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)\\?([A-Za-z_][A-Za-z0-9_]*)\2")
+# A placeholder left by _mask_substitutions: `$(subst3)` or `` `subst3` ``.
+_SUBST_REF = re.compile(r"\$\(subst(\d+)\)|`subst(\d+)`")
+_MAX_SUBST_DEPTH = 16
 _GLOBAL_OPTS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
 
 # Subcommands that rewrite HEAD, the index, or the working tree unconditionally.
@@ -286,26 +311,146 @@ def remove_lock(ld: Path, session_id: str) -> None:
 
 # --- shell command analysis: effective repo per git invocation ---------------
 
-def _resolve_dir(base: str, target: str) -> str:
+def _unresolvable(target: str) -> bool:
+    """True when the shell would expand `target` in a way the guard cannot.
+
+    `$W`, `${W}`, `$(...)` and backticks need the shell's state; a `~user`
+    that does not exist here stays literal after expanduser.
+    """
+    return "$" in target or "`" in target or os.path.expanduser(target).startswith("~")
+
+
+def _resolve_dir(base: str | None, target: str) -> str | None:
+    """`target` as an absolute path, or None when it cannot be known.
+
+    A relative target under an unknown base is unknown too; an absolute one
+    recovers.
+    """
+    if _unresolvable(target):
+        return None
     t = os.path.expanduser(target)
     if not os.path.isabs(t):
+        if base is None:
+            return None
         t = os.path.join(base, t)
     return os.path.normpath(t)
 
 
-def _statements(command: str) -> list[list[str]] | None:
-    """Tokenize and split into statements on shell separators.
+def _strip_heredocs(command: str) -> str:
+    """Drop heredoc bodies: they are data, not statements.
 
-    Returns None on a tokenization failure (caller fails open).
+    Splitting on newlines would otherwise read a `git commit` line inside
+    `cat > notes <<'EOF'` as a command. An unbalanced quote in a body (`it's`)
+    also made shlex raise, which failed the whole command open.
     """
+    lines = command.split("\n")
+    out: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        out.append(lines[i])
+        body_start = i + 1
+        # Bodies follow the opening line in marker order. A marker whose
+        # delimiter never comes is not a heredoc (`"a <<EOF"` in quotes,
+        # `$((a<<b))`) and swallows nothing, so the lines after it are still
+        # judged, and a real heredoc on the same line is still stripped.
+        for m in _HEREDOC.finditer(lines[i]):
+            delim, dash = m.group(3), m.group(1) == "-"
+            k = body_start
+            while k < n and (lines[k].lstrip("\t") if dash else lines[k]) != delim:
+                k += 1
+            if k < n:
+                body_start = k + 1
+        i = body_start
+    return "\n".join(out)
+
+
+def _mask_substitutions(command: str) -> tuple[str, list[str]]:
+    """Replace each outermost `...` and $(...) with an indexed opaque word.
+
+    Returns (masked command, bodies). Their contents run in a subshell: a `cd`
+    there never moves the outer shell, and a `|` or `;` inside must not split
+    the outer statement (a backticked `-C` target holding a pipe made a deinit
+    look like no deinit at all). The placeholder keeps its `$` or backtick, so a
+    target built from one stays unresolvable; `_git_targets` analyzes each body
+    as a command of its own. An unbalanced $( or backtick is left as written,
+    and a backtick pair never spans lines, so a stray one cannot swallow
+    statements.
+    """
+    out: list[str] = []
+    bodies: list[str] = []
+    i, n = 0, len(command)
+    while i < n:
+        if command.startswith("$(", i):
+            depth, j = 0, i + 1
+            while j < n:
+                if command[j] == "(":
+                    depth += 1
+                elif command[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            if j < n:
+                bodies.append(command[i + 2:j])
+                out.append(f"$(subst{len(bodies) - 1})")
+                i = j + 1
+                continue
+        elif command[i] == "`":
+            j = command.find("`", i + 1)
+            if j != -1 and "\n" not in command[i + 1:j]:
+                bodies.append(command[i + 1:j])
+                out.append(f"`subst{len(bodies) - 1}`")
+                i = j + 1
+                continue
+        out.append(command[i])
+        i += 1
+    return "".join(out), bodies
+
+
+def _subst_refs(token: str, bodies: list[str]) -> list[re.Match]:
+    """Placeholders in `token` that index a real body.
+
+    A literal `$(subst9` the user typed is left unmasked when unbalanced, so an
+    index is checked rather than trusted.
+    """
+    return [m for m in _SUBST_REF.finditer(token) if _subst_index(m) < len(bodies)]
+
+
+def _subst_index(m: re.Match) -> int:
+    return int(m.group(1) if m.group(1) is not None else m.group(2))
+
+
+def _unmask(token: str, bodies: list[str]) -> str:
+    """A token with its substitution placeholders written back, for messages."""
+    for m in reversed(_subst_refs(token, bodies)):
+        body = bodies[_subst_index(m)]
+        text = f"$({body})" if m.group(1) is not None else f"`{body}`"
+        token = token[:m.start()] + text + token[m.end():]
+    return token
+
+
+def _statements(command: str) -> tuple[list[list[str]], list[str]] | None:
+    """Tokenize and split into statements on shell separators and newlines.
+
+    Returns (statements, substitution bodies), or None on a tokenization
+    failure (caller fails open).
+    """
+    # Heredocs first: a `$(cat <<'EOF' ... EOF)` commit message body may hold
+    # unbalanced parens that would throw off the substitution scan.
+    command = _strip_heredocs(command).replace("\\\n", "")  # join continuations
+    command, bodies = _mask_substitutions(command)
+    lex = shlex.shlex(command, posix=True, punctuation_chars=_SEPARATOR_CHARS)
+    lex.whitespace_split = True
+    lex.whitespace = " \t\r"  # newline is a separator, not whitespace
+    lex.commenters = ""  # shlex.split's default; `#` mid-word is not a comment
     try:
-        tokens = shlex.split(command)
+        tokens = list(lex)
     except ValueError:
         return None
     stmts: list[list[str]] = []
     cur: list[str] = []
     for t in tokens:
-        if t in _SEPARATORS:
+        if t and all(c in _SEPARATOR_CHARS for c in t):
             if cur:
                 stmts.append(cur)
                 cur = []
@@ -313,44 +458,71 @@ def _statements(command: str) -> list[list[str]] | None:
             cur.append(t)
     if cur:
         stmts.append(cur)
-    return stmts
+    return stmts, bodies
 
 
-def _git_targets(command: str, base_dir: str) -> list[tuple[str, list[str]]] | None:
-    """For each `git ...` invocation, the (effective_dir, git_args) it runs with.
+def _git_targets(
+    command: str, base_dir: str | None, base_raw: str | None = None, depth: int = 0
+) -> list[tuple[str | None, list[str], str | None]] | None:
+    """For each `git ...` invocation: (effective_dir, git_args, unresolved_token).
 
-    Tracks `cd <dir>` across `&&`/`;`-separated statements and honors `git -C
-    <dir>`, so the directory each git call actually operates in is resolved
-    rather than assumed to be the session cwd. Returns None on parse failure.
+    Tracks `cd <dir>` across statements and honors `git -C <dir>`, so the
+    directory each git call actually operates in is resolved rather than
+    assumed to be the session cwd. effective_dir is None when a shell expansion
+    hides it; unresolved_token is then the `-C` or `cd` value responsible.
+    A command substitution is analyzed as its own command, starting in the
+    directory the outer shell is in when it runs. Returns None on parse failure.
     """
-    stmts = _statements(command)
-    if stmts is None:
+    parsed = _statements(command)
+    if parsed is None:
         return None
-    targets: list[tuple[str, list[str]]] = []
-    cur = base_dir
+    stmts, bodies = parsed
+    targets: list[tuple[str | None, list[str], str | None]] = []
+    cur: str | None = base_dir
+    cur_raw: str | None = base_raw  # the cd target that made `cur` unknown
     for st in stmts:
-        # Skip leading env-assignment prefixes (FOO=bar git ...).
+        # Substitutions run before the statement that holds them. Past
+        # _MAX_SUBST_DEPTH levels of nesting a body stays opaque: unbounded
+        # recursion would hit Python's limit and crash the hook, which allows.
+        for tok in st if depth < _MAX_SUBST_DEPTH else ():
+            for m in _subst_refs(tok, bodies):
+                inner = _git_targets(bodies[_subst_index(m)], cur, cur_raw, depth + 1)
+                targets += inner or []
+        # Skip env-assignment prefixes (FOO=bar git ...) and statement openers.
         k = 0
-        while k < len(st) and _ENV_ASSIGN.match(st[k]):
+        while k < len(st) and (_ENV_ASSIGN.match(st[k]) or st[k] in _STATEMENT_PREFIXES):
             k += 1
         if k >= len(st):
             continue
-        head = st[k]
+        head = st[k].lstrip("(")  # `(cd x && git ...)` tokenizes as "(cd"
         rest = st[k + 1:]
         if head == "cd":
             target = next((a for a in rest if not a.startswith("-")), None)
             if target is not None:
                 cur = _resolve_dir(cur, target)
+                if cur is None:
+                    cur_raw = _unmask(target, bodies) if _unresolvable(target) else cur_raw
+                else:
+                    cur_raw = None
         elif head == "git" or head.endswith("/git"):
-            eff = cur
+            eff, raw = cur, cur_raw
             j = 0
-            while j < len(rest):  # honor a -C <path> override for this call
-                if rest[j] == "-C" and j + 1 < len(rest):
-                    eff = _resolve_dir(cur, rest[j + 1])
+            while j < len(rest):  # global options only: `commit -C <rev>` is not a dir
+                a = rest[j]
+                if a in _GLOBAL_OPTS_WITH_VALUE:
+                    if a == "-C" and j + 1 < len(rest):  # each -C is relative to the last
+                        value = rest[j + 1]
+                        eff = _resolve_dir(eff, value)
+                        if eff is None:
+                            raw = _unmask(value, bodies) if _unresolvable(value) else raw
+                        else:
+                            raw = None
                     j += 2
                     continue
+                if not a.startswith("-"):
+                    break  # the subcommand
                 j += 1
-            targets.append((eff, rest))
+            targets.append((eff, rest, raw))
     return targets
 
 
@@ -476,7 +648,7 @@ def in_progress_op(git_dir: str) -> tuple[str, str] | None:
 def is_contended(command: str) -> bool:
     """Convenience wrapper: does the command contain any contended git op?"""
     targets = _git_targets(command, "/")
-    return bool(targets) and any(_is_contended_args(args, eff) for eff, args in targets)
+    return bool(targets) and any(_is_contended_args(args, eff) for eff, args, _ in targets)
 
 
 # --- edit-tool target resolution ---------------------------------------------
@@ -580,6 +752,23 @@ def deny_reason_edit(others: list[dict], repo_dir: str, ld: Path, path: str, ctx
     return "\n".join(lines)
 
 
+def _deinit_safe_route(worktree: str, main: str, base: str) -> list[str]:
+    """The worktree-removal route that leaves the shared config alone."""
+    return [
+        "If you are removing a worktree: `git worktree remove` refuses one with",
+        "initialized submodules, and deinit does not change that. Instead:",
+        "",
+        f"  git -C {worktree} status --porcelain      # must print nothing",
+        f"  git -C {worktree} cherry {base} HEAD      # no '+' lines: every commit is in {base}",
+        f"  git -C {main} worktree remove --force {worktree}",
+        "",
+        "--force also discards uncommitted work, which is why both checks come first.",
+        "If the main checkout already shows '-' in `git submodule status`, re-register it:",
+        "",
+        f"  git -C {main} submodule init",
+    ]
+
+
 def deny_reason_deinit(repo_dir: str, ctx: dict) -> str:
     # Paste-ready, like suggest_worktree: real paths and the remote's default
     # branch, so the safe route needs no template filling.
@@ -594,17 +783,28 @@ def deny_reason_deinit(repo_dir: str, ctx: dict) -> str:
         "It deletes the submodule.* entries, so the main checkout and every other worktree",
         "lose their submodule registration too, even with no other session running.",
         "",
-        "If you are removing this worktree: `git worktree remove` refuses one with",
-        "initialized submodules, and deinit does not change that. Instead:",
+        *_deinit_safe_route(worktree, main, base),
+    ])
+
+
+def deny_reason_deinit_unresolved(token: str | None) -> str:
+    # No repo is known here, so nothing is resolved through git and the safe
+    # route keeps placeholders. Naming the token tells the agent what to replace.
+    where = f"`{token}`" if token else "a shell expansion"
+    return "\n".join([
+        "Worktree isolation guard: BLOCKED (submodule deinit, target directory unknown).",
         "",
-        f"  git -C {worktree} status --porcelain      # must print nothing",
-        f"  git -C {worktree} cherry {base} HEAD      # no '+' lines: every commit is in {base}",
-        f"  git -C {main} worktree remove --force {worktree}",
+        f"This `git submodule deinit` runs in a directory given by {where}, which the guard",
+        "cannot expand, so it cannot tell whether the target is a linked worktree. In a",
+        "linked worktree, deinit deletes the submodule.* entries from the repository's",
+        "SHARED .git/config, and the main checkout and every other worktree lose their",
+        "submodule registration (dotfiles, 2026-11-13, through `git -C $W`).",
         "",
-        "--force also discards uncommitted work, which is why both checks come first.",
-        "If the main checkout already shows '-' in `git submodule status`, re-register it:",
+        "Re-run with the literal absolute path (`git -C /abs/path ...`). Deinit in a main",
+        "checkout is then allowed; in a linked worktree the guard denies it again and",
+        "prints the route below with real paths filled in.",
         "",
-        f"  git -C {main} submodule init",
+        *_deinit_safe_route("<worktree>", "<main-checkout>", "origin/HEAD"),
     ])
 
 
@@ -779,7 +979,14 @@ def cmd_check(payload: dict) -> None:
     targets = _git_targets(command, cwd)
     if not targets:
         allow()  # no git op, or parse failure => fail open
-    for eff_dir, args in targets:
+    for eff_dir, args, unresolved in targets:
+        if eff_dir is None:
+            # Target hidden behind a shell expansion. Deinit fails closed; the
+            # other checks need a repo's locks to read, so they fail open (see
+            # the module docstring for why the two differ).
+            if _is_submodule_deinit(args):
+                deny(deny_reason_deinit_unresolved(unresolved))
+            continue
         tctx = repo_context(eff_dir)
         if tctx is None:
             continue  # not a repo => allow

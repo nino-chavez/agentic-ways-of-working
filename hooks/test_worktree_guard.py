@@ -182,6 +182,165 @@ class SubmoduleDeinitTests(_TwoSessionRepo):
         self.assertEqual(self.bash("A", self.worktree, "git submodule deinit --all")[0], "allow")
 
 
+class UnresolvedDeinitTargetTests(_TwoSessionRepo):
+    """A deinit whose directory hides behind a shell expansion fails closed.
+
+    The incident (dotfiles, 2026-11-13): from a session cwd outside any repo,
+    `W=<worktree>; git -C $W submodule deinit --all -q` was allowed while the
+    same command with the literal path was denied. It de-registered all three
+    dotfiles submodules.
+    """
+
+    def outside(self) -> Path:
+        plain = Path(self.temporary.name) / "workspace"
+        plain.mkdir(exist_ok=True)
+        return plain
+
+    def test_incident_form_is_denied_from_outside_any_repo(self) -> None:
+        command = f"W={self.worktree}; git -C $W submodule deinit --all -q"
+        decision, reason = self.bash("A", self.outside(), command)
+        self.assertEqual(decision, "deny")
+        self.assertIn("`$W`", reason)
+        self.assertIn("literal absolute path", reason)
+        self.assertIn("worktree remove --force <worktree>", reason)
+
+    def test_every_expansion_form_is_denied(self) -> None:
+        for command in (
+            f'W={self.worktree} && git -C "$W" submodule deinit --all',
+            "git -C ${W} submodule deinit --all",
+            'git -C "$(git worktree list | tail -1)" submodule deinit --all',
+            "git -C $(git worktree list | tail -1) submodule deinit --all",
+            "git -C `git worktree list | tail -1` submodule deinit --all",
+            "git -C ~no-such-user-zz/wt submodule deinit --all",
+            f"W={self.worktree}; cd $W && git submodule deinit --all",
+            'cd "$W"; git submodule --quiet deinit -f vendor/x',
+            "cd $W && cd vendor && git submodule deinit --all",  # relative under unknown
+            "for w in $(git worktree list); do git -C $w submodule deinit --all; done",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.bash("A", self.outside(), command)[0], "deny")
+
+    def test_message_names_the_expansion_as_written(self) -> None:
+        command = "git -C $(git worktree list | tail -1) submodule deinit --all"
+        _, reason = self.bash("A", self.outside(), command)
+        self.assertIn("`$(git worktree list | tail -1)`", reason)
+
+    def test_a_literal_absolute_path_recovers(self) -> None:
+        # Deinit in the main checkout stays allowed once the path is literal.
+        for command in (
+            f"cd $X; cd {self.root} && git submodule deinit --all",
+            f"cd $X && git -C {self.root} submodule deinit --all",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.bash("A", self.outside(), command)[0], "allow")
+
+    def test_other_checks_stay_fail_open_on_an_unknown_target(self) -> None:
+        # Occupancy and branch ownership need the target repo's locks, so an
+        # unknown target allows them, even with both sessions in main.
+        self.arrive("A", self.root)
+        self.arrive("B", self.root)
+        for command in ("git -C $R commit -m x", 'git -C "$R" merge main'):
+            with self.subTest(command=command):
+                self.assertEqual(self.bash("A", self.root, command)[0], "allow")
+
+
+class StatementSplittingTests(_TwoSessionRepo):
+    """Every git call in a command is judged, not only the first line's.
+
+    shlex.split read newlines as plain whitespace and kept `;` glued to its
+    word, so `cd <worktree>; git submodule deinit --all` and anything after a
+    newline never reached a check.
+    """
+
+    def test_deinit_is_seen_wherever_it_sits(self) -> None:
+        wt = self.worktree
+        for command in (
+            f'W={wt}\ngit -C "$W" status --porcelain\ngit -C "$W" submodule deinit --all',
+            f"cd {wt}\ngit submodule deinit --all",
+            f"echo removing\ngit -C {wt} submodule deinit --all",
+            f"cd {wt}; git submodule deinit --all",
+            f"cd {wt}&&git submodule deinit --all",
+            f"(cd {wt} && git submodule deinit --all)",
+            f"for w in {wt}; do git -C $w submodule deinit --all; done",
+            f"git -C {wt} \\\n  submodule deinit --all",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.bash("A", self.root, command)[0], "deny")
+
+    def test_contended_op_after_a_newline_is_denied(self) -> None:
+        self.arrive("A", self.root)
+        self.arrive("B", self.root)
+        self.assertEqual(self.bash("A", self.root, "echo hi\ngit commit -m x")[0], "deny")
+
+    def test_heredoc_bodies_are_data(self) -> None:
+        self.arrive("A", self.root)
+        self.arrive("B", self.root)
+        note = "cat > notes.md <<'EOF'\ngit commit -m x\nEOF"
+        self.assertEqual(self.bash("A", self.root, note)[0], "allow")
+        note = "cat > notes.md <<-EOF\n\tgit submodule deinit --all\n\tEOF"
+        self.assertEqual(self.bash("C", self.worktree, note)[0], "allow")
+        # A body with an apostrophe used to make shlex raise and fail the whole
+        # command open; the statement after the heredoc must still be judged.
+        command = f"cat > notes.md <<EOF\nit's data\nEOF\ngit -C {self.worktree} submodule deinit --all"
+        self.assertEqual(self.bash("C", self.root, command)[0], "deny")
+
+    def test_cd_inside_a_substitution_does_not_move_the_shell(self) -> None:
+        command = f"x=$(cd {self.worktree}; pwd); git submodule deinit --all"
+        self.assertEqual(self.bash("A", self.root, command)[0], "allow")
+
+    def test_git_inside_a_substitution_is_checked(self) -> None:
+        # The spaced form was caught before substitutions became opaque words;
+        # each body is now checked as its own command, from the outer dir.
+        wt = self.worktree
+        for cwd, command in (
+            (wt, "echo $(true ; git submodule deinit --all)"),
+            (wt, "echo $(true; git submodule deinit --all)"),
+            (wt, "echo `git submodule deinit --all`"),
+            (self.root, f"x=$(cd {wt} && git submodule deinit --all)"),
+            (self.root, f"cd {wt} && x=$(git submodule deinit --all)"),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.bash("A", cwd, command)[0], "deny")
+
+    def test_deep_substitution_nesting_does_not_crash_the_hook(self) -> None:
+        # _run uses check=True, so a traceback exit fails this test.
+        nested = "echo " + "$(" * 1100 + "x" + ")" * 1100
+        command = f"{nested}\ngit -C {self.worktree} submodule deinit --all"
+        self.assertEqual(self.bash("A", self.root, command)[0], "deny")
+
+    def test_an_unclosed_heredoc_marker_hides_nothing(self) -> None:
+        # `<<` inside quotes or an arithmetic shift is not a heredoc; with no
+        # closing delimiter line, the lines after it must still be judged.
+        for first in ('echo "a <<EOF"', "echo $((1<<b))"):
+            command = f"{first}\ngit -C {self.worktree} submodule deinit --all"
+            with self.subTest(command=command):
+                self.assertEqual(self.bash("A", self.root, command)[0], "deny")
+
+    def test_an_unclosed_marker_keeps_closed_heredocs_stripped(self) -> None:
+        # Review of 273adc6: restoring the whole command un-stripped a closed
+        # body, its apostrophe made shlex raise, and the command failed open.
+        note = "cat > notes.md <<'EOF'\nit's done\nEOF"
+        deinit = f"git -C {self.worktree} submodule deinit --all"
+        for command in (
+            f"{note}\n{deinit}\necho $((1<<b))",       # closed heredoc, then a false marker
+            f"echo $((1<<b))\n{note}\n{deinit}",       # false marker, then a closed heredoc
+            f'{note}\n{deinit}\necho "a <<EOF"',
+            # Both on one line, either order (review of ba92cc0).
+            f"cat > n <<'EOF' && echo $((1<<b))\nit's\nEOF\n{deinit}",
+            f"echo $((1<<b)) && cat > n <<'EOF'\nit's\nEOF\n{deinit}",
+            # Many false markers: a recursive strip hit the recursion limit and crashed.
+            "echo $((1<<b))\n" * 1500 + deinit,
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.bash("A", self.root, command)[0], "deny")
+        # A closed body stays data on both sides of a false marker.
+        self.arrive("A", self.root)
+        self.arrive("B", self.root)
+        body = "cat > notes.md <<'EOF'\ngit commit -m x\nEOF"
+        self.assertEqual(self.bash("A", self.root, f"echo $((1<<b))\n{body}")[0], "allow")
+        self.assertEqual(self.bash("A", self.root, f"{body}\necho $((1<<b))")[0], "allow")
+
+
 class ContendedOpCoverageTests(_TwoSessionRepo):
     """The op set that stranded the operator merge. Both sessions in main."""
 
@@ -197,6 +356,9 @@ class ContendedOpCoverageTests(_TwoSessionRepo):
             "git pull", "git reset --hard HEAD~1", "git stash pop",
             "git checkout -b new", "git switch feat/x", "git branch new",
             "git checkout feat/x",
+            # -C after the subcommand reuses a commit message; it is not a
+            # directory, and reading it as one sent the commit to a non-repo.
+            "git commit -C HEAD",
         ):
             with self.subTest(command=command):
                 self.assertEqual(self.bash("A", self.root, command)[0], "deny")
@@ -209,6 +371,8 @@ class ContendedOpCoverageTests(_TwoSessionRepo):
             "git reset --soft HEAD~1", "git stash push", "git push",
             "git checkout -- tracked.txt", "git checkout tracked.txt",
             "git branch --list", "git branch -d old",
+            "git log -C -M", "git status 2>&1 | head",
+            "git log --format='%h;%s' && git status",
         ):
             with self.subTest(command=command):
                 self.assertEqual(self.bash("A", self.root, command)[0], "allow")
