@@ -220,6 +220,11 @@ class UnresolvedDeinitTargetTests(_TwoSessionRepo):
             with self.subTest(command=command):
                 self.assertEqual(self.bash("A", self.outside(), command)[0], "deny")
 
+    def test_message_names_the_expansion_as_written(self) -> None:
+        command = "git -C $(git worktree list | tail -1) submodule deinit --all"
+        _, reason = self.bash("A", self.outside(), command)
+        self.assertIn("`$(git worktree list | tail -1)`", reason)
+
     def test_a_literal_absolute_path_recovers(self) -> None:
         # Deinit in the main checkout stays allowed once the path is literal.
         for command in (
@@ -282,6 +287,28 @@ class StatementSplittingTests(_TwoSessionRepo):
     def test_cd_inside_a_substitution_does_not_move_the_shell(self) -> None:
         command = f"x=$(cd {self.worktree}; pwd); git submodule deinit --all"
         self.assertEqual(self.bash("A", self.root, command)[0], "allow")
+
+    def test_git_inside_a_substitution_is_checked(self) -> None:
+        # The spaced form was caught before substitutions became opaque words;
+        # each body is now checked as its own command, from the outer dir.
+        wt = self.worktree
+        for cwd, command in (
+            (wt, "echo $(true ; git submodule deinit --all)"),
+            (wt, "echo $(true; git submodule deinit --all)"),
+            (wt, "echo `git submodule deinit --all`"),
+            (self.root, f"x=$(cd {wt} && git submodule deinit --all)"),
+            (self.root, f"cd {wt} && x=$(git submodule deinit --all)"),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.bash("A", cwd, command)[0], "deny")
+
+    def test_an_unclosed_heredoc_marker_hides_nothing(self) -> None:
+        # `<<` inside quotes or an arithmetic shift is not a heredoc; with no
+        # closing delimiter line, the lines after it must still be judged.
+        for first in ('echo "a <<EOF"', "echo $((1<<b))"):
+            command = f"{first}\ngit -C {self.worktree} submodule deinit --all"
+            with self.subTest(command=command):
+                self.assertEqual(self.bash("A", self.root, command)[0], "deny")
 
 
 class ContendedOpCoverageTests(_TwoSessionRepo):

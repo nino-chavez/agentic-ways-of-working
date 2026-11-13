@@ -59,7 +59,8 @@ command like `cd ~/other-repo && git commit` is judged against ~/other-repo —
 not the session's repo. A commit in an uncontended repo is never blocked just
 because the *session* happens to live in a busy one. Statements split on
 newlines and on separators glued to a word (`cd x;git`), heredoc bodies are
-data and are dropped, and a statement may open with `(`, `{` or a reserved word
+data and are dropped, a `$(...)` or backtick substitution is checked as a
+command of its own, and a statement may open with `(`, `{` or a reserved word
 such as `do` or `then`. Until 2026-11-13 any git call after a newline was
 invisible to every check.
 
@@ -111,7 +112,8 @@ _SEPARATOR_CHARS = ";&|\n"
 _STATEMENT_PREFIXES = {"do", "then", "else", "elif", "if", "while", "until", "!", "{", "(", "time"}
 # `<<EOF`, `<<-EOF`, `<< 'EOF'`, `<<"EOF"`, `<<\EOF`; not the here-string `<<<`.
 _HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)\\?([A-Za-z_][A-Za-z0-9_]*)\2")
-_BACKTICK_SUBST = re.compile(r"`[^`\n]*`")  # one line at most: a stray backtick must not swallow statements
+# A placeholder left by _mask_substitutions: `$(subst3)` or `` `subst3` ``.
+_SUBST_REF = re.compile(r"\$\(subst(\d+)\)|`subst(\d+)`")
 _GLOBAL_OPTS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
 
 # Subcommands that rewrite HEAD, the index, or the working tree unconditionally.
@@ -350,20 +352,27 @@ def _strip_heredocs(command: str) -> str:
             continue
         out.append(line)
         pending = [(m.group(3), m.group(1) == "-") for m in _HEREDOC.finditer(line)]
+    if pending:
+        # The delimiter never came, so that `<<` was not a heredoc (`"a <<EOF"`
+        # in quotes, `$((a<<b))`). Dropping every later line would hide them.
+        return command
     return "\n".join(out)
 
 
-def _mask_substitutions(command: str) -> str:
-    """Collapse each `...` and $(...) to an opaque word.
+def _mask_substitutions(command: str) -> tuple[str, list[str]]:
+    """Replace each outermost `...` and $(...) with an indexed opaque word.
 
-    Their contents run in a subshell: a `cd` there never moves the outer shell,
-    and a `|` or `;` inside must not split the outer statement: a backticked
-    `-C` target holding a pipe made a deinit look like no deinit at all. The
-    placeholder keeps its `$` or backtick, so a target built from one stays
-    unresolvable. An unbalanced $( is left as written.
+    Returns (masked command, bodies). Their contents run in a subshell: a `cd`
+    there never moves the outer shell, and a `|` or `;` inside must not split
+    the outer statement (a backticked `-C` target holding a pipe made a deinit
+    look like no deinit at all). The placeholder keeps its `$` or backtick, so a
+    target built from one stays unresolvable; `_git_targets` analyzes each body
+    as a command of its own. An unbalanced $( or backtick is left as written,
+    and a backtick pair never spans lines, so a stray one cannot swallow
+    statements.
     """
-    command = _BACKTICK_SUBST.sub("`subst`", command)
     out: list[str] = []
+    bodies: list[str] = []
     i, n = 0, len(command)
     while i < n:
         if command.startswith("$(", i):
@@ -377,23 +386,54 @@ def _mask_substitutions(command: str) -> str:
                         break
                 j += 1
             if j < n:
-                out.append("$(subst)")
+                bodies.append(command[i + 2:j])
+                out.append(f"$(subst{len(bodies) - 1})")
+                i = j + 1
+                continue
+        elif command[i] == "`":
+            j = command.find("`", i + 1)
+            if j != -1 and "\n" not in command[i + 1:j]:
+                bodies.append(command[i + 1:j])
+                out.append(f"`subst{len(bodies) - 1}`")
                 i = j + 1
                 continue
         out.append(command[i])
         i += 1
-    return "".join(out)
+    return "".join(out), bodies
 
 
-def _statements(command: str) -> list[list[str]] | None:
+def _subst_refs(token: str, bodies: list[str]) -> list[re.Match]:
+    """Placeholders in `token` that index a real body.
+
+    A literal `$(subst9` the user typed is left unmasked when unbalanced, so an
+    index is checked rather than trusted.
+    """
+    return [m for m in _SUBST_REF.finditer(token) if _subst_index(m) < len(bodies)]
+
+
+def _subst_index(m: re.Match) -> int:
+    return int(m.group(1) if m.group(1) is not None else m.group(2))
+
+
+def _unmask(token: str, bodies: list[str]) -> str:
+    """A token with its substitution placeholders written back, for messages."""
+    for m in reversed(_subst_refs(token, bodies)):
+        body = bodies[_subst_index(m)]
+        text = f"$({body})" if m.group(1) is not None else f"`{body}`"
+        token = token[:m.start()] + text + token[m.end():]
+    return token
+
+
+def _statements(command: str) -> tuple[list[list[str]], list[str]] | None:
     """Tokenize and split into statements on shell separators and newlines.
 
-    Returns None on a tokenization failure (caller fails open).
+    Returns (statements, substitution bodies), or None on a tokenization
+    failure (caller fails open).
     """
     # Heredocs first: a `$(cat <<'EOF' ... EOF)` commit message body may hold
     # unbalanced parens that would throw off the substitution scan.
     command = _strip_heredocs(command).replace("\\\n", "")  # join continuations
-    command = _mask_substitutions(command)
+    command, bodies = _mask_substitutions(command)
     lex = shlex.shlex(command, posix=True, punctuation_chars=_SEPARATOR_CHARS)
     lex.whitespace_split = True
     lex.whitespace = " \t\r"  # newline is a separator, not whitespace
@@ -413,11 +453,11 @@ def _statements(command: str) -> list[list[str]] | None:
             cur.append(t)
     if cur:
         stmts.append(cur)
-    return stmts
+    return stmts, bodies
 
 
 def _git_targets(
-    command: str, base_dir: str
+    command: str, base_dir: str | None, base_raw: str | None = None
 ) -> list[tuple[str | None, list[str], str | None]] | None:
     """For each `git ...` invocation: (effective_dir, git_args, unresolved_token).
 
@@ -425,15 +465,20 @@ def _git_targets(
     directory each git call actually operates in is resolved rather than
     assumed to be the session cwd. effective_dir is None when a shell expansion
     hides it; unresolved_token is then the `-C` or `cd` value responsible.
-    Returns None on parse failure.
+    A command substitution is analyzed as its own command, starting in the
+    directory the outer shell is in when it runs. Returns None on parse failure.
     """
-    stmts = _statements(command)
-    if stmts is None:
+    parsed = _statements(command)
+    if parsed is None:
         return None
+    stmts, bodies = parsed
     targets: list[tuple[str | None, list[str], str | None]] = []
     cur: str | None = base_dir
-    cur_raw: str | None = None  # the cd target that made `cur` unknown
+    cur_raw: str | None = base_raw  # the cd target that made `cur` unknown
     for st in stmts:
+        for tok in st:  # substitutions run before the statement that holds them
+            for m in _subst_refs(tok, bodies):
+                targets += _git_targets(bodies[_subst_index(m)], cur, cur_raw) or []
         # Skip env-assignment prefixes (FOO=bar git ...) and statement openers.
         k = 0
         while k < len(st) and (_ENV_ASSIGN.match(st[k]) or st[k] in _STATEMENT_PREFIXES):
@@ -447,7 +492,7 @@ def _git_targets(
             if target is not None:
                 cur = _resolve_dir(cur, target)
                 if cur is None:
-                    cur_raw = target if _unresolvable(target) else cur_raw
+                    cur_raw = _unmask(target, bodies) if _unresolvable(target) else cur_raw
                 else:
                     cur_raw = None
         elif head == "git" or head.endswith("/git"):
@@ -460,7 +505,7 @@ def _git_targets(
                         value = rest[j + 1]
                         eff = _resolve_dir(eff, value)
                         if eff is None:
-                            raw = value if _unresolvable(value) else raw
+                            raw = _unmask(value, bodies) if _unresolvable(value) else raw
                         else:
                             raw = None
                     j += 2
