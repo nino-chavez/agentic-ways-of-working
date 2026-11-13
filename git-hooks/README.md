@@ -156,7 +156,7 @@ bash git-hooks/claude-review-run.test.sh
 ```
 
 Stubs `claude` and `osascript`, spends no quota, and asserts that a failed
-review says so and that every reply lands on one of the four verdict lines. It
+review says so and that every reply lands on one of the three verdict lines. It
 exists because the script used to notify "review ready" on *any* outcome other
 than "Looks good to me" — including an auth failure — so on 2026-08-30
 twenty-four unreviewed commits looked exactly like reviewed ones for sixteen
