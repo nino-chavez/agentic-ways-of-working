@@ -122,6 +122,33 @@ Added 2026-10-21; before it the only machine-readable signal was a grep for the
 phrase "Looks good to me", so a review with findings and a review that ignored
 the format looked the same to every script downstream.
 
+## Review history
+
+After writing the final `last-review.md` for every completed, non-dry review,
+the runner appends one row to
+`${CLAUDE_REVIEW_HISTORY_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-review}/history.tsv`.
+Set `CLAUDE_REVIEW_HISTORY_DIR` to keep this state elsewhere. There is no header:
+
+| Column | Value |
+|---|---|
+| `reviewed_at` | UTC timestamp |
+| `repo` | repository name, shared by its main checkout and linked worktrees |
+| `sha` | full reviewed commit sha |
+| `verdict` | `PASS`, `CHANGES`, `INVALID`, or `FAILED` |
+| `review_file` | absolute saved-review path; empty for `PASS` |
+
+`CHANGES`, `INVALID`, and `FAILED` also keep the finished review at
+`reviews/<repo>/<sha>.md`; a re-review replaces that copy but appends another
+row. Nothing prunes this directory. History is best effort: an unavailable or
+unwritable history path never changes the review, its exit code, its
+notification, or its stderr.
+
+To count verdicts by repository, run:
+
+```sh
+cut -f2,4 "${CLAUDE_REVIEW_HISTORY_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-review}/history.tsv" | sort | uniq -c
+```
+
 ## Regression test for failure signalling and the verdict line
 
 ```sh
@@ -129,11 +156,13 @@ bash git-hooks/claude-review-run.test.sh
 ```
 
 Stubs `claude` and `osascript`, spends no quota, and asserts that a failed
-review says so and that every reply lands on one of the three verdict lines. It
+review says so and that every reply lands on one of the four verdict lines. It
 exists because the script used to notify "review ready" on *any* outcome other
 than "Looks good to me" — including an auth failure — so on 2026-08-30
 twenty-four unreviewed commits looked exactly like reviewed ones for sixteen
 hours. If you touch `notify()`, the `claude` invocation or the prompt, run this.
+It also covers PASS, CHANGES, INVALID, FAILED, repeated, dry-run, linked-worktree
+and unwritable-path history cases.
 `RUNNER=<path> bash git-hooks/claude-review-run.test.sh` runs the same
 assertions against another copy of the runner.
 
