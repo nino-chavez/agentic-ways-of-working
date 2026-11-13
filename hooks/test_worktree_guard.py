@@ -302,6 +302,12 @@ class StatementSplittingTests(_TwoSessionRepo):
             with self.subTest(command=command):
                 self.assertEqual(self.bash("A", cwd, command)[0], "deny")
 
+    def test_deep_substitution_nesting_does_not_crash_the_hook(self) -> None:
+        # _run uses check=True, so a traceback exit fails this test.
+        nested = "echo " + "$(" * 1100 + "x" + ")" * 1100
+        command = f"{nested}\ngit -C {self.worktree} submodule deinit --all"
+        self.assertEqual(self.bash("A", self.root, command)[0], "deny")
+
     def test_an_unclosed_heredoc_marker_hides_nothing(self) -> None:
         # `<<` inside quotes or an arithmetic shift is not a heredoc; with no
         # closing delimiter line, the lines after it must still be judged.
@@ -319,6 +325,11 @@ class StatementSplittingTests(_TwoSessionRepo):
             f"{note}\n{deinit}\necho $((1<<b))",       # closed heredoc, then a false marker
             f"echo $((1<<b))\n{note}\n{deinit}",       # false marker, then a closed heredoc
             f'{note}\n{deinit}\necho "a <<EOF"',
+            # Both on one line, either order (review of ba92cc0).
+            f"cat > n <<'EOF' && echo $((1<<b))\nit's\nEOF\n{deinit}",
+            f"echo $((1<<b)) && cat > n <<'EOF'\nit's\nEOF\n{deinit}",
+            # Many false markers: a recursive strip hit the recursion limit and crashed.
+            "echo $((1<<b))\n" * 1500 + deinit,
         ):
             with self.subTest(command=command):
                 self.assertEqual(self.bash("A", self.root, command)[0], "deny")

@@ -114,6 +114,7 @@ _STATEMENT_PREFIXES = {"do", "then", "else", "elif", "if", "while", "until", "!"
 _HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)\\?([A-Za-z_][A-Za-z0-9_]*)\2")
 # A placeholder left by _mask_substitutions: `$(subst3)` or `` `subst3` ``.
 _SUBST_REF = re.compile(r"\$\(subst(\d+)\)|`subst(\d+)`")
+_MAX_SUBST_DEPTH = 16
 _GLOBAL_OPTS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
 
 # Subcommands that rewrite HEAD, the index, or the working tree unconditionally.
@@ -344,22 +345,22 @@ def _strip_heredocs(command: str) -> str:
     """
     lines = command.split("\n")
     out: list[str] = []
-    pending: list[tuple[str, bool]] = []  # (delimiter, <<- strips leading tabs)
-    opened_at = 0  # index of the line whose markers are pending
-    for idx, line in enumerate(lines):
-        if pending:
-            delim, dash = pending[0]
-            if (line.lstrip("\t") if dash else line) == delim:
-                pending.pop(0)
-            continue
-        out.append(line)
-        pending = [(m.group(3), m.group(1) == "-") for m in _HEREDOC.finditer(line)]
-        opened_at = idx
-    if pending:
-        # The delimiter never came, so that `<<` was not a heredoc (`"a <<EOF"`
-        # in quotes, `$((a<<b))`). Keep what was stripped before it, and give
-        # back the lines it swallowed, still stripping real heredocs among them.
-        out.append(_strip_heredocs("\n".join(lines[opened_at + 1:])))
+    i, n = 0, len(lines)
+    while i < n:
+        out.append(lines[i])
+        body_start = i + 1
+        # Bodies follow the opening line in marker order. A marker whose
+        # delimiter never comes is not a heredoc (`"a <<EOF"` in quotes,
+        # `$((a<<b))`) and swallows nothing, so the lines after it are still
+        # judged, and a real heredoc on the same line is still stripped.
+        for m in _HEREDOC.finditer(lines[i]):
+            delim, dash = m.group(3), m.group(1) == "-"
+            k = body_start
+            while k < n and (lines[k].lstrip("\t") if dash else lines[k]) != delim:
+                k += 1
+            if k < n:
+                body_start = k + 1
+        i = body_start
     return "\n".join(out)
 
 
@@ -461,7 +462,7 @@ def _statements(command: str) -> tuple[list[list[str]], list[str]] | None:
 
 
 def _git_targets(
-    command: str, base_dir: str | None, base_raw: str | None = None
+    command: str, base_dir: str | None, base_raw: str | None = None, depth: int = 0
 ) -> list[tuple[str | None, list[str], str | None]] | None:
     """For each `git ...` invocation: (effective_dir, git_args, unresolved_token).
 
@@ -480,9 +481,13 @@ def _git_targets(
     cur: str | None = base_dir
     cur_raw: str | None = base_raw  # the cd target that made `cur` unknown
     for st in stmts:
-        for tok in st:  # substitutions run before the statement that holds them
+        # Substitutions run before the statement that holds them. Past
+        # _MAX_SUBST_DEPTH levels of nesting a body stays opaque: unbounded
+        # recursion would hit Python's limit and crash the hook, which allows.
+        for tok in st if depth < _MAX_SUBST_DEPTH else ():
             for m in _subst_refs(tok, bodies):
-                targets += _git_targets(bodies[_subst_index(m)], cur, cur_raw) or []
+                inner = _git_targets(bodies[_subst_index(m)], cur, cur_raw, depth + 1)
+                targets += inner or []
         # Skip env-assignment prefixes (FOO=bar git ...) and statement openers.
         k = 0
         while k < len(st) and (_ENV_ASSIGN.match(st[k]) or st[k] in _STATEMENT_PREFIXES):
