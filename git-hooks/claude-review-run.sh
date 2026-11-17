@@ -9,7 +9,18 @@
 #   first. One that names no commit exits 1 and leaves last-review.md alone.
 #
 # Env:
-#   CLAUDE_REVIEW_DRY=1   skip the claude call (wiring test, no quota spend)
+#   CLAUDE_REVIEW_DRY=1        skip the claude call (wiring test, no quota spend)
+#   CLAUDE_REVIEW_HINTS_DIR    folder of hint commands (default
+#                              ${XDG_CONFIG_HOME:-~/.config}/claude-review/hints.d)
+#   CLAUDE_REVIEW_HINT_TIMEOUT seconds each hint command may run (default 60)
+#
+# Hints: each executable file in the hints folder is run as `<cmd> <repo> <sha>`
+# before the review. Whatever it prints to stdout is passed to the reviewer as
+# unverified hints to confirm or dismiss, and kept at the end of last-review.md
+# under "Hints given to the reviewer". Exit status is ignored, so a command that
+# should stay quiet must print nothing; one that runs past the time limit is
+# killed. A hint never sets the verdict. The folder is per machine; this
+# repository ships none.
 #
 # Contract for consumers: the first body line of last-review.md is exactly
 #   VERDICT: <WORD> <full commit sha>
@@ -134,6 +145,47 @@ Use CHANGES when there is at least one finding, and list the findings after a
 blank line. Output GitHub-flavored markdown only — no preamble.
 EOF
 
+# Deterministic hints (see "Hints" above). Output is capped per command so a
+# noisy one cannot crowd out the diff, and verdict-shaped lines are quoted so
+# the hint section can never be read as this review's verdict.
+HINTS=""
+HINTS_DIR="${CLAUDE_REVIEW_HINTS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-review/hints.d}"
+if [ -d "$HINTS_DIR" ]; then
+  for hint_cmd in "$HINTS_DIR"/*; do
+    [ -f "$hint_cmd" ] && [ -x "$hint_cmd" ] || continue
+    # perl is the portable timeout: macOS ships no timeout(1). The command runs
+    # in its own process group and the whole group is killed, because a child
+    # left alive keeps the pipe open. A hung hint would otherwise hold the
+    # review lock until post-commit steals it.
+    hint_out="$(perl -e '$t = shift; $p = fork; if (!$p) { setpgrp(0, 0); exec @ARGV or exit 127 }
+                         $SIG{ALRM} = sub { kill "KILL", -$p; exit 124 }; alarm $t; waitpid($p, 0)' \
+                  "${CLAUDE_REVIEW_HINT_TIMEOUT:-60}" "$hint_cmd" "$REPO" "$SHA" 2>/dev/null </dev/null \
+                | head -c 6000 | sed 's/^VERDICT:/> VERDICT:/')"
+    [ -n "$hint_out" ] || continue
+    HINTS="${HINTS}From \`$(basename "$hint_cmd")\`:"$'\n'"${hint_out}"$'\n\n'
+  done
+fi
+if [ -n "$HINTS" ]; then
+  PROMPT="${PROMPT}
+
+Deterministic checks flagged the items below. They are unverified hints, not
+findings: they can be wrong (a path in another repository, a file a plan says
+will be created, build output). Check each one against the repository. Report
+only the ones that are really wrong, as ordinary findings; ignore the rest.
+
+${HINTS}"
+fi
+
+append_hints() {               # keep what the reviewer was told, after its reply
+  [ -n "$HINTS" ] || return 0
+  {
+    echo
+    echo "## Hints given to the reviewer (unverified)"
+    echo
+    printf '%s' "$HINTS"
+  } >> "$OUT"
+}
+
 : > "$BODY"
 if claude -p "$PROMPT" \
      --permission-mode default \
@@ -175,6 +227,7 @@ else
     echo "_(review failed — ${WHERE})_"
   } >> "$OUT"
   rm -f "$BODY"
+  append_hints
   record_history FAILED
   case "$ERRLINE" in
     *uthenticat*|*OAuth*|*oauth*|*"ogged out"*|*"og in"*)
@@ -213,6 +266,7 @@ if [ "$VERDICT" = INVALID ]; then
     quoted_body
   } >> "$OUT"
   rm -f "$BODY"
+  append_hints
   record_history INVALID
   notify "Claude review INVALID — no verdict line" \
          "$(basename "$REPO") ${SHORT}: review text saved, but it cannot be read as PASS"
@@ -226,6 +280,7 @@ fi
   sed '/./,$!d' "$BODY" | tail -n +2 | sed 's/^VERDICT:/> VERDICT:/'
 } >> "$OUT"
 rm -f "$BODY"
+append_hints
 record_history "$VERDICT"
 
 if [ "$VERDICT" = PASS ]; then

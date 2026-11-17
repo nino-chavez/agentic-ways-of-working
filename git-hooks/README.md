@@ -149,6 +149,24 @@ To count verdicts by repository, run:
 cut -f2,4 "${CLAUDE_REVIEW_HISTORY_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-review}/history.tsv" | sort | uniq -c
 ```
 
+## Hints from deterministic checks
+
+A machine can give the reviewer hints from its own checks. Put executable
+commands in
+`${CLAUDE_REVIEW_HINTS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-review/hints.d}`.
+Before each review, the runner calls each one as `<cmd> <repo> <sha>`.
+
+- Whatever a command prints, up to 6,000 bytes, is added to the prompt as
+  unverified hints. The reviewer confirms or dismisses each hint and reports
+  only the real ones as findings.
+- The hints are kept at the end of `last-review.md`, under "Hints given to the
+  reviewer (unverified)". Comparing them with the findings shows how often a
+  hint was right.
+- A hint never sets the verdict. Exit status is ignored, so a command that
+  has nothing to say must print nothing to stdout. A command that runs longer
+  than `CLAUDE_REVIEW_HINT_TIMEOUT` seconds (default 60) is killed.
+- This repository ships no hint commands. Each machine adds its own.
+
 ## Regression test for failure signalling and the verdict line
 
 ```sh
@@ -161,7 +179,7 @@ exists because the script used to notify "review ready" on *any* outcome other
 than "Looks good to me" — including an auth failure — so on 2026-08-30
 twenty-four unreviewed commits looked exactly like reviewed ones for sixteen
 hours. If you touch `notify()`, the `claude` invocation or the prompt, run this.
-It also covers PASS, CHANGES, INVALID, FAILED, repeated, dry-run, linked-worktree
+It also covers PASS, CHANGES, INVALID, FAILED, hints, repeated, dry-run, linked-worktree
 and unwritable-path history cases.
 `RUNNER=<path> bash git-hooks/claude-review-run.test.sh` runs the same
 assertions against another copy of the runner.
