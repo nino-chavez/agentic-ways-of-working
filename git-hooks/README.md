@@ -162,8 +162,9 @@ Before each review, the runner calls each one as `<cmd> <repo> <sha>`.
 - The hints are kept at the end of `last-review.md`, under "Hints given to the
   reviewer (unverified)". Comparing them with the findings shows how often a
   hint was right.
-- A hint never sets the verdict. A command that fails, or prints nothing, adds
-  nothing.
+- A hint never sets the verdict. Exit status is ignored, so a command that
+  has nothing to say must print nothing to stdout. A command that runs longer
+  than `CLAUDE_REVIEW_HINT_TIMEOUT` seconds (default 60) is killed.
 - This repository ships no hint commands. Each machine adds its own.
 
 ## Regression test for failure signalling and the verdict line

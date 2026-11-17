@@ -352,6 +352,16 @@ if [[ "$MD" == *"Hints given"* || "$(cat "$PROMPT_LOG")" == *"Deterministic chec
 _assert_eq "silent, failing or non-executable hints add nothing" "$GOT" none "hint section" 0
 teardown
 
+setup "$STUB_LOG_PROMPT"
+add_hint slow 'echo early; sleep 20; echo late'
+add_hint fast 'echo fast-hint'
+START=$SECONDS
+CLAUDE_REVIEW_HINT_TIMEOUT=1 _run
+ELAPSED=$((SECONDS - START))
+if [ "$ELAPSED" -lt 10 ] && [[ "$MD" == *fast-hint* ]] && [[ "$MD" != *late* ]]; then GOT=cut; else GOT="not cut (${ELAPSED}s)"; fi
+_assert_eq "a hung hint is killed at the time limit and the others still run" "$GOT" cut "hint timing" 0
+teardown
+
 setup 'echo "VERDICT: CHANGES"; echo; echo "- a finding"; exit 0'
 add_hint doc-path-check 'echo "hint line"'
 _history

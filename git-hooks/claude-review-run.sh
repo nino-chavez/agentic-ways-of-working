@@ -12,13 +12,15 @@
 #   CLAUDE_REVIEW_DRY=1        skip the claude call (wiring test, no quota spend)
 #   CLAUDE_REVIEW_HINTS_DIR    folder of hint commands (default
 #                              ${XDG_CONFIG_HOME:-~/.config}/claude-review/hints.d)
+#   CLAUDE_REVIEW_HINT_TIMEOUT seconds each hint command may run (default 60)
 #
 # Hints: each executable file in the hints folder is run as `<cmd> <repo> <sha>`
-# before the review. Whatever it prints is passed to the reviewer as unverified
-# hints to confirm or dismiss, and kept at the end of last-review.md under
-# "Hints given to the reviewer". A hint never sets the verdict, and a hint
-# command that fails or prints nothing adds nothing. The folder is per machine;
-# this repository ships none.
+# before the review. Whatever it prints to stdout is passed to the reviewer as
+# unverified hints to confirm or dismiss, and kept at the end of last-review.md
+# under "Hints given to the reviewer". Exit status is ignored, so a command that
+# should stay quiet must print nothing; one that runs past the time limit is
+# killed. A hint never sets the verdict. The folder is per machine; this
+# repository ships none.
 #
 # Contract for consumers: the first body line of last-review.md is exactly
 #   VERDICT: <WORD> <full commit sha>
@@ -151,7 +153,14 @@ HINTS_DIR="${CLAUDE_REVIEW_HINTS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-r
 if [ -d "$HINTS_DIR" ]; then
   for hint_cmd in "$HINTS_DIR"/*; do
     [ -f "$hint_cmd" ] && [ -x "$hint_cmd" ] || continue
-    hint_out="$("$hint_cmd" "$REPO" "$SHA" 2>/dev/null </dev/null | head -c 6000 | sed 's/^VERDICT:/> VERDICT:/')"
+    # perl is the portable timeout: macOS ships no timeout(1). The command runs
+    # in its own process group and the whole group is killed, because a child
+    # left alive keeps the pipe open. A hung hint would otherwise hold the
+    # review lock until post-commit steals it.
+    hint_out="$(perl -e '$t = shift; $p = fork; if (!$p) { setpgrp(0, 0); exec @ARGV or exit 127 }
+                         $SIG{ALRM} = sub { kill "KILL", -$p; exit 124 }; alarm $t; waitpid($p, 0)' \
+                  "${CLAUDE_REVIEW_HINT_TIMEOUT:-60}" "$hint_cmd" "$REPO" "$SHA" 2>/dev/null </dev/null \
+                | head -c 6000 | sed 's/^VERDICT:/> VERDICT:/')"
     [ -n "$hint_out" ] || continue
     HINTS="${HINTS}From \`$(basename "$hint_cmd")\`:"$'\n'"${hint_out}"$'\n\n'
   done
