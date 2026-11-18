@@ -635,6 +635,8 @@ def _is_clean_fast_forward(args: list[str], repo_dir: str, ctx: dict) -> bool:
       - no merge, rebase, cherry-pick or revert is in progress here.
       - `git status` shows no staged or unstaged change to a tracked file, so
         there is no other session's uncommitted work for the move to touch.
+      - no git option precedes the subcommand except `-C <dir>`, so a
+        `-c name=value` override cannot turn the op into something else.
 
     git itself then refuses when the branch cannot fast-forward or an untracked
     file is in the way, and changes nothing. Any failure to read the state
@@ -646,6 +648,12 @@ def _is_clean_fast_forward(args: list[str], repo_dir: str, ctx: dict) -> bool:
     """
     sub, rest = _subcommand(args)
     if sub not in _FAST_FORWARD_SUBS or "--ff-only" not in rest:
+        return False
+    # Global options ahead of the subcommand: only `-C <dir>` is understood.
+    # `-c pull.rebase=true`, `-c submodule.recurse=true`, `--work-tree` and the
+    # rest can change what the op touches, so their presence keeps the denial.
+    lead = args[: len(args) - len(rest) - 1]
+    if any(a != "-C" for a in lead[0::2]) or len(lead) % 2:
         return False
     operands: list[str] = []
     for a in rest:

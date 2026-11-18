@@ -430,6 +430,18 @@ class CleanFastForwardTests(_TwoSessionRepo):
             with self.subTest(command=command):
                 self.assertEqual(self.bash("A", self.root, command)[0], "deny")
 
+    def test_a_git_option_ahead_of_the_subcommand_keeps_the_denial(self) -> None:
+        # A config override can change what the same words do.
+        for command in (
+            "git -c pull.rebase=true pull --ff-only",
+            "git -c submodule.recurse=true merge --ff-only origin/main",
+            f"git --work-tree {self.worktree} merge --ff-only origin/main",
+            "git --no-pager merge --ff-only origin/main",
+            f"git -C {self.root} -c merge.autoStash=true merge --ff-only origin/main",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.bash("A", self.root, command)[0], "deny")
+
     def test_fast_forwarding_to_another_ref_stays_denied(self) -> None:
         # Moving the default branch onto unmerged work is not catching up.
         for command in (
