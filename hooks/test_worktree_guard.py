@@ -385,6 +385,99 @@ class ContendedOpCoverageTests(_TwoSessionRepo):
         self.assertEqual(decision, "allow")
 
 
+class CleanFastForwardTests(_TwoSessionRepo):
+    """Catching a clean default branch up to its upstream is not a stomp.
+
+    Both sessions sit in main, the case where every other merge or pull is
+    denied. Measured 2026-11-18: 11 of the 17 denials that ended with the
+    operator running the command by hand were this one op.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.remote = Path(self.temporary.name) / "origin.git"
+        self.git("init", "--bare", "--initial-branch=main", str(self.remote))
+        self.git("remote", "add", "origin", str(self.remote), cwd=self.root)
+        self.git("push", "-u", "origin", "main", cwd=self.root)
+        self.arrive("A", self.root)
+        self.arrive("B", self.root)
+
+    def test_catching_up_a_clean_default_branch_is_allowed(self) -> None:
+        for command in (
+            "git merge --ff-only origin/main", "git merge --ff-only @{u}",
+            "git pull --ff-only", "git pull --ff-only origin",
+            "git pull --ff-only origin main", "git pull -q --ff-only",
+            "git fetch -q origin && git merge --ff-only origin/main",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.bash("A", self.root, command)[0], "allow")
+
+    def test_it_is_judged_in_the_repo_the_command_names(self) -> None:
+        elsewhere = Path(self.temporary.name)
+        command = f"git -C {self.root} merge --ff-only origin/main"
+        self.assertEqual(self.bash("A", elsewhere, command)[0], "allow")
+
+    def test_anything_beyond_a_plain_fast_forward_stays_denied(self) -> None:
+        for command in (
+            "git merge origin/main", "git pull", "git pull origin main",
+            "git pull --rebase --ff-only", "git pull --ff-only --autostash",
+            "git pull --ff-only --recurse-submodules",
+            "git merge --ff-only --autostash origin/main",
+            "git merge --ff-only -X theirs origin/main",
+            "git merge --ff-only --squash origin/main",
+            "git merge --ff-only -- origin/main",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.bash("A", self.root, command)[0], "deny")
+
+    def test_a_git_option_ahead_of_the_subcommand_keeps_the_denial(self) -> None:
+        # A config override can change what the same words do.
+        for command in (
+            "git -c pull.rebase=true pull --ff-only",
+            "git -c submodule.recurse=true merge --ff-only origin/main",
+            f"git --work-tree {self.worktree} merge --ff-only origin/main",
+            "git --no-pager merge --ff-only origin/main",
+            f"git -C {self.root} -c merge.autoStash=true merge --ff-only origin/main",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.bash("A", self.root, command)[0], "deny")
+
+    def test_fast_forwarding_to_another_ref_stays_denied(self) -> None:
+        # Moving the default branch onto unmerged work is not catching up.
+        for command in (
+            "git merge --ff-only feat/x", "git merge --ff-only origin/main feat/x",
+            "git pull --ff-only origin feat/x", "git pull --ff-only elsewhere",
+            "git merge --ff-only",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.bash("A", self.root, command)[0], "deny")
+
+    def test_a_tracked_change_in_the_checkout_keeps_the_denial(self) -> None:
+        (self.root / "tracked.txt").write_text("another session's edit\n", encoding="utf-8")
+        self.assertEqual(self.bash("A", self.root, "git merge --ff-only origin/main")[0], "deny")
+        self.git("add", "tracked.txt", cwd=self.root)   # staged counts too
+        self.assertEqual(self.bash("A", self.root, "git pull --ff-only")[0], "deny")
+
+    def test_an_untracked_file_does_not_block_it(self) -> None:
+        # git refuses by itself if the file is in the way of the fast-forward.
+        (self.root / "scratch.txt").write_text("note\n", encoding="utf-8")
+        self.assertEqual(self.bash("A", self.root, "git merge --ff-only origin/main")[0], "allow")
+
+    def test_an_operation_in_progress_keeps_the_denial(self) -> None:
+        (self.root / ".git" / "MERGE_HEAD").write_text("0" * 40 + "\n", encoding="utf-8")
+        self.assertEqual(self.bash("A", self.root, "git merge --ff-only origin/main")[0], "deny")
+
+    def test_a_checkout_off_its_default_branch_keeps_the_denial(self) -> None:
+        self.git("checkout", "-b", "side", "--track", "origin/main", cwd=self.root)
+        self.assertEqual(self.bash("A", self.root, "git merge --ff-only origin/main")[0], "deny")
+        self.assertEqual(self.bash("A", self.root, "git pull --ff-only")[0], "deny")
+
+    def test_a_default_branch_with_no_upstream_keeps_the_denial(self) -> None:
+        self.git("branch", "--unset-upstream", cwd=self.root)
+        self.assertEqual(self.bash("A", self.root, "git merge --ff-only origin/main")[0], "deny")
+        self.assertEqual(self.bash("A", self.root, "git pull --ff-only")[0], "deny")
+
+
 class BranchOwnershipTests(_TwoSessionRepo):
     """Folding in a branch another live session holds escalates to the user."""
 

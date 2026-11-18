@@ -34,6 +34,10 @@ Contention model — two hazards, two checks:
      2026-08-27 the Bash path counted worktree sessions too, denying a solo
      commit in main while the other session sat safely isolated; the Edit path
      never did. The two paths now agree.)
+     One contended op is let through: `merge --ff-only` or `pull --ff-only` on
+     the default branch of a checkout with no tracked changes and no operation
+     in progress. It cannot overwrite an edit or strand a merge, and it is how
+     a main checkout catches up after a PR merges (_is_clean_fast_forward).
 
   2. Branch ownership. git refuses to CHECK OUT a branch another worktree holds,
      but merges or rebases it without complaint — so occupancy alone misses the
@@ -120,6 +124,15 @@ _GLOBAL_OPTS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace"
 # Subcommands that rewrite HEAD, the index, or the working tree unconditionally.
 # `pull` is fetch+merge; `am` applies a mailbox onto the current branch.
 _ALWAYS_CONTENDED = {"commit", "merge", "rebase", "cherry-pick", "revert", "am", "pull"}
+# The one exception to _ALWAYS_CONTENDED: `merge --ff-only` and `pull --ff-only`
+# with nothing but these flags. See _is_clean_fast_forward for the conditions.
+_FAST_FORWARD_SUBS = {"merge", "pull"}
+_FAST_FORWARD_SAFE_FLAGS = {
+    "--ff-only", "-q", "--quiet", "-v", "--verbose", "--stat", "--no-stat",
+    "-n", "--no-edit", "--progress", "--no-progress", "--prune", "-p",
+    "--tags", "--no-tags", "--no-rebase",
+}
+_DEFAULT_BRANCH_FALLBACK = {"main", "master"}
 # `reset <path>` and `reset --soft` do not touch the working tree; these do.
 _RESET_STOMPING = {"--hard", "--merge", "--keep"}
 # `stash push/list/show` are safe; these write the working tree.
@@ -592,6 +605,83 @@ def _is_contended_args(args: list[str], cwd: str | None = None) -> bool:
     return False
 
 
+def _default_branch(repo_dir: str) -> set[str]:
+    """Names the repo's default branch may have: origin/HEAD's, else main/master."""
+    ref = git(["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], repo_dir)
+    if ref and "/" in ref:
+        return {ref.split("/", 1)[1]}
+    return set(_DEFAULT_BRANCH_FALLBACK)
+
+
+def _is_clean_fast_forward(args: list[str], repo_dir: str, ctx: dict) -> bool:
+    """True when this op can only move a clean default branch forward.
+
+    The occupancy check exists because a merge or pull in a shared checkout can
+    overwrite another session's edits or strand a half-finished merge there.
+    A fast-forward-only one cannot do either when all of these hold:
+
+      - the subcommand is `merge` or `pull`, `--ff-only` is given, and every
+        other flag is in _FAST_FORWARD_SAFE_FLAGS. Any other flag (--rebase,
+        --autostash, --squash, --no-ff, --recurse-submodules, -X, -s ...)
+        fails the test, so an unknown flag keeps the old denial.
+      - the checkout is on the repo's default branch, so the move lands where
+        every session already expects merged work to land, never on a branch
+        another session created in this checkout.
+      - what it brings in is that branch's own upstream: `merge` names exactly
+        the upstream ref (or `@{u}`), `pull` names nothing, the upstream's
+        remote, or that remote and branch. Fast-forwarding the default branch
+        to some other ref would put unmerged work on it, which is a different
+        act from catching up and stays denied.
+      - no merge, rebase, cherry-pick or revert is in progress here.
+      - `git status` shows no staged or unstaged change to a tracked file, so
+        there is no other session's uncommitted work for the move to touch.
+      - no git option precedes the subcommand except `-C <dir>`, so a
+        `-c name=value` override cannot turn the op into something else.
+
+    git itself then refuses when the branch cannot fast-forward or an untracked
+    file is in the way, and changes nothing. Any failure to read the state
+    answers False: the caller falls back to the denial.
+
+    Measured 2026-11-18 over four months of transcripts: 11 of 17 denials this
+    guard produced that ended with the operator running the command by hand
+    were this op, bringing a main checkout up to date after a PR merged.
+    """
+    sub, rest = _subcommand(args)
+    if sub not in _FAST_FORWARD_SUBS or "--ff-only" not in rest:
+        return False
+    # Global options ahead of the subcommand: only `-C <dir>` is understood.
+    # `-c pull.rebase=true`, `-c submodule.recurse=true`, `--work-tree` and the
+    # rest can change what the op touches, so their presence keeps the denial.
+    lead = args[: len(args) - len(rest) - 1]
+    if any(a != "-C" for a in lead[0::2]) or len(lead) % 2:
+        return False
+    operands: list[str] = []
+    for a in rest:
+        if a == "--":
+            return False
+        if a.startswith("-"):
+            if a not in _FAST_FORWARD_SAFE_FLAGS:
+                return False
+        else:
+            operands.append(a)
+    branch = ctx.get("branch")
+    if branch not in _default_branch(repo_dir):
+        return False
+    upstream = git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], repo_dir)
+    if not upstream or "/" not in upstream:
+        return False  # no upstream configured => nothing to catch up to
+    remote, remote_branch = upstream.split("/", 1)
+    if sub == "merge":
+        if operands not in ([upstream], ["@{u}"], ["@{upstream}"]):
+            return False
+    elif operands not in ([], [remote], [remote, remote_branch]):
+        return False
+    if in_progress_op(ctx.get("git_dir", "")) is not None:
+        return False
+    status = git(["status", "--porcelain", "--untracked-files=no"], repo_dir)
+    return status == ""
+
+
 def _is_submodule_deinit(args: list[str]) -> bool:
     """True for `git submodule [--quiet] deinit ...`."""
     sub, rest = _subcommand(args)
@@ -1007,7 +1097,9 @@ def cmd_check(payload: dict) -> None:
         # count worktree sessions too and denied legitimate solo work in main.
         if not tctx["is_worktree"] and _is_contended_args(args, eff_dir):
             main_others = [o for o in others if not o.get("is_worktree")]
-            if main_others:
+            # A fast-forward of a clean default branch stomps nobody; the branch
+            # check below still runs on its operands.
+            if main_others and not _is_clean_fast_forward(args, eff_dir, tctx):
                 deny(deny_reason(main_others, eff_dir, tld, tctx))
 
         # (2) Branch ownership — the hazard occupancy misses entirely. Runs in
