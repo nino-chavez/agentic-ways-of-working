@@ -133,6 +133,10 @@ _FAST_FORWARD_SAFE_FLAGS = {
     "--tags", "--no-tags", "--no-rebase",
 }
 _DEFAULT_BRANCH_FALLBACK = {"main", "master"}
+# A shell redirection inside a git statement: `2>`, `>/dev/null`, `>>log`, `<in`.
+# `2>&1` reaches here as `2>` because `&` splits statements. Group 1 is the
+# target when it is attached; empty means the next token is the target.
+_REDIRECT = re.compile(r"^\d*(?:>>?|<)(.*)$")
 # `reset <path>` and `reset --soft` do not touch the working tree; these do.
 _RESET_STOMPING = {"--hard", "--merge", "--keep"}
 # `stash push/list/show` are safe; these write the working tree.
@@ -656,7 +660,17 @@ def _is_clean_fast_forward(args: list[str], repo_dir: str, ctx: dict) -> bool:
     if any(a != "-C" for a in lead[0::2]) or len(lead) % 2:
         return False
     operands: list[str] = []
+    skip = False
     for a in rest:
+        if skip:
+            skip = False  # the target of a detached redirect, not an operand
+            continue
+        redirect = _REDIRECT.match(a)
+        if redirect:
+            # Where output goes does not change what git does. Real commands
+            # end in `2>&1 | tail`, and reading `2>` as a ref denied them.
+            skip = redirect.group(1) == ""
+            continue
         if a == "--":
             return False
         if a.startswith("-"):

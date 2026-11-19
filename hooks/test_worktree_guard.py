@@ -412,6 +412,29 @@ class CleanFastForwardTests(_TwoSessionRepo):
             with self.subTest(command=command):
                 self.assertEqual(self.bash("A", self.root, command)[0], "allow")
 
+    def test_output_redirects_do_not_change_the_answer(self) -> None:
+        # Observed 2026-11-18: `... merge --ff-only origin/main 2>&1 | tail -1`
+        # was denied on a clean checkout because `2>` was read as a second ref.
+        for command in (
+            "git merge --ff-only origin/main 2>&1 | tail -1",
+            "git pull --ff-only >/dev/null 2>&1",
+            "git merge --ff-only origin/main > /dev/null",
+            "git pull --ff-only 2>> sync.log",
+            "git merge --ff-only origin/main 2>/dev/null | tail -2; git log --oneline -1",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.bash("A", self.root, command)[0], "allow")
+        for command in (
+            "git merge --ff-only origin/main feat/x 2>&1 | tail -1",
+            "git merge --ff-only feat/x > /dev/null",
+            "git pull --ff-only --rebase 2>&1",
+            "git merge origin/main 2>&1 | tail -1",
+            # An attached redirect consumes nothing: the next token still counts.
+            "git pull --ff-only 2>/dev/null elsewhere",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.bash("A", self.root, command)[0], "deny")
+
     def test_it_is_judged_in_the_repo_the_command_names(self) -> None:
         elsewhere = Path(self.temporary.name)
         command = f"git -C {self.root} merge --ff-only origin/main"
