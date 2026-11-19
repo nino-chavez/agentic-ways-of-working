@@ -247,6 +247,38 @@ Added 2026-10-26, after comparing Entire's CLI, which writes an
 `Entire-Checkpoint:` trailer but pushes the whole transcript to the remote.
 This keeps the link and leaves the transcript local.
 
+## Secret scan before a commit
+
+`pre-commit-secret-scan` refuses a commit whose staged lines contain a provider
+key. It matches the key shapes in the script's `PATTERNS` list and reads added
+lines only. The message names the file and shows the first twelve characters of
+each match.
+
+- **Install by symlink.** `install.sh` does not place this hook. Link it into a
+  hooks folder as `pre-commit`.
+- **Exempt one line** by writing `pragma: allowlist secret` on it. The rest of
+  the commit is still scanned.
+- **Every staged path is read except a deletion.** A renamed file, a copy and a
+  symlink replaced by a regular file are scanned in full, because git shows all
+  their lines as added.
+- **Add a provider** by adding its key shape to `PATTERNS`. The session
+  closeout's `secret-scan.py` reads the same list, so write each entry in the
+  subset that `grep -E` and Python's `re` both read.
+
+Regression test (throwaway repo, random fake keys, no network):
+
+```sh
+bash git-hooks/pre-commit-secret-scan.test.sh
+```
+
+`HOOK=<path>` runs the same cases against another copy of the hook. The test
+builds every fake key at run time, so no key-shaped text is stored here.
+
+Added 2026-11-19. A review had found that the hook skipped a key added to a
+renamed file and knew no key shape for seven providers. Writing the test
+found three more skipped cases: a file whose name is not plain ASCII, a name
+git reads as a pattern, and a symlink replaced by a regular file.
+
 ## Note on global `core.hooksPath`
 
 Git honors exactly one `hooksPath`. Repos that set their own (Husky, lefthook)
@@ -264,6 +296,8 @@ a repo relies on hand-written non-Husky hooks, install per-repo there instead.
 | `prepare-commit-msg` | Adds the `Agent-Session:` trailer to agent commits |
 | `commit-msg` | Symlink to `prepare-commit-msg`; stamps editor-composed commits |
 | `prepare-commit-msg.test.sh` | Regression test for the trailer |
+| `pre-commit-secret-scan` | Refuses a commit that stages a provider key |
+| `pre-commit-secret-scan.test.sh` | Regression test for the secret scan |
 | `claude-review-run.sh` | Background worker that calls `claude` and writes the review |
 | `claude-review.conf.example` | Per-repo config template |
 | `install.sh` | Global or per-repo installer |
