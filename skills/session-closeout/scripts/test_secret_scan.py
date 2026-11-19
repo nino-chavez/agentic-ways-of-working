@@ -20,6 +20,14 @@ def rand(n: int = 32) -> str:
     return secrets.token_hex(n // 2)
 
 
+ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"  # no 0, O, I or l
+
+
+def pick(n: int, alphabet: str = ALNUM) -> str:
+    return "".join(secrets.choice(alphabet) for _ in range(n))
+
+
 def typed_password() -> str:
     """The shape a person types: short, mixed case, a digit, a symbol. Too short for token_shaped."""
     return f"Tulip{secrets.randbelow(10)}:{secrets.randbelow(90) + 10}moss"
@@ -71,6 +79,41 @@ class SecretScanTest(unittest.TestCase):
         self.assertIn("tool-results/big-output.txt", r.stdout)
         for value in (prefix_key, assigned, bearer, side_key):
             self.assertNotIn(value[-12:], r.stdout)
+
+    def test_provider_shapes_added_to_the_shared_list(self):
+        # 2026-11-19: the hook's PATTERNS block gained these shapes, and this
+        # scanner reads the same block. Python must read each entry as grep does.
+        cases = {
+            "Google API key": "AIza" + pick(35),
+            "Google API key bound to a service account": "AQ." + pick(50),
+            "OpenRouter": "sk-or-v1-" + rand(64),
+            "Perplexity": "pplx-" + pick(48),
+            "Resend": "re_" + pick(8, BASE58) + "_" + pick(24, BASE58),
+            "Supabase secret key": "sb_secret_" + pick(22) + "_" + pick(8),
+            "Stripe restricted live": "rk_live_" + pick(99),
+            "OpenAI legacy key": "sk-" + pick(48),
+            "OpenAI admin or service-account key": "sk-svcacct-" + pick(60),
+        }
+        for i, (label, key) in enumerate(cases.items()):
+            with self.subTest(label):
+                self.write(f"p{i}", f"the value is {key} today")
+                r = self.run_scan("--session-id", f"p{i}")
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertIn(f"prefix {label}  p{i}.jsonl", r.stdout)
+                self.assertNotIn(key[-12:], r.stdout)
+
+    def test_provider_lookalikes_are_clean(self):
+        self.write("p20",
+                   f"id store_{pick(8, BASE58)}_{pick(24, BASE58)}",
+                   f"id re_{pick(8, BASE58)}_{pick(32, BASE58)}",
+                   f"ref task-{rand(48)}",
+                   f"see FAQ.{pick(50)}",
+                   f"key sk_test_{pick(99)}",
+                   f"key sb_publishable_{pick(22)}_{pick(8)}",
+                   f"key pplx-{rand(16)}")
+        r = self.run_scan("--session-id", "p20")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("SECRET_SCAN_CLEAN", r.stdout)
 
     def test_live_value_from_environment(self):
         value = rand(64)
