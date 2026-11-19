@@ -276,8 +276,8 @@ builds every fake key at run time, so no key-shaped text is stored here.
 
 Added 2026-11-19. A review had found that the hook skipped a key added to a
 renamed file and knew no key shape for seven providers. Writing the test
-found two more skipped cases: a file whose name is not plain ASCII, and a
-symlink replaced by a regular file.
+found three more skipped cases: a file whose name is not plain ASCII, a name
+git reads as a pattern, and a symlink replaced by a regular file.
 
 ## Note on global `core.hooksPath`
 

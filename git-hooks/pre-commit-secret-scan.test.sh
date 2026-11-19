@@ -128,12 +128,14 @@ expect_block "key in a symlink replaced by a file"
 # Names git prints in quoted form unless asked for -z.
 named() {  # named <case name> <file name>
   printf 'API_KEY=%s\n' "$(known_key)" > "$R/$2"
-  g git -C "$R" add -- "$2"
+  g git --literal-pathspecs -C "$R" add -- "$2"
   expect_block "$1"
 }
 named "key in a file whose name has a space" "with space.txt"
 named "key in a file whose name is not ASCII" "résumé.env"
 named "key in a file whose name has a quote and a tab" $'quote"and\ttab.txt'
+# A name git would otherwise read as a pattern, not a file.
+named "key in a file whose name looks like a git pattern" ":(glob)notes.txt"
 
 # --- What must still pass. ----------------------------------------------------
 passes "line carrying the allowlist pragma" "FAKE=$(known_key)  # pragma: allowlist secret"
