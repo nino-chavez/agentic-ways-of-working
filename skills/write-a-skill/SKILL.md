@@ -1,117 +1,67 @@
 ---
 name: write-a-skill
-description: Create new agent skills with proper structure, progressive disclosure, and bundled resources. Use when user wants to create, write, or build a new skill.
+description: Create or revise agent skills with clear triggers, focused instructions, and reusable resources. Use when a request is to create, write, or substantially update a skill.
 ---
 
 # Writing Skills
 
-## Process
+Create the smallest skill that changes a future agent's decisions. Preserve the
+user's scope, authorization, and stop conditions; do not turn one example into
+a universal rule.
 
-1. **Gather requirements** - use the request and existing context to establish:
-   - What task/domain does the skill cover?
-   - What specific use cases should it handle?
-   - Does it need executable scripts or just instructions?
-   - Any reference materials to include?
+## Draft
 
-   Ask only for missing information that materially changes the skill. If the request supplies enough detail, proceed to drafting.
+1. Establish the task, representative use cases, and any permission or safety
+   boundary that changes the work. Ask only about a missing choice that would
+   materially change the skill.
+2. Write a discriminating description: what the skill does and when it should
+   trigger. State useful exclusions only when they prevent likely misrouting.
+3. Keep shared purpose and essential constraints in `SKILL.md`. Link directly
+   to a reference when detail is conditional or substantial, and say when to
+   read it. Keep every rule in one owner; inspect a referenced skill or tool
+   before describing what it contains.
+4. Add a script only for a deterministic operation that agents would otherwise
+   recreate repeatedly. Reuse and run existing deterministic helpers rather
+   than copying their logic into prose.
 
-2. **Draft the skill** - create:
-   - SKILL.md with concise instructions
-   - Additional reference files if content exceeds 500 lines
-   - Utility scripts if deterministic operations needed
+## Size and structure
 
-3. **Review the result** - check it against the requested use cases and the checklist below, then present what changed and any remaining decisions. Ask the user only about an unresolved choice that needs their judgment; do not require another review round when the direction is already authorized.
+Use the structure the task needs. A simple skill can be self-contained;
+substantial mode-specific instructions, schemas, and examples belong in direct
+references.
 
-## Skill Structure
+Treat 500 body lines as a review heuristic, not a hard limit: move conditional
+detail when doing so makes the entrypoint clearer. A long reference should have
+a short contents list near its start once navigation would otherwise be hard
+(around 100 lines is a useful prompt to consider one). Neither number is a
+quality score or a required split point.
 
-```
+```text
 skill-name/
-├── SKILL.md           # Main instructions (required)
-├── REFERENCE.md       # Detailed docs (if needed)
-├── EXAMPLES.md        # Usage examples (if needed)
-└── scripts/           # Utility scripts (if needed)
-    └── helper.js
+├── SKILL.md            # required entrypoint
+├── references/         # detailed, directly linked guidance when needed
+├── scripts/            # deterministic helpers when needed
+└── assets/             # files copied into outputs when needed
 ```
 
-## SKILL.md Template
+## Validate
 
-```md
----
-name: skill-name
-description: Brief description of capability. Use when [specific triggers].
----
+Separate three claims in the handoff:
 
-# Skill Name
+- **Structure-valid:** frontmatter, links, names, and scripts pass the
+  available mechanical checks.
+- **Behavior-proven:** a representative task produced the required observable
+  behavior under its stated scope.
+- **Host-loaded:** the target host discovered and loaded the skill. This is
+  separate from both source validation and behavior.
 
-## Quick start
+For a simple, low-impact edit, source review and cheap manual validation are
+enough. For a complex or consequential skill, read
+[behavioral validation](references/behavioral-validation.md) and run its small
+baseline/candidate comparison when the current permissions and stop limits
+allow it. Use the required dispatcher for any evaluation worker; do not create
+another runner or repeat its launch instructions. See
+[dispatch routing](../../docs/dispatch-routing.md).
 
-[Minimal working example]
-
-## Workflows
-
-[Step-by-step processes with checklists for complex tasks]
-
-## Advanced features
-
-[Link to separate files: See [REFERENCE.md](REFERENCE.md)]
-```
-
-## Description Requirements
-
-The description is **the only thing your agent sees** when deciding which skill to load. It's surfaced in the system prompt alongside all other installed skills. Your agent reads these descriptions and picks the relevant skill based on the user's request.
-
-**Goal**: Give your agent just enough info to know:
-
-1. What capability this skill provides
-2. When/why to trigger it (specific keywords, contexts, file types)
-
-**Format**:
-
-- Max 1024 chars
-- Write in third person
-- First sentence: what it does
-- Second sentence: "Use when [specific triggers]"
-
-**Good example**:
-
-```
-Extract text and tables from PDF files, fill forms, merge documents. Use when working with PDF files or when user mentions PDFs, forms, or document extraction.
-```
-
-**Bad example**:
-
-```
-Helps with documents.
-```
-
-The bad example gives your agent no way to distinguish this from other document skills.
-
-## When to Add Scripts
-
-Add utility scripts when:
-
-- Operation is deterministic (validation, formatting)
-- Same code would be generated repeatedly
-- Errors need explicit handling
-
-Scripts save tokens and improve reliability vs generated code.
-
-## When to Split Files
-
-Split into separate files when:
-
-- SKILL.md exceeds 100 lines
-- Content has distinct domains (finance vs sales schemas)
-- Advanced features are rarely needed
-
-## Review Checklist
-
-After drafting, verify:
-
-- [ ] Description includes triggers ("Use when...")
-- [ ] SKILL.md under 100 lines
-- [ ] No time-sensitive info
-- [ ] Consistent terminology
-- [ ] Concrete examples included
-- [ ] References one level deep
-- [ ] Every referenced file exists, and every pointer to another skill says what that skill actually contains — open the target and check, don't describe it from its name
+Before handoff, check the requested cases, referenced-file existence, terms,
+and available frontmatter validation. Report what was not tested and why.
