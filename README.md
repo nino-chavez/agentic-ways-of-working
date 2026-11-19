@@ -41,7 +41,7 @@ So there's exactly one canonical doc — [`principles/working-style.md`](princip
 
 | Principle | What it changes | Enforced by |
 |---|---|---|
-| **Default to action** | One "go" covers the thread. Turns end on a status sentence, not a permission check | [`anti-hesitation.py`](hooks/anti-hesitation.py) |
+| **Default to action** | One "go" covers the thread. Turns end on a status sentence, not a permission check or a command the agent could have run itself | [`anti-hesitation.py`](hooks/anti-hesitation.py) |
 | **Worktree isolation** | Parallel sessions never share a checkout, so commits can't land on each other's branch | [`worktree-guard.py`](hooks/worktree-guard.py) |
 | **Resource cleanup** | What a session starts, something ends: build output on disk, orphaned connector processes, and dev servers, browser tabs and local database stacks left running. Each reaper fails closed when ownership is unclear | [`worktree-reaper.py`](hooks/worktree-reaper.py) (disk) + [`connector-reaper.py`](hooks/connector-reaper.py) (MCP processes) + [`session-reaper.py`](hooks/session-reaper.py) (servers, tabs, stacks) |
 | **Token economics** | Session hygiene beats payload trimming; subagents are context firewalls | [`read-guard.py`](hooks/read-guard.py) (reads) + [`output-trim.py`](hooks/output-trim.py) (Bash output) + [statusline](statusline.py) |
