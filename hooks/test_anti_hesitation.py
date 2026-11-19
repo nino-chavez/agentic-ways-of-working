@@ -191,11 +191,11 @@ class RecentRefusalsTests(_Transcript):
 class EndToEndTests(_Transcript):
     """Run the hook the way the harness does: a payload on stdin, JSON on stdout."""
 
-    def run_hook(self, *rows: dict) -> dict | None:
+    def run_hook(self, *rows: dict, **payload) -> dict | None:
         self.write(*rows)
         result = subprocess.run(
             [sys.executable, str(HOOK)],
-            input=json.dumps({"transcript_path": str(self.path)}),
+            input=json.dumps({"transcript_path": str(self.path), **payload}),
             capture_output=True, text=True, timeout=20,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -228,6 +228,18 @@ class EndToEndTests(_Transcript):
         out = self.run_hook(prompt("do step one"), question, FEEDBACK, assistant("Continuing."),
                             prompt("do step two"), question)
         self.assertEqual(out["decision"], "block")
+
+    def test_the_harness_flag_alone_marks_a_rewrite(self) -> None:
+        # A task notification after the feedback line hides the marker from the
+        # transcript check; stop_hook_active still says this stop is a rewrite.
+        notice = {"type": "user", "origin": {"kind": "task-notification"},
+                  "message": {"content": "<task-notification>done</task-notification>"}}
+        rows = (prompt("merge it"), assistant(HANDOFF), FEEDBACK, notice, assistant(HANDOFF))
+        self.assertEqual(self.run_hook(*rows)["decision"], "block")
+        self.assertIsNone(self.run_hook(*rows, stop_hook_active=True))
+        question = assistant("Step one is done. Want me to continue?")
+        self.assertIsNone(self.run_hook(prompt("go"), question, stop_hook_active=True))
+        self.assertEqual(self.run_hook(prompt("go"), question, stop_hook_active=False)["decision"], "block")
 
     def test_an_ordinary_closing_is_allowed(self) -> None:
         self.assertIsNone(self.run_hook(prompt("merge it"), assistant("Merged and synced. Nothing is pending.")))

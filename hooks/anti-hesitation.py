@@ -265,10 +265,15 @@ def main() -> None:
     if not text:
         sys.exit(0)
 
+    # One block per turn. The harness sets stop_hook_active when this stop is
+    # already the continuation of a blocked one; the transcript marker covers
+    # clients that do not send it.
+    rewrite = payload.get("stop_hook_active") is True or already_blocked_this_turn(Path(transcript_path))
+
     evidence = classify_hesitation(text)
     if not evidence:
         command = classify_handoff(text, recent_refusals(Path(transcript_path)))
-        if not command or already_blocked_this_turn(Path(transcript_path)):
+        if not command or rewrite:
             sys.exit(0)
         print(json.dumps({"decision": "block", "reason": (
             "You ended your turn by handing the user a shell command to run, and "
@@ -283,7 +288,7 @@ def main() -> None:
         )}))
         sys.exit(0)
 
-    if already_blocked_this_turn(Path(transcript_path)):
+    if rewrite:
         sys.exit(0)
 
     reason = (
