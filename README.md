@@ -80,7 +80,9 @@ The portable preferences snapshot is [`principles/working-style.md`](principles/
 
 **Session retention.** One Codex home directory reached roughly **24 GB**, split between 18.5 GiB of reproducible worktree output and 5.04 GiB of archived transcripts. Mining 605 transcripts produced a 34 MB recall database, but ingestion could not prove that every project-specific lesson had moved into its owning repository. The [`session-closeout`](skills/session-closeout/SKILL.md) skill makes that semantic gate explicit; the [retention pattern](docs/session-retention.md) keeps hooks fast, provenance attached, and deletion behind a current watermark plus human judgment.
 
-**Harness hygiene.** The harness rots two ways: bloat that accumulates, and good tooling that quietly disappears because it was never version-controlled. Both turned up in the same audit — a working harness-cleaner command was built, ran successfully, and vanished within four days, and a dozen more extensions were found sitting in that identical unbacked state. [`/doctor`](commands/doctor.md) maps the whole harness read-only and applies nothing without confirmation, including a check for whether each extension it finds is backed by version control at all.
+**Harness hygiene.** The harness rots two ways: bloat that accumulates, and tooling that could quietly disappear because it was never version-controlled. An audit of one setup found a dozen extensions in that unbacked state, one of them used seven times. [`/doctor`](commands/doctor.md) is Claude Code's built-in `/doctor` checkup with one check added: whether each extension it finds is backed by version control at all. It maps the whole harness read-only and applies nothing without confirmation.
+
+*Corrected 2026-11-24: this paragraph first said the command was built here and vanished within four days. It was Claude Code's built-in command, and it was never lost.*
 
 ## What's in the box
 
@@ -89,7 +91,7 @@ principles/working-style.md   The canonical doc. Harness-agnostic. Start here.
 adapters/                     Thin pointers: CLAUDE.md, AGENTS.md, GEMINI.md
 skills/                       The methodology suite (see below)
 commands/campsite.md          /campsite — toggle the north-star working stance
-commands/doctor.md            /doctor — health-check and clean up your own harness
+commands/doctor.md            /doctor — Claude Code's built-in checkup plus a version-control check
 hooks/                        anti-hesitation, campsite, blueprint-session-start, worktree-guard, read-guard,
                               output-trim, worktree-reaper, connector-reaper, session-reaper,
                               process-argv-guard
@@ -164,3 +166,5 @@ This is a snapshot of a working method, not a finished standard. The principles 
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+One exception: most of [`commands/doctor.md`](commands/doctor.md) is the text of Claude Code's built-in `/doctor` command, which is Anthropic's. This license covers only the additions named at the top of that file.
