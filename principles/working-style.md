@@ -132,12 +132,15 @@ MCP servers, memory files — is the harness, and it grows the way ships grow
 barnacles: one correction at a time, never subtracted. The instinct is to
 treat this as an accumulation problem (too much stuff) and reach for a
 cleanup pass. Measured against a real setup, accumulation was the smaller
-failure. The larger one was persistence: a genuinely good piece of harness
-tooling was built, ran successfully, and disappeared within days because it
-lived nowhere version-controlled — no error, no log, nothing to `git diff`,
-just gone, undetected until a transcript search happened to surface it. A
-harness audit of the same setup then found a dozen more extensions sitting in
-that identical unbacked state, in active use in some cases, right now.
+failure. The larger one was persistence: a harness audit found a dozen
+extensions that lived nowhere version-controlled, in active use in some
+cases. Any of them could have disappeared with no error, no log and nothing
+to `git diff`.
+
+Corrected 2026-11-24: this section first cited a tool that was built, ran
+successfully and disappeared within days. That tool was Claude Code's
+built-in `/doctor`, and it was never lost. The dozen untracked extensions are
+the evidence that stands.
 
 Derived rules:
 
@@ -155,7 +158,8 @@ Derived rules:
 - **Hard requirements need hard checks, including this one.** A harness
   cleaner that only produces advice repeats the failure it exists to catch —
   a correct diagnosis nobody acts on is indistinguishable from no diagnosis.
-  [`commands/doctor.md`](../commands/doctor.md) audits installation health,
+  [`commands/doctor.md`](../commands/doctor.md), which is Claude Code's
+  built-in `/doctor` text plus one added check, audits installation health,
   unused skills/MCP servers/plugins (with context-cost accounting that knows
   which tool schemas are deferred and therefore free), memory-file
   duplication, derivable content in checked-in `CLAUDE.md` files, slow hooks,
@@ -166,8 +170,7 @@ Derived rules:
   confirmation.
 - **A durable tool is re-runnable by design.** `/doctor`'s checks are
   read-only scans before they are anything else, specifically so the same
-  audit can run again later and catch drift the first run didn't — including
-  drift in itself, now that it checks its own kind of failure.
+  audit can run again later and catch drift the first run didn't.
 - **Connectors are processes, and nothing reaps them.** Every stdio MCP
   server is a local process tree the client spawns and is supposed to clean
   up. Measured on a real setup after a forced reboot: three loaded tasks

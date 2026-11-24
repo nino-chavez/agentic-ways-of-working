@@ -4,6 +4,14 @@ description: Health-check your Claude Code setup — installation, unused extens
 
 # Claude Code Doctor
 
+> **Provenance (added 2026-11-24).** The body of this file is the text of Claude Code's built-in `/doctor` command, as version 2.1.219 supplied it in July 2026, with three additions made here:
+>
+> 1. the clause "find extensions with no version-control backing that could vanish without a trace," in the opening summary;
+> 2. the "Version-control status" bullet under Data sources;
+> 3. the "Unbacked extensions — no version control" bullet in Check 0.
+>
+> The frontmatter description and this note were also written here. Everything else is Anthropic's text, so this repository's MIT license covers only those additions. To compare, run the built-in `/doctor` and read its text in that session's transcript; later versions may differ. A command file with this name loads in place of the built-in one (checked on Claude Code 2.1.308, desktop app).
+
 Health-check my Claude Code setup and fix what's wrong: diagnose installation health (what the `claude doctor` terminal diagnostics cover), find extensions that cost context but never get used, find extensions with no version-control backing that could vanish without a trace, deduplicate my LOCAL memory files against checked-in ones, trim checked-in CLAUDE.md files down to what a session can't derive on its own, migrate the always-loaded guidance that survives to lazy loading, flag slow hooks, verify my installed version is current, make auto mode my default permission mode, and pre-approve the read-only commands I keep getting denied on.
 
 ## Ground rules
